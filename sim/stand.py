@@ -197,10 +197,38 @@ KD_JOINT = 3.0                      # N*m*s/rad
 KP_CART = np.array([1500.0, 1500.0, 1000.0])    # N/m
 KD_CART = np.array([30.0, 30.0, 25.0])          # N*s/m
 
-#: Phase durations, seconds.  The lift is slower because it is the phase with
-#: contact in the loop.
-RAMP_POSITION = 1.5
+#: Phase durations, seconds.  RAMP_POSITION IS SET BY TORQUE, NOT BY TASTE.
+#: The stand-to-belly move swings the knee 88 deg, and on a linear 1.5 s ramp
+#: the sequence peaked at 3.583 N*m -- over `hw.safety.TAU_STAGED_MAX`, which
+#: is 3.0 and is the cap a real bring-up actually runs under.  Every
+#: steady-state hold here is below 0.75 N*m, so that peak was all transient.
+#:
+#: Measured peak over the whole sequence, against the 3.0 N*m cap:
+#:
+#:      ramp    Kp=120/Kd=3     Kp=60/Kd=2.5
+#:      2.5 s      2.923            2.924
+#:      3.5 s      2.497            2.538
+#:      4.5 s      2.215            2.259        <- chosen, 26 % margin
+#:      6.0 s      1.962            2.008
+#:
+#: HALVING THE GAINS MOVES THE PEAK BY 0.04 N*m AND THE RAMP MOVES IT BY 1.0.
+#: So this is not a servo-tuning artifact, it is the dynamics of lowering the
+#: body, and it is therefore a property of the TRAJECTORY that carries over to
+#: hardware -- where the driver's own position loop, not KP_JOINT, closes it.
+RAMP_POSITION = 4.5
 RAMP_LIFT = 3.0        # 157 mm of lift, against the crouch's 0 mm
+
+
+def _smoothstep(s: float) -> float:
+    """0 -> 1 with ZERO SLOPE AT BOTH ENDS, so the reference has no velocity step.
+
+    A linear ramp commands its full speed in one tick.  KD_JOINT sees that as
+    an instantaneous velocity error and the first torque of the phase is the
+    largest one in it -- which is exactly where this sequence used to blow
+    through the staging cap.  Half a cosine costs nothing and removes it.
+    """
+    s = min(1.0, max(0.0, s))
+    return 0.5 * (1.0 - np.cos(np.pi * s))
 
 
 # ===========================================================================
@@ -348,12 +376,12 @@ class StandController:
             self.h_cmd = height_from_fk(self.q_ref0)   # whatever it started at
             tau = self._position(self.q_ref0, q, qd)
         elif name in ("crouch", "park"):
-            alpha = min(1.0, elapsed / RAMP_POSITION)
+            alpha = _smoothstep(elapsed / RAMP_POSITION)
             self.h_cmd = CROUCH_HEIGHT
             tau = self._position(self.q_ref0 + alpha * (self.q_crouch - self.q_ref0),
                                  q, qd)
         elif name == "lift":
-            alpha = min(1.0, elapsed / RAMP_LIFT)
+            alpha = _smoothstep(elapsed / RAMP_LIFT)
             self.h_cmd = CROUCH_HEIGHT + alpha * (LIFT_HEIGHT - CROUCH_HEIGHT)
             tau = self._compliance(q, qd, self.h_cmd)
         else:                                            # done
