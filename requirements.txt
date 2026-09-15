@@ -1,0 +1,13 @@
+# DOG6 dependencies.
+#
+# The project is sim-only right now -- `hw/` is empty because the robot is
+# being assembled -- so this list is short and will grow when it isn't.
+# `hw/README.md` names what is coming: python-can and pyserial land here the
+# day hw/motorbus.py does, not before.
+#
+# There is an interpreter that already satisfies this:
+#     D:\mujoco\.venv\Scripts\python.exe
+# which is also the one the model's build pipeline runs under.
+
+numpy>=1.24
+mujoco>=3.0

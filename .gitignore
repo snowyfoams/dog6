@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Run logs and captures. Nothing generated belongs in the repository; the
+# READMEs quote measured numbers instead of shipping the runs behind them.
+*.npz
+*.zip
+csv/
+out/
+logs/
+data/**
+!data/README.md
+
+# MuJoCo
+MUJOCO_LOG.TXT
+
+# Renders. sim/model/meshes/*.stl IS tracked -- the model needs them to load.
+*.gif
+*.mp4
+*.mov
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+.claude/
