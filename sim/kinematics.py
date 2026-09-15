@@ -264,8 +264,12 @@ def leg_gravity_torque(leg, q) -> np.ndarray:
 def foot_force_to_torque(leg, q, force) -> np.ndarray:
     """Joint torques that produce a given force AT the foot, trunk frame.
 
-    ``tau = J^T f``.  Sign: `force` is what the LEG applies to the world, so a
-    stance leg holding the robot up takes a force with positive z.
+    ``tau = J^T f``.  Sign: `force` is what the LEG applies to the WORLD, so a
+    stance leg holding the robot up PUSHES DOWN ON THE GROUND and takes a
+    force with NEGATIVE z.  The ground reaction it earns back is the positive
+    one; do not pass that.  Getting this backwards does not merely sag -- it
+    commands the robot to pull itself into the floor, and `sim.stand`'s
+    gravity feedforward is where it would show up first.
     """
     return foot_jacobian(leg, q).T @ np.asarray(force, dtype=float).reshape(3)
 
