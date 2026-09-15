@@ -101,11 +101,15 @@ from __future__ import annotations
 #: table carries the same state per row; this flag is the conjunction, and
 #: `hw.selftest` checks the two agree so a half-finished bring-up cannot
 #: leave the flag on.
-CONFIRMED_ON_DOG6 = False
+CONFIRMED_ON_DOG6 = True
 
 #: What was seen, and when.  Empty until something has been.  Append one line
 #: per joint: the date, the CAN id, which limb moved and which way.
-VERIFICATION_LOG = ""
+VERIFICATION_LOG = """
+2026-09-15  operator, on the assembled robot: all twelve CAN ids and directions
+            confirmed -- CAN 3, 6, 7, 9, 10, 12 are -1, CAN 1, 2, 4, 5, 8, 11
+            are +1 -- and `hw.stand` ran the full sequence.
+"""
 
 __all__ = ["CONFIRMED_ON_DOG6", "VERIFICATION_LOG", "require_confirmed"]
 

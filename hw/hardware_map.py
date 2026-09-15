@@ -118,21 +118,22 @@ class HardwareJoint:
 #:
 #: Read off DOG6 after assembly and calibration, 2026-09-15.  CAN ids are
 #: wired FL=1-3, FR=4-6, RR=7-9, RL=10-12 -- note RR comes before RL on the
-#: bus, which is NOT canonical order.  None re-driven with `hw.bringup check`
-#: yet, so nothing is `confirmed`.
+#: bus, which is NOT canonical order.  All twelve CONFIRMED on the robot by the
+#: operator, 2026-09-15: CAN 3, 6, 7, 9, 10, 12 turn -1, the rest +1, and
+#: `hw.stand` ran the full sequence on them.
 HARDWARE_JOINTS: tuple[HardwareJoint, ...] = (
-    HardwareJoint('FL', 'abd', 'hip_abd_FL', can_id=1, direction=+1, note='2026-09-15 calibrate'),
-    HardwareJoint('FL', 'pitch', 'hip_pitch_FL', can_id=2, direction=+1, note='2026-09-15 calibrate'),
-    HardwareJoint('FL', 'knee', 'knee_FL', can_id=3, direction=-1, note='2026-09-15 calibrate'),
-    HardwareJoint('FR', 'abd', 'hip_abd_FR', can_id=4, direction=+1, note='2026-09-15 calibrate'),
-    HardwareJoint('FR', 'pitch', 'hip_pitch_FR', can_id=5, direction=+1, note='2026-09-15 calibrate'),
-    HardwareJoint('FR', 'knee', 'knee_FR', can_id=6, direction=-1, note='2026-09-15 calibrate'),
-    HardwareJoint('RL', 'abd', 'hip_abd_RL', can_id=10, direction=-1, note='2026-09-15 calibrate'),
-    HardwareJoint('RL', 'pitch', 'hip_pitch_RL', can_id=11, direction=+1, note='2026-09-15 calibrate'),
-    HardwareJoint('RL', 'knee', 'knee_RL', can_id=12, direction=-1, note='2026-09-15 calibrate'),
-    HardwareJoint('RR', 'abd', 'hip_abd_RR', can_id=7, direction=-1, note='2026-09-15 calibrate'),
-    HardwareJoint('RR', 'pitch', 'hip_pitch_RR', can_id=8, direction=+1, note='2026-09-15 calibrate'),
-    HardwareJoint('RR', 'knee', 'knee_RR', can_id=9, direction=-1, note='2026-09-15 calibrate'),
+    HardwareJoint('FL', 'abd', 'hip_abd_FL', can_id=1, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('FL', 'pitch', 'hip_pitch_FL', can_id=2, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('FL', 'knee', 'knee_FL', can_id=3, direction=-1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('FR', 'abd', 'hip_abd_FR', can_id=4, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('FR', 'pitch', 'hip_pitch_FR', can_id=5, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('FR', 'knee', 'knee_FR', can_id=6, direction=-1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('RL', 'abd', 'hip_abd_RL', can_id=10, direction=-1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('RL', 'pitch', 'hip_pitch_RL', can_id=11, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('RL', 'knee', 'knee_RL', can_id=12, direction=-1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('RR', 'abd', 'hip_abd_RR', can_id=7, direction=-1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('RR', 'pitch', 'hip_pitch_RR', can_id=8, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
+    HardwareJoint('RR', 'knee', 'knee_RR', can_id=9, direction=-1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
 )
 
 #: Human labels in canonical order, e.g. "FL.knee".

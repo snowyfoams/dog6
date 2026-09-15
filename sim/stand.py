@@ -94,7 +94,9 @@ import time
 
 import numpy as np
 
-import mujoco
+# NO `import mujoco` HERE.  `hw.stand` runs this module's trajectory and force
+# law on the robot, which carries no simulator; the three functions that step
+# MuJoCo import it themselves.
 
 if __package__ in (None, ""):        # allow `python sim/stand.py` too
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -104,8 +106,9 @@ from . import coordinates as C       # noqa: E402
 from . import kinematics as K        # noqa: E402
 from . import params as P            # noqa: E402
 
-__all__ = ["CROUCH_HEIGHT", "LIFT_HEIGHT", "foot_targets", "pose_for_height",
-           "height_from_fk", "StandController", "run"]
+__all__ = ["Q_CROUCH", "CROUCH_HEIGHT", "FOOT_XY", "LIFT_HEIGHT", "smoothstep",
+           "foot_targets", "pose_for_height", "height_from_fk",
+           "compliance_torque", "StandController", "run"]
 
 
 # ===========================================================================
@@ -184,7 +187,7 @@ FOOT_XY = K.hip_to_foot_stance(Q_CROUCH)[:, :2].copy()
 #: 83.6 % of LEG_REACH -- more than Q_STAND's own 76.9 %, because of the splay
 #: above, but nowhere near the 93.9 % the previous thigh-horizontal crouch
 #: needed, which was DOG5's number and the thing DOG6 exists to get away from.
-LIFT_HEIGHT = P.STAND_HEIGHT
+LIFT_HEIGHT = 0.15
 
 #: Position-mode joint PD.  [SIM TUNING -- NOT THE DRIVER'S GAINS]
 KP_JOINT = 120.0                    # N*m/rad
@@ -194,8 +197,8 @@ KD_JOINT = 3.0                      # N*m*s/rad
 #: xy is stiffer than z on purpose: xy is a constraint the sequence never asks
 #: to move, so it should hold hard, while z is the axis being commanded and a
 #: softer z is what makes the lift compliant rather than a position servo.
-KP_CART = np.array([1500.0, 1500.0, 1000.0])    # N/m
-KD_CART = np.array([30.0, 30.0, 25.0])          # N*s/m
+KP_CART = np.array([2000.0, 2000.0, 500.0])    # N/m
+KD_CART = np.array([30.0, 30.0, 20.0])          # N*s/m
 
 #: Phase durations, seconds.  RAMP_POSITION IS SET BY TORQUE, NOT BY TASTE.
 #: The stand-to-belly move swings the knee 88 deg, and on a linear 1.5 s ramp
@@ -219,7 +222,7 @@ RAMP_POSITION = 4.5
 RAMP_LIFT = 3.0        # 157 mm of lift, against the crouch's 0 mm
 
 
-def _smoothstep(s: float) -> float:
+def smoothstep(s: float) -> float:
     """0 -> 1 with ZERO SLOPE AT BOTH ENDS, so the reference has no velocity step.
 
     A linear ramp commands its full speed in one tick.  KD_JOINT sees that as
@@ -262,6 +265,37 @@ def height_from_fk(q) -> float:
     where it stops being so.
     """
     return float(P.FOOT_RADIUS - K.all_foot_positions(q)[:, 2].mean())
+
+
+def compliance_torque(q, qd, height, *, foot_xy=FOOT_XY, kin=K,
+                      gravity=None) -> np.ndarray:
+    """(4, 3) joint torques for the Cartesian compliance law at `height`.
+
+    THE ONE COPY OF THE LAW.  `StandController` runs it in MuJoCo and
+    `hw.stand` runs it on the robot, so the thing the simulator validated is
+    the thing the motors receive.
+
+    `kin` is any module with `foot_position_hip` and `foot_jacobian` --
+    `sim.kinematics` here, `hw.kinematics` on the robot, which `sim.selftest`
+    gates equal to 1e-12 and which is twenty times faster.  `gravity` is the
+    (4, 3) leg-weight torque if the caller already has it; left None it is
+    computed here with `sim.kinematics.leg_gravity_torque`.
+    """
+    q = C.unflat(q)
+    qd = C.unflat(qd)
+    tau = np.zeros((C.N_LEGS, C.N_JOINTS_PER_LEG))
+    z_des = -(height - P.FOOT_RADIUS)
+    for i in range(C.N_LEGS):
+        p = kin.foot_position_hip(i, q[i])
+        jac = kin.foot_jacobian(i, q[i])
+        p_des = np.array([foot_xy[i, 0], foot_xy[i, 1], z_des])
+        # f is what the LEG APPLIES TO THE WORLD.  f_ff pushes DOWN.
+        force = (KP_CART * (p_des - p) - KD_CART * (jac @ qd[i])
+                 + np.array([0.0, 0.0, -P.WEIGHT / C.N_LEGS]))
+        leg_gravity = (K.leg_gravity_torque(i, q[i]) if gravity is None
+                       else gravity[i])
+        tau[i] = jac.T @ force + leg_gravity
+    return tau
 
 
 # ===========================================================================
@@ -338,17 +372,7 @@ class StandController:
 
     def _compliance(self, q, qd, height) -> np.ndarray:
         """Cartesian spring-damper at each foot, plus the weight feedforward."""
-        tau = np.zeros((C.N_LEGS, C.N_JOINTS_PER_LEG))
-        z_des = -(height - P.FOOT_RADIUS)
-        for i in range(C.N_LEGS):
-            p = K.foot_position_hip(i, q[i])
-            jac = K.foot_jacobian(i, q[i])
-            p_des = np.array([self.foot_xy[i, 0], self.foot_xy[i, 1], z_des])
-            # f is what the LEG APPLIES TO THE WORLD.  f_ff pushes DOWN.
-            force = (KP_CART * (p_des - p) - KD_CART * (jac @ qd[i])
-                     + np.array([0.0, 0.0, -P.WEIGHT / C.N_LEGS]))
-            tau[i] = jac.T @ force + K.leg_gravity_torque(i, q[i])
-        return tau
+        return compliance_torque(q, qd, height, foot_xy=self.foot_xy)
 
     # -- the callback ------------------------------------------------------
     def __call__(self, model, data) -> None:
@@ -376,12 +400,12 @@ class StandController:
             self.h_cmd = height_from_fk(self.q_ref0)   # whatever it started at
             tau = self._position(self.q_ref0, q, qd)
         elif name in ("crouch", "park"):
-            alpha = _smoothstep(elapsed / RAMP_POSITION)
+            alpha = smoothstep(elapsed / RAMP_POSITION)
             self.h_cmd = CROUCH_HEIGHT
             tau = self._position(self.q_ref0 + alpha * (self.q_crouch - self.q_ref0),
                                  q, qd)
         elif name == "lift":
-            alpha = _smoothstep(elapsed / RAMP_LIFT)
+            alpha = smoothstep(elapsed / RAMP_LIFT)
             self.h_cmd = CROUCH_HEIGHT + alpha * (LIFT_HEIGHT - CROUCH_HEIGHT)
             tau = self._compliance(q, qd, self.h_cmd)
         else:                                            # done
@@ -405,6 +429,8 @@ class StandController:
 # running it
 # ===========================================================================
 def _load():
+    import mujoco
+
     model = mujoco.MjModel.from_xml_path(P.XML_PATH)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, C.KEYFRAMES["stand"])
@@ -419,6 +445,8 @@ def run_headless(seconds_per_phase: float = 4.0, quiet: bool = False):
     deterministic, it needs no display, and it exercises exactly the callback
     the viewer runs.
     """
+    import mujoco
+
     model, data = _load()
     ctrl = StandController()
     ctrl.reset(data)

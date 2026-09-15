@@ -59,7 +59,7 @@ expectation, which is the exact failure the empty map exists to prevent.
 `python -m hw.hardware_map` prints all twelve predictions at once.
 
 **Steps 1–6 command no torque.** `scan` streams iq=0 keep-alives (which hold
-the drivers' 10 ms input watchdog open without producing motion — every motor
+the drivers' 50 ms input watchdog open without producing motion — every motor
 stays back-drivable); `spin` and `check` use the drivers' own 0xA4 position
 loop with a low speed cap.
 
@@ -87,6 +87,7 @@ collapsed the two and the check lived in an operator's memory.
 | `safety.py` | **refuses** | ramp, cap, limit block, slew, e-stop trips |
 | `fake_bus.py` | needs explicit ids | twelve drivers in software, same protocol |
 | `bringup.py` | — | scan / spin / check / setzero / imu / plan |
+| `stand.py` | **refuses** | `sim.stand`'s limp → settle → crouch → lift → park on the robot. Driver 0xA4 for position, `SafetyGate` for the lift, every motor re-sent inside the 50 ms input-lost window. `--fake` runs it against `fake_bus` |
 | `selftest.py` | — | 53 checks, no robot |
 
 ## The staging ladder, with DOG6's own numbers

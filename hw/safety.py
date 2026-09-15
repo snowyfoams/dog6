@@ -120,6 +120,11 @@ QD_ESTOP_ENCODER_CONFIRM_RATIO = 0.5    # encoder must exceed this * QD_ESTOP
 TEMP_ESTOP_C = 80                       # [INHERITED FROM DOG5]
 MISS_ESTOP = 20                         # consecutive missed CAN replies
 
+#: The drivers' input-signal-lost protection on DOG6: a motor that hears no
+#: frame for this long latches error 0x80 and goes limp.  Per the operator,
+#: 2026-09-15.  Every loop that commands a motor has to re-send well inside it.
+INPUT_LOST_S = 0.050
+
 
 class SafetyGate:
     """Torque shaping (ramp, cap, limit block, slew) plus the e-stop tests."""

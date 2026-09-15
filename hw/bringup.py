@@ -32,7 +32,7 @@ DISCOVERY, NOT VERIFICATION, AND THAT IS THE DIFFERENCE FROM DOG5
     a controller will.  Passing it is what earns `confirmed=True`.
 
 NOTHING IN STEPS 1-4 COMMANDS TORQUE.  `scan` and the arming ladder stream
-    iq=0 keep-alives, which hold the drivers' 10 ms input watchdog open
+    iq=0 keep-alives, which hold the drivers' 50 ms input watchdog open
     without producing motion -- every motor stays back-drivable.  `spin` and
     `check` use the drivers' own 0xA4 position loop with a low speed cap.  The
     torque path is `hw.safety`, and it refuses on an empty map with no
@@ -90,7 +90,7 @@ def _bus(ids, bitrate: int, fake: bool = False, joint_frame: bool = False):
 def _hold(mb, can_id, target_deg, seconds, dps, rate_hz, unwrap):
     """0xA4 re-sent every slot until `seconds` is up; returns the angle reached.
 
-    RE-SENT is the point: the driver's input watchdog is 10 ms, so one command
+    RE-SENT is the point: the driver's input watchdog is 50 ms, so one command
     followed by silence latches error 0x80 and the joint goes limp mid-move.
     The angle returned is in whatever frame the bus was opened in.
     """
