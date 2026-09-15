@@ -68,10 +68,57 @@ THE ZERO
 
     DOG6's CAD is drawn STANDING, not flat, so the flat pose is a
     reconstruction -- `build_dog6_mjcf.py` rotates each link back onto it.
-    Which way the leg plane folds down is otherwise a free 180 deg choice, and
-    it is fixed by DEFINING the standing pose to be hip_abd = +90 deg on the
-    left legs and -90 deg on the right (DOG5's `Q_ROLL` sign).  That choice is
-    what makes DOG6's joint signs come out on DOG5's convention.
+    Which way the leg plane folds down is otherwise a free 180 deg choice.
+
+    IT IS FIXED BY THE BUILT ROBOT, AND THAT IS CONFIRMED.  At hip_abd = 0
+    the thigh plate sits ON TOP OF its pitch motor, so the foot ball points
+    UP and a leg laid out flat rests on its own face.  DOG6's twelve drivers
+    are CALIBRATED to this zero and `hw.kinematics` is written in this frame
+    -- both on the operator's word, checked against the bench, 2026-09-15.
+    This is the one thing in this file that is not inherited from DOG5 and
+    not merely read off the CAD: it is a statement about the built robot, and
+    where it disagrees with the CAD pipeline, the robot wins.
+
+    THIS IS A CORRECTION.  The choice used to be pinned to DOG5 instead, by
+    DEFINING the standing pose to be hip_abd = +90 deg on the left legs
+    (DOG5's `Q_ROLL` sign).  That folds every leg the other way and puts the
+    thigh UNDER its motor at zero, 180 deg off the robot on the bench.
+
+    THE FOLD IS THE ONLY THING THAT MOVES.  Rolling a leg 180 deg about trunk
+    +x carries the whole chain: the pitch and knee axis LINES stay where they
+    were, the chain's offsets all lie ON the roll axis and so are its fixed
+    points, and at q = 0 every body frame still coincides with the trunk
+    frame.  What the roll does change is which way "positive" points -- and
+    DOG6 IS CALIBRATED SO THAT EVERY JOINT OBEYS THE RIGHT-HAND RULE about
+    the axis as written in "THE JOINT AXES" below, reading +x, +z, +z in the
+    TRUNK frame at the zero, not just in its own body frame.  Holding that
+    fixed while the leg rolls negates all three columns at once:
+
+        Q_STAND_new = -Q_STAND_old
+
+    and the feet still land at (+-0.182, +-0.065, FOOT_RADIUS) with no
+    residual.  NOTHING ELSE IN THIS FILE MOVES -- not JOINT_AXES, not
+    `link_rotations`, not `hw.kinematics`'s own closed form -- because the
+    roll lives in the MJCF's GEOMETRY (each leg body's geoms, sites and
+    inertial) and not in its body frames.  That is what keeps the aligned
+    zero, and with it `link_rotations` as a plain product with no offsets.
+
+    UNTIL THE REBUILD, ONLY Q_STAND HAS MOVED.  `model/dog6.xml` is a
+    generated artifact whose generator is not in this repository, so the XML
+    still carries the old fold.  The rebuild rolls each leg body's geoms,
+    sites and inertial 180 deg about x -- pos (x, y, z) -> (x, -y, -z), quat
+    pre-multiplied by Rx(180 deg), the inertia's ixy and ixz negated -- and
+    negates the `stand` keyframe's twelve joint entries.  Every body `pos`,
+    every absent body `quat` and all twelve joint `axis` attributes stay
+    exactly as they are.  The same roll goes through `params`, which copies
+    the MJCF: every leg link's `com` y and z negate, every leg link inertia's
+    ixy and ixz negate, and `knee_to_foot`'s z flips from -0.005 to +0.005.
+    Masses, link lengths and the trunk's own inertial are untouched, and so
+    is L3, which is a norm.  Until that lands ONE gate in `selftest` is RED,
+    `Q_STAND == the stand keyframe`, and that is the honest signal that the
+    artifact is behind the convention.  Do not read the feet-on-the-floor
+    gate as agreement: it checks only z, and the old fold lands the foot ball
+    10 mm to the other side of the shin at the same height.
 
 
 THE JOINT AXES
@@ -87,7 +134,8 @@ THE JOINT AXES
 
     Because at the flat zero all four of a leg's frames are aligned with the
     trunk frame, the body rotations are a plain product of elementary
-    rotations with no fixed offsets -- see `link_rotations`.
+    rotations with no fixed offsets -- see `link_rotations`.  The corrected
+    fold preserves that; see "THE ZERO" above for why.
 """
 from __future__ import annotations
 
@@ -253,20 +301,23 @@ Q_ZERO = np.zeros((N_LEGS, N_JOINTS_PER_LEG))
 
 #: The pose the CAD is drawn in, and the stance every controller starts from.
 #:
-#: EXACT, NOT AN IK SOLVE.  Abduction at +-90 deg (left positive, DOG5's
-#: Q_ROLL sign) and pitch/knee at +-60 deg.  Driving the chain to these exact
-#: values puts all four foot balls precisely on the floor: the foot sites land
-#: at (+-0.182, +-0.065, FOOT_RADIUS) with the trunk origin at STAND_HEIGHT,
+#: EXACT, NOT AN IK SOLVE.  It is the OLD DOG5-folded Q_STAND negated, every
+#: column: abduction at -+90 deg (LEFT NEGATIVE) and pitch/knee at -+60 deg.
+#: The sign is the opposite of DOG5's `Q_ROLL` throughout, because DOG6's
+#: zero is fixed by DOG6's bench and its right-hand-rule calibration, not by
+#: DOG5's convention -- see "THE ZERO" above.  Driving the chain to these exact values puts all
+#: four foot balls precisely on the floor: the foot sites land at
+#: (+-0.182, +-0.065, FOOT_RADIUS) with the trunk origin at STAND_HEIGHT,
 #: with no residual.  `selftest` gates that against MuJoCo.
 #:
-#: The sign pattern pairs FL with RR and FR with RL, which is DOG5's own
-#: `Q_STAND` pattern.  model/dog6.xml carries the same pose, rounded to eight
-#: decimals, as its `stand` keyframe.
+#: The sign pattern still pairs FL with RR and FR with RL.  model/dog6.xml's
+#: `stand` keyframe carries the OLD abduction signs and disagrees with this
+#: array until the model is rebuilt -- again, see "THE ZERO".
 Q_STAND = np.array([
-    [+np.pi / 2, -np.pi / 3, -np.pi / 3],      # FL
-    [-np.pi / 2, +np.pi / 3, +np.pi / 3],      # FR
-    [+np.pi / 2, +np.pi / 3, +np.pi / 3],      # RL
-    [-np.pi / 2, -np.pi / 3, -np.pi / 3],      # RR
+    [-np.pi / 2, +np.pi / 3, +np.pi / 3],      # FL
+    [+np.pi / 2, -np.pi / 3, -np.pi / 3],      # FR
+    [-np.pi / 2, -np.pi / 3, -np.pi / 3],      # RL
+    [+np.pi / 2, +np.pi / 3, +np.pi / 3],      # RR
 ])
 
 #: The keyframes model/dog6.xml ships, name -> MJCF keyframe id.
@@ -341,7 +392,7 @@ def describe() -> str:
         "  joints/leg      %s" % (", ".join(JOINTS),),
         "  axes            abd about trunk +x, pitch/knee about parent +z",
         "  qpos/qvel       %d / %d  (freejoint is 7 of qpos but 6 of qvel)" % (NQ, NV),
-        "  Q_STAND         abd +-90 deg, pitch/knee +-60 deg (exact)",
+        "  Q_STAND         -(DOG5 fold): abd -+90 (LEFT NEG), pitch/knee -+60",
         "  R_body_imu      %s" % ("identity (PLACEHOLDER -- not measured)"
                                   if np.allclose(R_BODY_IMU, np.eye(3))
                                   else "measured"),
