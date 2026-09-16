@@ -3,10 +3,14 @@
     python -m hw.hardware_map          what is known, what is not
 
 THIS FILE IS A RECORD OF MEASUREMENTS.
-    All twelve rows were filled in from DOG6 itself on 2026-09-15, after
-    assembly and calibration.  None is `confirmed` yet.  Before that every
-    `can_id` and `direction` was None, and that was the correct state of
-    knowledge about a robot nobody had driven a motor on.
+    All twelve rows were read off DOG6 itself on 2026-09-15, after assembly
+    and calibration: found with `bringup spin`, then re-driven in JOINT
+    coordinates with `bringup check` and confirmed one at a time.  `hw.stand`
+    then ran its position phases on them.  This table is the reference the
+    rest of the project measures joint angles against.
+
+    Before that every `can_id` and `direction` was None, and that was the
+    correct state of knowledge about a robot nobody had driven a motor on.
 
     DOG5's values are deliberately NOT here.  They were tempting: same motor,
     same driver, same protocol, and a table of twelve numbers that already
@@ -51,16 +55,17 @@ HOW THE TABLE GETS FILLED, AND WHY IT IS DISCOVERY AND NOT VERIFICATION
       5. `hw.bringup setzero`         only once all twelve rows are complete.
 
     Steps 2 and 3 are the same command; the difference is that by step 3 you
-    know which joint you are looking at.
+    know which joint you are looking at.  This is also the procedure for ONE
+    row: a replaced or re-flashed driver is re-measured the same way, not
+    inferred from the eleven that did not change.
 
-WHAT WORKS ON AN INCOMPLETE MAP, AND WHAT REFUSES
-    Works     `scan` and `spin`, because they address raw CAN ids and command
-              in the motor's own frame.  The protocol layer (`hw.motor`), all
-              of `hw.kinematics`, and `hw.imu`.
-    Refuses   anything that needs joint coordinates -- `hw.calibration`'s
-              conversions, `joint_state`, `set_zero_all`, and
-              `hw.safety.SafetyGate`.  They raise `MapIncomplete`, which names
-              the rows that are still empty.
+A ROW THAT GOES MISSING STILL STOPS THE ROBOT
+    Filling the table in did not remove that guard, it satisfied it.
+    Everything needing joint coordinates -- `hw.calibration`'s conversions,
+    `joint_state`, `set_zero_all`, `hw.safety.SafetyGate` -- asks this file at
+    CALL time and raises `MapIncomplete` naming the row if one is not there.
+    `scan` and `spin` never ask: they address raw CAN ids in the motor's own
+    frame, which is what makes them the tools for re-measuring.
 """
 from __future__ import annotations
 
@@ -119,8 +124,10 @@ class HardwareJoint:
 #: Read off DOG6 after assembly and calibration, 2026-09-15.  CAN ids are
 #: wired FL=1-3, FR=4-6, RR=7-9, RL=10-12 -- note RR comes before RL on the
 #: bus, which is NOT canonical order.  All twelve CONFIRMED on the robot by the
-#: operator, 2026-09-15: CAN 3, 6, 7, 9, 10, 12 turn -1, the rest +1, and
-#: `hw.stand` ran the full sequence on them.
+#: operator, 2026-09-15: CAN 3, 6, 7, 9, 10, 12 turn -1, the rest +1.
+#: `hw.stand` then ran its POSITION phases on them -- limp, settle, crouch,
+#: park.  The LIFT phase did not hold; that is a question about the lift law,
+#: not about this table, and `hw.balance` is where it is being addressed.
 HARDWARE_JOINTS: tuple[HardwareJoint, ...] = (
     HardwareJoint('FL', 'abd', 'hip_abd_FL', can_id=1, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
     HardwareJoint('FL', 'pitch', 'hip_pitch_FL', can_id=2, direction=+1, confirmed=True, note='2026-09-15 calibrate; confirmed on robot'),
@@ -175,12 +182,14 @@ def require_complete(what: str = "this operation") -> None:
         missing = unassigned()
         raise MapIncomplete(
             f"{what} needs joint coordinates, and {len(missing)} of "
-            f"{N_JOINTS} rows of hw/hardware_map.py are still empty "
+            f"{N_JOINTS} rows of hw/hardware_map.py are empty "
             f"({', '.join(missing)}).\n"
-            "  Nothing has been read off DOG6 yet and DOG5's table is "
-            "deliberately not here.\n"
-            "  Build it: `python -m hw.bringup scan`, then "
-            "`python -m hw.bringup spin --id <n>` per motor.")
+            "  DOG6's twelve were measured on 2026-09-15, so an empty row "
+            "means an edited table, a\n"
+            "  replaced or re-flashed driver, or another robot.  DOG5's "
+            "table is deliberately not here.\n"
+            "  Re-measure that row: `python -m hw.bringup scan`, then "
+            "`python -m hw.bringup spin --id <n>`.")
 
 
 def motor_ids() -> list[int]:
@@ -249,10 +258,10 @@ def record_template(label: str, can_id: int, direction: int,
 def _explicit_table() -> str:
     """HARDWARE_JOINTS written out row by row, ready to be edited.
 
-    The tuple above is a comprehension while every row is empty, because
-    twelve identical empty rows are noise.  The moment a real value exists it
-    should be written out longhand -- a measurement belongs in the source as a
-    literal, where a reader can see it and a diff can show it changing.
+    The tuple above is already longhand, which is where a measurement
+    belongs: in the source as a literal, where a reader can see it and a diff
+    can show it changing.  This stays because it is what re-prints the table
+    after a row has been re-measured.
     """
     lines = ["HARDWARE_JOINTS: tuple[HardwareJoint, ...] = ("]
     for entry in HARDWARE_JOINTS:
@@ -348,10 +357,11 @@ def describe(step_rad: float = 0.1) -> str:
     if not is_complete():
         lines += ["  EMPTY: %s" % ", ".join(unassigned()),
                   "",
-                  "  Nothing has been read off DOG6.  DOG5's table is",
-                  "  deliberately not here -- see the module docstring.",
-                  "  Build it:  python -m hw.bringup scan",
-                  "             python -m hw.bringup spin --id <n>"]
+                  "  DOG6's twelve were measured on 2026-09-15, so an empty",
+                  "  row means an edited table or a replaced driver.  DOG5's",
+                  "  is deliberately not here -- see the module docstring.",
+                  "  Re-measure:  python -m hw.bringup scan",
+                  "               python -m hw.bringup spin --id <n>"]
     lines += [
         "",
         "  the yardstick -- a POSITIVE JOINT step of +%.2f rad from Q_STAND,"

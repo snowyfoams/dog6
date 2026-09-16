@@ -161,7 +161,7 @@ class Quintic:
         return float(max(abs(self.at(t).hddot) for t in ts))
 
 
-def com_command(command: HeightCommand, R) -> ComCommand:
+def com_command(command: HeightCommand, R, srb=None) -> ComCommand:
     """The h reference as the PD consumes it: a CoM height in the WORLD frame.
 
         p_c,z,d    = h_cmd + TRUNK_BOTTOM_OFFSET + (R c^b)_z
@@ -182,8 +182,9 @@ def com_command(command: HeightCommand, R) -> ComCommand:
     constant, so the whole offset cancels out of the error and the PD's z
     channel sees precisely the trunk-height error.
     """
+    srb = cfg.SRB if srb is None else srb
     offset_z = float((np.asarray(R, dtype=float).reshape(3, 3)
-                      @ cfg.COM_BODY)[2])
+                      @ srb.com_body)[2])
     return ComCommand(
         p_cz=command.h + cfg.TRUNK_BOTTOM_OFFSET + offset_z,
         p_cz_dot=command.hdot,

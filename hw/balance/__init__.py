@@ -5,9 +5,18 @@
     python -m hw.stand --law per-leg     run what it replaces
 
 WHAT THIS REPLACES, AND WHAT IT DOES NOT TOUCH
-    Only the LIFT phase of `hw.stand`.  The limp, settle, crouch, park and
-    done phases are the drivers' own 0xA4 position loops and nothing here
-    reaches them.
+    The LIFT phase, and only that.  `sequence` runs all six phases of the
+    stand -- limp, settle, crouch, lift, park, done -- but the other five are
+    the drivers' own 0xA4 position loops and no gain in this package reaches
+    them.
+
+    The sequence lives here rather than in `hw.stand` because every seam
+    between a position phase and the lift is a statement about the law: the
+    lift is armed from the pose the CROUCH left, `law.BalanceLaw.arm` latches
+    h0 and the heading from what is MEASURED at that instant, and the PARK
+    starts from wherever the lift settled.  `hw.stand` is the runner -- the
+    CAN slots, the keys, the log, the command line -- and the dividing line
+    between the two is I/O.
 
     The law it replaces is `sim.stand.compliance_torque` -- a Cartesian
     spring-damper per leg with a fixed mg/4 feedforward, four independent
@@ -50,6 +59,9 @@ THE FIVE STAGES, AND THE TWO FRAMES
     DOG6 not even that -- see `config.INERTIA_BODY`.
 
 THE MODULES
+    sequence     the six phases and what each one sends.  The only module
+                 here that is not part of the law: it decides WHEN the law
+                 runs, and hands every other phase to the drivers' 0xA4 loop.
     config       every number.  Gains, the cone, the weights, the FIXED CoM
                  and inertia, the trip thresholds.  Nothing else holds one.
     state        stages 1-2.  Measurement only: no gain appears in it.
@@ -61,7 +73,11 @@ THE MODULES
                  four feet.  No trunk feedback in it at all.
     torque       stage 5, plus the tilt-aware leg gravity term the SRB model's
                  massless-leg assumption leaves out.
-    selftest     gates the lot offline, including against the old law.
+    law          the five chained, one call per sweep.  `sequence` owns when,
+                 this owns what.
+    selftest     gates the lot offline, including against the old law.  It
+                 gates the LAW; the sequence above it is still exercised only
+                 by `hw.stand --fake`, which is a gap and not a decision.
 
     That split is DOG5's (`feedback_estimator` / `dynamic_model` /
     `force_totorque` / the runner) with DOG6's names, and it is where it is
@@ -78,4 +94,5 @@ WHAT IS STILL OPEN
 """
 from __future__ import annotations
 
-__all__ = ["config", "state", "reference", "controller", "allocation", "torque"]
+__all__ = ["config", "state", "reference", "controller", "allocation",
+           "torque", "law", "sequence"]

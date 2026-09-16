@@ -74,7 +74,10 @@ THE ZERO
     the thigh plate sits ON TOP OF its pitch motor, so the foot ball points
     UP and a leg laid out flat rests on its own face.  DOG6's twelve drivers
     are CALIBRATED to this zero and `hw.kinematics` is written in this frame
-    -- both on the operator's word, checked against the bench, 2026-09-15.
+    -- checked against the bench on 2026-09-15, and then driven: all twelve
+    directions were read against `hw.kinematics`' prediction from this zero
+    and confirmed one at a time, and `hw.stand` ran its position phases from
+    it.  The feet went where this frame said they would.
     This is the one thing in this file that is not inherited from DOG5 and
     not merely read off the CAD: it is a statement about the built robot, and
     where it disagrees with the CAD pipeline, the robot wins.
@@ -405,11 +408,35 @@ KEYFRAMES = {"home": 0, "stand": 1}
 #: and every consumer has to undo it -- which is the point.  A sim that reports
 #: sensors already in body axes is a sim that will not catch a mounting error.
 #:
-#: IT IS THE IDENTITY, AND THAT IS A PLACEHOLDER, NOT A MEASUREMENT.  DOG6's
-#: IMU has not been mounted.  When it is, this becomes the measured mounting
-#: rotation and model/dog6.xml's imu site quat has to move with it: they are
-#: one value with two homes, and `selftest` gates that they agree.
+#: IT IS THE IDENTITY, AND THAT IS THE MEASUREMENT.  The DETA10 is bolted to
+#: DOG6 exactly as it is to DOG5 -- same board, same orientation, aligned with
+#: the trunk -- so the mounting rotation is a no-op and the only thing between
+#: the sensor die and the trunk is the NED -> FLU convention, which lives in
+#: `hw.imu.SENSOR_TO_FLU` and is not a mounting term at all.
+#:
+#: DOG5 ESTABLISHED THIS AND ITS NOTES SAY SO.  `IMU_sensor/review.md`,
+#: 2026-07-22: "why the dog frame and the IMU frame disagree EVEN THOUGH THE
+#: PCB IS MOUNTED STRAIGHT ... it is a frame-convention difference, not a
+#: tilted or flipped PCB".  What is left over at a level robot is a degree or
+#: two of skew, which is a scalar TRIM and not a frame -- see `hw.imu`.
+#:
+#: Identity is also what model/dog6.xml's imu site quat carries: they are one
+#: value with two homes, and `selftest` gates that they agree.  If DOG6's
+#: board is ever moved, BOTH change together and `R_BODY_IMU_MEASURED` is the
+#: flag that has to be re-earned.
 R_BODY_IMU = np.eye(3)
+
+#: Whether `R_BODY_IMU` above is a measurement or a guess.  It has to be said
+#: OUT LOUD because the value cannot say it: identity is both the plausible
+#: placeholder and the right answer, so no amount of inspecting the matrix
+#: distinguishes "nobody has looked" from "looked, and it is aligned".
+#:
+#: True since 2026-09-16, inherited from DOG5: the board mounts identically,
+#: and DOG5 verified the frame BEHAVIOURALLY rather than by trusting the
+#: drawing -- `imu_frame_test.py`'s four hand-rotation moves all passed, and
+#: the first stand cross-checked the roll sign against leg sag (left legs
+#: sagging 12-18 mm against 2-11 mm on the right, IMU reading negative roll).
+R_BODY_IMU_MEASURED = True
 
 
 # ===========================================================================

@@ -50,11 +50,15 @@ from sim import stand as ST          # noqa: E402
 
 from .. import imu as IMU            # noqa: E402
 from .. import kinematics as HK      # noqa: E402
+from .. import fold_stand as FS      # noqa: E402
+from .. import safety as SAFE        # noqa: E402
 from . import allocation as ALLOC    # noqa: E402
 from . import config as cfg          # noqa: E402
 from . import controller as CTRL     # noqa: E402
 from . import law as LAW             # noqa: E402
 from . import reference as REF       # noqa: E402
+from . import posture as POSE        # noqa: E402
+from . import sequence as SEQ        # noqa: E402
 from . import state as STATE         # noqa: E402
 from . import torque as TRQ          # noqa: E402
 
@@ -80,8 +84,11 @@ def close(label: str, a, b, tol: float, unit: str = "") -> None:
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
-def pose_at(h: float) -> np.ndarray:
-    """(4, 3) joints with the feet at FOOT_XY and the trunk bottom at `h`.
+def pose_at(h: float, foot_xy=None, q_seed=None) -> np.ndarray:
+    """(4, 3) joints with the feet at `foot_xy` and the trunk bottom at `h`.
+
+    `foot_xy` None means the nominal `sim.stand.FOOT_XY`; a `CrouchPose` fills
+    it to build states in a posture the lift was not designed for.
 
     `hw.kinematics`' CLOSED-FORM inverse, not `sim.stand.pose_for_height`'s
     damped least squares.  The difference is 9 nm of residual, which is
@@ -89,20 +96,28 @@ def pose_at(h: float) -> np.ndarray:
     the commanded height makes the PD ask for 8.6 uN, and a check on "zero
     error gives exactly mg" then fails on the SOLVER rather than on the law.
     """
-    targets = ST.foot_targets(STATE.height_to_origin(h))
-    return HK.all_leg_ik(targets, q_seed=ST.Q_CROUCH)
+    height = STATE.height_to_origin(h)
+    if foot_xy is None:
+        targets = ST.foot_targets(height)
+    else:
+        targets = np.zeros((C.N_LEGS, 3))
+        targets[:, :2] = np.asarray(foot_xy, dtype=float)
+        targets[:, 2] = -(height - P.FOOT_RADIUS)
+    return HK.all_leg_ik(targets,
+                         q_seed=ST.Q_CROUCH if q_seed is None else q_seed)
 
 
-def state_at(h: float, R=None, omega_b=None, qd=None, age_s: float = 0.0):
+def state_at(h: float, R=None, omega_b=None, qd=None, age_s: float = 0.0,
+             foot_xy=None, q_seed=None, srb=None):
     """A `BodyState` at height `h` and orientation `R`, feet planted."""
     R = np.eye(3) if R is None else R
     roll, pitch, yaw = C.zyx_from_rot(R)
     orientation = IMU.TrunkOrientation(
         R=R, omega_b=np.zeros(3) if omega_b is None else np.asarray(omega_b),
         roll=roll, pitch=pitch, yaw=yaw, age_s=age_s)
-    q = C.flat(pose_at(h))
+    q = C.flat(pose_at(h, foot_xy=foot_xy, q_seed=q_seed))
     return STATE.read(q, np.zeros(C.N_JOINTS) if qd is None else qd,
-                      orientation)
+                      orientation, srb=srb)
 
 
 def main() -> int:
@@ -532,6 +547,694 @@ def main() -> int:
     check("the whole law fits in one 333 us CAN slot on this machine",
           float(np.percentile(samples, 95)) * 1e6 < slot_us,
           "%s   (slot %.0f us)" % (timing.timing.summary(), slot_us))
+
+    # =====================================================================
+    print("\n9. the attitude setpoint: DOG5's SETPOINT_DYNAMIC, ported")
+    # =====================================================================
+    # The convention is "world := body here".  Yaw always had it -- psi_0 is
+    # latched when torque arms -- and these gate the other two axes, which
+    # DOG5 added on 2026-08-28 and DOG6 was missing.
+    tilted = state_at(cfg.H_CROUCH, R=C.rot_x(np.deg2rad(3.0)))
+
+    fresh = LAW.BalanceLaw()
+    close("before the latch the setpoint IS the config statics",
+          [np.degrees(fresh.sp_roll), np.degrees(fresh.sp_pitch)],
+          [cfg.SETPOINT_ROLL_DEG, cfg.SETPOINT_PITCH_DEG], 1e-12, "deg")
+    latched = fresh.latch_setpoint(tilted)
+    check("the latch takes the reading it is handed",
+          latched is not None and abs(latched[0] - 3.0) < 1e-9,
+          "roll %+.2f  pitch %+.2f deg" % latched)
+    check("a SECOND latch is refused -- once per run, in limp only",
+          fresh.latch_setpoint(state_at(cfg.H_CROUCH,
+                                        R=C.rot_x(np.deg2rad(9.0)))) is None
+          and abs(np.degrees(fresh.sp_roll) - 3.0) < 1e-9,
+          "level has a truth to return to; re-latching would drag it")
+
+    stale_sp = LAW.BalanceLaw()
+    check("a STALE sample is refused, the statics stand",
+          stale_sp.latch_setpoint(
+              state_at(cfg.H_CROUCH, R=C.rot_x(np.deg2rad(3.0)),
+                       age_s=10 * cfg.IMU_MAX_AGE_S)) is None
+          and not stale_sp.setpoint_latched,
+          "a bad setpoint is a constant the loop fights all run")
+
+    # THE PROPERTY THE WHOLE CONVENTION EXISTS FOR: at the attitude it was
+    # latched at, the attitude error is EXACTLY zero, so arming cannot step
+    # the wrench.  DOG5's reason for latching yaw at arm, now on all three.
+    armed_sp = LAW.BalanceLaw()
+    armed_sp.latch_setpoint(tilted)
+    armed_sp.arm(0.0, tilted)
+    close("R_des == the R it was latched at", armed_sp.R_des, tilted.R, 1e-12)
+    close("...so e_R is exactly zero there",
+          C.log_so3(tilted.R.T @ armed_sp.R_des), np.zeros(3), 1e-12, "rad")
+    close("...and the attitude half of the wrench is zero with it",
+          CTRL.balance_wrench(tilted, REF.com_command(
+              armed_sp.ramp.at(0.0), tilted.R), armed_sp.R_des,
+              armed_sp.gains).b_d[3:], np.zeros(3), 1e-9, "N*m")
+
+    check("the tilt trip measures FROM the setpoint, not from true level",
+          abs(armed_sp.tilt_from_setpoint_deg(tilted)) < 1e-9
+          and abs(tilted.tilt_deg - 3.0) < 1e-9,
+          "state.tilt_deg still reports %.1f deg for the log" % tilted.tilt_deg)
+    check("...so the stop is reached %.0f deg from where the run began"
+          % cfg.TILT_STOP_DEG,
+          abs(armed_sp.tilt_from_setpoint_deg(
+              state_at(cfg.H_CROUCH,
+                       R=C.rot_x(np.deg2rad(3.0 + cfg.TILT_STOP_DEG))))
+              - cfg.TILT_STOP_DEG) < 1e-9)
+
+    close("level_attitude is latched_attitude at a zero setpoint",
+          CTRL.level_attitude(0.7), CTRL.latched_attitude(0.0, 0.0, 0.7), 1e-15)
+
+    _dynamic = cfg.SETPOINT_DYNAMIC
+    try:
+        cfg.SETPOINT_DYNAMIC = False
+        check("SETPOINT_DYNAMIC off refuses the latch outright",
+              LAW.BalanceLaw().latch_setpoint(tilted) is None,
+              "the config statics are then the whole story, as DOG5 ran")
+    finally:
+        cfg.SETPOINT_DYNAMIC = _dynamic
+
+    # =====================================================================
+    print("\n10. RISE and HOLD: the phase the controller is WATCHED in")
+    # =====================================================================
+    def _to_rise(law: str):
+        """A fresh sequence sitting at the START of the rise.  -> (seq, t)."""
+        seq = SEQ.StandSequence(SAFE.SafetyGate(3.0), law=law)
+        crouch = state_at(cfg.H_CROUCH)
+        t = 0.0
+        seq.update(t, crouch)                    # limp: latches the setpoint
+        # limp -> settle -> crouch -> rise.  Only the CROUCH ramp needs the
+        # clock moved on; `advance` refuses to leave it while it is running.
+        for wait_s in (0.0, ST.RAMP_POSITION + 1.0, 0.0):
+            refused = seq.advance(t, crouch.q)
+            assert refused is None, refused
+            seq.update(t, crouch)
+            t += wait_s
+            seq.update(t, crouch)
+        assert seq.phase_name == "rise", seq.phase_name
+        return seq, t
+
+    def _to_hold(law: str):
+        """...and on up to the top of it.  -> (seq, t)."""
+        seq, t = _to_rise(law)
+        while seq.phase_name == "rise":
+            t += 0.004
+            h = (seq.balance.ramp.at(t - seq.balance.t0).h if law == "srb"
+                 else cfg.H_LIFT)
+            seq.update(t, state_at(h))
+        return seq, t
+
+    check("PHASES has rise then hold, between crouch and park",
+          SEQ.PHASES == ("limp", "settle", "crouch", "rise", "hold",
+                         "park", "done"), str(SEQ.PHASES))
+
+    srb, t_srb = _to_hold("srb")
+    check("the rise ends ON THE CLOCK, with no keypress",
+          srb.phase_name == "hold",
+          "arrived %.2f s after the crouch handover" % srb.balance.rise_s)
+
+    # THE TRAP THE SPLIT CREATED.  `t_phase` resets at the boundary, and the
+    # per-leg law's smoothstep is authored against time since the RISE.  Were
+    # it authored against `t_phase` its alpha would restart at 0 here and
+    # command CROUCH_HEIGHT at full height -- a drop, at the worst moment.
+    legged, t_leg = _to_hold("per-leg")
+    h_before = legged.h_cmd
+    legged.update(t_leg + 0.004, state_at(cfg.H_LIFT))
+    close("per-leg: h_cmd does NOT restart across the rise -> hold edge",
+          legged.h_cmd, h_before, 1e-9, " m")
+    check("...and it is at the lift height, not the crouch",
+          abs(legged.h_cmd - ST.LIFT_HEIGHT) < 1e-9,
+          "%.1f mm, crouch would be %.1f"
+          % (1e3 * legged.h_cmd, 1e3 * ST.CROUCH_HEIGHT))
+
+    # REFUSED MID-RISE, and the sequence must still BE in the rise when the
+    # refusal is asked for -- a check that passes because it never got there
+    # is worse than no check.
+    mid, t_mid = _to_rise("srb")
+    mid.update(t_mid + 0.5, state_at(cfg.H_CROUCH))
+    refusal = mid.advance(t_mid + 0.5, state_at(cfg.H_CROUCH).q)
+    check("ENTER is REFUSED out of the rise -- its exit is a physical fact",
+          mid.phase_name == "rise" and isinstance(refusal, str),
+          "still in %s; %r" % (mid.phase_name, refusal))
+
+    # -- THE PUSH.  The whole reason the phase exists. --------------------
+    def _push(seq, t, roll_deg, seconds):
+        out = None
+        for _ in range(int(seconds / 0.004)):
+            t += 0.004
+            seq.update(t, state_at(cfg.H_LIFT, R=C.rot_x(np.deg2rad(roll_deg))))
+            out = seq.out
+        return t, out
+
+    t_srb, quiet = _push(srb, t_srb, 0.0, 0.2)
+    close("standing at the setpoint, the law asks for NO attitude moment",
+          quiet.wrench.b_d[3:], np.zeros(3), 1e-9, "N*m")
+
+    t_srb, pushed = _push(srb, t_srb, 6.0, 0.4)
+    check("rolled +6 deg, the moment OPPOSES it (this is the correction)",
+          pushed.wrench.b_d[3] < 0.0,
+          "Mx %+.3f N*m against roll +6.0 deg" % pushed.wrench.b_d[3])
+    check("...and it is roll alone -- no phantom pitch or yaw",
+          abs(pushed.wrench.b_d[4]) < 1e-6 and abs(pushed.wrench.b_d[5]) < 1e-6,
+          "My %+.1e  Mz %+.1e N*m" % (pushed.wrench.b_d[4],
+                                      pushed.wrench.b_d[5]))
+
+    t_srb, _ = _push(srb, t_srb, 0.0, 1.0)       # released
+    check("HoldWatch caught the excursion", srb.hold.peak_deg > 5.9,
+          "peak %.2f deg from the setpoint" % srb.hold.peak_deg)
+    check("...and that it came back", srb.hold.recovery_s() is not None
+          and srb.hold.tilt_deg < SEQ.HoldWatch.SETTLED_DEG,
+          "back under %.1f deg in %.2f s"
+          % (SEQ.HoldWatch.SETTLED_DEG, srb.hold.recovery_s() or -1))
+    check("...and recorded the moment it took",
+          srb.hold.peak_moment_nm > 0.0,
+          "%.3f N*m peak" % srb.hold.peak_moment_nm)
+
+    quiet_watch = SEQ.HoldWatch()
+    check("a hold that never moved reports no recovery rather than 0 s",
+          quiet_watch.recovery_s() is None and not quiet_watch.live)
+
+    # -- the diagnostic the hold print exists to carry --------------------
+    # err != 0 with M == 0 is a DEAD loop; err != 0 with M != 0 is a loop
+    # trying and not winning; err == 0 under a visible tilt is a WRONG
+    # SETPOINT.  The print has to be able to say which.
+    nose_up = state_at(cfg.H_LIFT, R=C.rot_y(np.deg2rad(-2.0)))
+    err = srb.balance.attitude_error_deg(nose_up)
+    close("attitude_error_deg is measured MINUS setpoint, per axis",
+          err[:2],
+          [np.degrees(nose_up.roll - srb.balance.sp_roll),
+           np.degrees(nose_up.pitch - srb.balance.sp_pitch)], 1e-12, " deg")
+    check("...and nose-UP reads NEGATIVE pitch, as the frame says",
+          err[1] < -1.9, "%+.2f deg at 2 deg nose up" % err[1])
+    check("yaw error is NaN before arm, not a false zero",
+          not np.isfinite(LAW.BalanceLaw().attitude_error_deg(nose_up)[2]),
+          "there is no heading reference until torque is live")
+
+    srb.hold.add(1.0, nose_up, srb.balance,
+                 srb.balance.update(1.0, nose_up))
+    check("the hold line carries rpy, the error and the ruler's height",
+          "rpy" in srb.hold.status() and "err" in srb.hold.status()
+          and abs(srb.hold.h - nose_up.h) < 1e-12,
+          srb.hold.status())
+    check("...and the moment the law is ASKING for, which says it is alive",
+          abs(srb.hold.moment_nm[1]) > 0.5,
+          "M_y %+.2f N*m against %+.2f deg of pitch error"
+          % (srb.hold.moment_nm[1], err[1]))
+
+    # -- the tilt stop is a PARAMETER, and still a trip -------------------
+    check("tilt_stop_deg defaults to the config value",
+          LAW.BalanceLaw().tilt_stop_deg == cfg.TILT_STOP_DEG,
+          "%.0f deg" % cfg.TILT_STOP_DEG)
+    tipped = state_at(cfg.H_CROUCH, R=C.rot_x(np.deg2rad(20.0)))
+    strict = LAW.BalanceLaw(); strict.arm(0.0, crouch)
+    loose = LAW.BalanceLaw(tilt_stop_deg=45.0); loose.arm(0.0, crouch)
+    check("20 deg trips the 12 deg stop and NOT a 45 deg one",
+          "tilt" in (strict.update(0.0, tipped).trip or "")
+          and "tilt" not in (loose.update(0.0, tipped).trip or ""),
+          "raising it is what lets a steady-state tilt be READ")
+    check("...but 50 deg still trips the raised one -- it is a trip, not off",
+          "tilt" in (loose.update(
+              0.0, state_at(cfg.H_CROUCH,
+                            R=C.rot_x(np.deg2rad(50.0)))).trip or ""))
+    check("hw.fold_stand raises it deliberately, and says so",
+          FS.TILT_STOP_DEG == 45.0 and FS.TILT_STOP_DEG > cfg.TILT_STOP_DEG,
+          "%.0f deg against the %.0f deg default"
+          % (FS.TILT_STOP_DEG, cfg.TILT_STOP_DEG))
+
+    # -- the TRACKING stop is a switch, and switching it changes no torque --
+    check("track_stop_deg defaults to config.TRACK_STOP_RAD",
+          abs(LAW.BalanceLaw().track_stop_deg
+              - np.rad2deg(cfg.TRACK_STOP_RAD)) < 1e-12,
+          "%.0f deg" % np.rad2deg(cfg.TRACK_STOP_RAD))
+    astray = state_at(cfg.H_CROUCH + 0.09)       # 90 mm off the commanded h
+    on = LAW.BalanceLaw(); on.arm(0.0, crouch)
+    off = LAW.BalanceLaw(track_stop_deg=0.0); off.arm(0.0, crouch)
+    out_on, out_off = on.update(0.0, astray), off.update(0.0, astray)
+    check("a leg far from the IK trips it ON and does NOT trip it OFF",
+          "tracking" in (out_on.trip or "")
+          and "tracking" not in (out_off.trip or ""),
+          "on: %r" % out_on.trip)
+    # THE CLAIM THE SWITCH RESTS ON: the IK feeds the trip and the log only.
+    close("...and the torque is IDENTICAL either way -- a monitor, not a law",
+          out_off.tau, out_on.tau, 0.0, " N*m")
+    close("...and q_ref is still computed and logged when it is off",
+          out_off.q_ref, out_on.q_ref, 0.0, " rad")
+    check("hw.fold_stand switches it off, deliberately",
+          FS.TRACK_STOP_DEG == 0.0,
+          "it fires at 40 mm of ramp lag against a 55 mm rise from the fold")
+
+    # =====================================================================
+    print("\n11. the FOLD posture: a crouch the lift was not designed for")
+    # =====================================================================
+    raw = C.unflat(POSE.FOLD_CAPTURED_Q)
+    hip_raw = SK.hip_to_foot_stance(raw)
+    check("the raw capture is NOT symmetric and NOT one height",
+          abs(hip_raw[0, 0] - hip_raw[1, 0]) > 1e-3
+          or np.ptp(hip_raw[:, 2]) > 1e-3,
+          "front x differ %.1f mm, foot z spans %.1f mm"
+          % (1e3 * abs(hip_raw[0, 0] - hip_raw[1, 0]),
+             1e3 * np.ptp(hip_raw[:, 2])))
+
+    close("regularised: the two front feet mirror exactly",
+          POSE.FOLD.foot_xy[0], POSE.FOLD.foot_xy[1] * [1, -1], 1e-15, " m")
+    close("...and the two rear feet",
+          POSE.FOLD.foot_xy[2], POSE.FOLD.foot_xy[3] * [1, -1], 1e-15, " m")
+    check("...and the JOINTS come out mirrored, which is the point of doing "
+          "it in foot space",
+          np.abs(POSE.FOLD.q[1] + POSE.FOLD.q[0]).max() < 1e-12
+          and np.abs(POSE.FOLD.q[3] + POSE.FOLD.q[2]).max() < 1e-12,
+          "worst %.1e rad" % max(np.abs(POSE.FOLD.q[1] + POSE.FOLD.q[0]).max(),
+                                 np.abs(POSE.FOLD.q[3] + POSE.FOLD.q[2]).max()))
+    x_fold = SK.all_foot_positions(POSE.FOLD.q)
+    close("...and all four feet are at ONE trunk-frame height",
+          x_fold[:, 2], np.full(C.N_LEGS, x_fold[0, 2]), 1e-12, " m")
+    check("regularising moved the height by under a millimetre",
+          abs(POSE.FOLD.z_origin
+              - (P.FOOT_RADIUS - SK.all_foot_positions(raw)[:, 2].mean())) < 1e-3,
+          "h %.2f mm, from a capture at %.2f"
+          % (1e3 * POSE.FOLD.h,
+             1e3 * (P.FOOT_RADIUS - SK.all_foot_positions(raw)[:, 2].mean()
+                    - cfg.TRUNK_BOTTOM_OFFSET)))
+
+    check("the fold crouch does NOT start on the floor",
+          POSE.FOLD.h > 0.05 and abs(POSE.NOMINAL.h) < 1e-9,
+          "fold h %.1f mm against nominal %.1f" % (1e3 * POSE.FOLD.h,
+                                                   1e3 * POSE.NOMINAL.h))
+    check("every leg is inside its reach at the LIFT height",
+          float(np.max(POSE.FOLD.reach_used)) < 0.9,
+          "worst %.3f of LEG_REACH at the crouch"
+          % float(np.max(POSE.FOLD.reach_used)))
+
+    # WHY foot_xy HAD TO BECOME AN ARGUMENT.
+    close("the reference at the fold's own height IS the fold pose",
+          LAW.ik_reference(POSE.FOLD.h, POSE.FOLD.q, POSE.FOLD.foot_xy),
+          POSE.FOLD.q, 1e-12, " rad")
+    nominal_ref = LAW.ik_reference(POSE.FOLD.h, POSE.FOLD.q)
+    check("...while the NOMINAL pin would trip the tracking stop at once",
+          np.abs(C.flat(nominal_ref) - C.flat(POSE.FOLD.q)).max()
+          > cfg.TRACK_STOP_RAD,
+          "%.1f deg against a %.0f deg stop -- two postures, not a failure"
+          % (np.degrees(np.abs(C.flat(nominal_ref)
+                               - C.flat(POSE.FOLD.q)).max()),
+             np.rad2deg(cfg.TRACK_STOP_RAD)))
+
+    def _lift(pose):
+        """Torque and trips over a perfectly tracked lift from `pose`."""
+        law = LAW.BalanceLaw(foot_xy=pose.foot_xy, dynamic_setpoint=False,
+                             srb=pose.srb)
+        at = lambda h: state_at(h, foot_xy=pose.foot_xy, q_seed=pose.q,
+                                srb=pose.srb)
+        law.arm(0.0, at(pose.h))
+        trips, taus, fz = [], [], None
+        for t in np.linspace(0.0, cfg.T_RISE, 61):
+            out = law.update(t, at(law.ramp.at(t).h))
+            trips.append(out.trip)
+            taus.append(float(np.abs(out.tau).max()))
+            fz = out.allocation.fz
+        return [x for x in trips if x], max(taus), fz
+
+    bad, tau_fold, fz_fold = _lift(POSE.FOLD)
+    check("THE FOLD LIFTS: no trip over the whole rise",
+          not bad, bad[0] if bad else "rise + allocator clean")
+    check("...and it needs MORE torque than the nominal crouch",
+          tau_fold > _lift(POSE.NOMINAL)[1],
+          "%.2f N*m against %.2f -- tucked rear legs, worse leverage"
+          % (tau_fold, _lift(POSE.NOMINAL)[1]))
+    check("...more than TAU_START_MAX, so the default cap CANNOT lift it",
+          tau_fold > 1.0, "%.2f N*m against a 1.0 N*m start cap" % tau_fold)
+    check("...and under TAU_STAGED_MAX, so --tau-cap 3.0 can",
+          tau_fold < 3.0, "%.2f N*m against the 3.0 N*m staged ceiling"
+          % tau_fold)
+    check("the rear feet carry MORE of the weight, as the polygon says",
+          fz_fold[2:].sum() > fz_fold[:2].sum(),
+          "front %.0f%% / rear %.0f%%, CoM sits behind the support centroid"
+          % (100 * fz_fold[:2].sum() / fz_fold.sum(),
+             100 * fz_fold[2:].sum() / fz_fold.sum()))
+
+    # -- the SRB model is PINNED PER POSTURE, and still a constant ---------
+    check("the nominal posture flies config.SRB ITSELF, not a copy",
+          POSE.NOMINAL.srb is cfg.SRB,
+          "the path hw.stand has always flown stays bit-identical")
+    check("the fold posture derives its own, and it DIFFERS",
+          POSE.FOLD.srb is not cfg.SRB
+          and abs(POSE.FOLD.srb.com_body[0] - cfg.COM_BODY[0]) > 1e-3,
+          "c^b x %+.1f mm against the nominal %+.1f"
+          % (1e3 * POSE.FOLD.srb.com_body[0], 1e3 * cfg.COM_BODY[0]))
+    check("...and it is still a CONSTANT -- same object every read",
+          POSE.FOLD.srb is POSE.FOLD.srb,
+          "pinned, not evaluated per sweep")
+    check("the arrays cannot be written through",
+          not POSE.FOLD.srb.com_body.flags.writeable)
+
+    # WHAT THE OLD PINNING COST, and it is the number the first fold run read.
+    dx = float(cfg.COM_BODY[0] - POSE.FOLD.srb.com_body[0])
+    phantom = cfg.WEIGHT * abs(dx)
+    check("pinning the NOMINAL c^b in the fold stance is a phantom moment",
+          0.6 < phantom < 1.0,
+          "%.1f mm x %.1f N = %.2f N*m; the run logged 0.67 N*m steady"
+          % (1e3 * abs(dx), cfg.WEIGHT, phantom))
+
+    # THE CANCELLATION com_command's docstring depends on: the reference and
+    # the measurement must convert with the SAME c^b or the z error is biased.
+    for pose in (POSE.NOMINAL, POSE.FOLD):
+        here = state_at(cfg.H_LIFT, foot_xy=pose.foot_xy, q_seed=pose.q,
+                        srb=pose.srb)
+        cmd = REF.com_command(REF.HeightCommand(cfg.H_LIFT, 0.0, 0.0),
+                              here.R, pose.srb)
+        close("%s: at the commanded height the CoM z error is ZERO"
+              % pose.name, cmd.p_cz, here.p_cz, 1e-9, " m")
+    mixed = REF.com_command(REF.HeightCommand(cfg.H_LIFT, 0.0, 0.0),
+                            np.eye(3), cfg.SRB)
+    fold_here = state_at(cfg.H_LIFT, foot_xy=POSE.FOLD.foot_xy,
+                         q_seed=POSE.FOLD.q, srb=POSE.FOLD.srb)
+    check("...and MIXING the two models puts a bias straight into it",
+          abs(mixed.p_cz - fold_here.p_cz) > 1e-3,
+          "%.1f mm of phantom height error -- why they travel as one object"
+          % (1e3 * abs(mixed.p_cz - fold_here.p_cz)))
+
+    bad_fix, tau_fix, _ = _lift(POSE.FOLD)
+    check("the fold still lifts with the corrected model",
+          not bad_fix, bad_fix[0] if bad_fix else "rise clean, %.2f N*m peak"
+          % tau_fix)
+
+    # -- ROLL BY MOMENT: the second fold run's roll that did not come back --
+    ixx = POSE.FOLD.srb.inertia_body[0, 0]
+    iyy = POSE.FOLD.srb.inertia_body[1, 1]
+    default = CTRL.BalanceGains()
+    check("equal kp_att is NOT equal stiffness on this robot",
+          iyy * default.kp_att[1] > 4.0 * ixx * default.kp_att[0],
+          "fold: roll %.2f N*m/rad against pitch %.2f"
+          % (ixx * default.kp_att[0], iyy * default.kp_att[1]))
+    rolled = CTRL.BalanceGains()
+    rolled.kp_att[0], rolled.kd_att[0] = FS.ROLL_GAINS
+    close("fold_stand's roll kp puts roll at DOG5's 10 N*m/rad",
+          rolled.kp_att[0] * ixx, 10.0, 0.05, " N*m/rad")
+    close("...and pitch and yaw are exactly as they were",
+          [rolled.kp_att[1], rolled.kd_att[1], rolled.kp_att[2],
+           rolled.kd_att[2]],
+          [default.kp_att[1], default.kd_att[1], default.kp_att[2],
+           default.kd_att[2]], 0.0, "")
+
+    def _roll_push(gains):
+        """The REAL law in the fold stance, rolled 5.6 deg -> commanded Mx."""
+        law = LAW.BalanceLaw(gains=gains, foot_xy=POSE.FOLD.foot_xy,
+                             dynamic_setpoint=False, srb=POSE.FOLD.srb)
+        at = lambda R=None: state_at(cfg.H_LIFT, R=R, foot_xy=POSE.FOLD.foot_xy,
+                                     q_seed=POSE.FOLD.q, srb=POSE.FOLD.srb)
+        law.arm(0.0, at())
+        law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
+        out = law.update(1.0, at(C.rot_x(np.deg2rad(5.6))))
+        return out
+    weak, stiff = _roll_push(CTRL.BalanceGains()), _roll_push(rolled)
+    check("the same 5.6 deg roll now asks for ~3x the restoring moment",
+          stiff.wrench.b_d[3] < 2.5 * weak.wrench.b_d[3] < 0.0,
+          "Mx %+.3f -> %+.3f N*m (the run logged -0.14 with the old gains)"
+          % (weak.wrench.b_d[3], stiff.wrench.b_d[3]))
+    # The residual is NOT zero and is not meant to be: LAMBDA's Tikhonov
+    # damping leaves ~1e-4 N*m at any gain.  What matters is that it stays at
+    # that floor rather than growing with the bigger ask.
+    check("...and the allocator delivers it -- no trip, residual at the "
+          "lambda floor",
+          stiff.trip is None and stiff.allocation.residual_moment < 1e-3,
+          "%.1e N*m (sustained trip %.2f); fz %s N"
+          % (stiff.allocation.residual_moment, cfg.RESIDUAL_MOMENT_NM,
+             np.array2string(stiff.allocation.fz, precision=1)))
+    stiff_lift = LAW.BalanceLaw(gains=rolled, foot_xy=POSE.FOLD.foot_xy,
+                                dynamic_setpoint=False, srb=POSE.FOLD.srb)
+    at_h = lambda h: state_at(h, foot_xy=POSE.FOLD.foot_xy,
+                              q_seed=POSE.FOLD.q, srb=POSE.FOLD.srb)
+    stiff_lift.arm(0.0, at_h(POSE.FOLD.h))
+    trips = [stiff_lift.update(t, at_h(stiff_lift.ramp.at(t).h)).trip
+             for t in np.linspace(0.0, cfg.T_RISE, 61)]
+    check("the fold still lifts clean with the stiffer roll",
+          not any(trips), "peak %.2f N*m" % stiff_lift.tau_peak)
+
+    # THE LATENCY THE CHOICE OF DAMPING WAS MADE ON.  Sampled double
+    # integrator, ZOH at the 4 ms sweep, `d` sweeps of pure delay, PD on state.
+    def _max_latency_ms(kp, kd, T=0.004):
+        for d in range(1, 60):
+            A = np.array([[1, T], [0, 1]]); B = np.array([[T * T / 2], [T]])
+            F = np.zeros((2 + d, 2 + d)); F[:2, :2] = A; F[:2, 2:3] = B
+            for i in range(2, 1 + d):
+                F[i, i + 1] = 1.0
+            F[1 + d, :2] = -np.array([kp, kd])
+            if np.abs(np.linalg.eigvals(F)).max() >= 1.0:
+                return 4 * (d - 1)
+        return 999
+    lat = _max_latency_ms(rolled.kp_att[0], rolled.kd_att[0])
+    check("kd %.0f is the roll damping with the MOST latency margin"
+          % rolled.kd_att[0],
+          lat >= max(_max_latency_ms(rolled.kp_att[0], kd)
+                     for kd in (6, 17, 29, 35)),
+          "stable to %d ms; kd 29 gets %d, kd 6 gets %d"
+          % (lat, _max_latency_ms(rolled.kp_att[0], 29.0),
+             _max_latency_ms(rolled.kp_att[0], 6.0)))
+    check("...and that margin is UNDER the IMU freeze, which is why the hold "
+          "line prints the age",
+          lat < 1e3 * cfg.IMU_MAX_AGE_S,
+          "%d ms stable against a %.0f ms freeze" % (lat, 1e3 * cfg.IMU_MAX_AGE_S))
+
+    try:
+        SEQ.StandSequence(SAFE.SafetyGate(3.0), law="per-leg", crouch=POSE.FOLD)
+        refused = None
+    except ValueError as why:
+        refused = str(why)
+    check("per-leg is REFUSED from a non-nominal crouch, not silently wrong",
+          refused is not None,
+          "it pins its springs at the nominal foot xy and has no posture")
+
+    # =====================================================================
+    print("\n12. the trot in place (gait, swing, the trot half of the law)")
+    from .. import fold_trot as FT
+    from . import gait as GAIT
+    from . import swing as SWING
+
+    # -- the clock ------------------------------------------------------
+    gait = GAIT.TrotGait()
+    gait.reset(0.0)
+    fl, fr, rl, rr = (C.LEGS.index(n) for n in ("FL", "FR", "RL", "RR"))
+    t_end = gait.cycle_start(3 * gait.settle_every)
+    ts = np.arange(0.0, t_end, 0.002)
+    samples = [gait.sample(t) for t in ts]
+    contact = np.array([s.contact for s in samples])
+    weight = np.array([s.weight for s in samples])
+    check("the diagonals pair: FL with RR, FR with RL, at every instant",
+          bool(np.all(contact[:, fl] == contact[:, rr])
+               and np.all(contact[:, fr] == contact[:, rl])))
+    check("at least two feet are planted at every instant",
+          bool(np.all(contact.sum(axis=1) >= 2)),
+          "counts seen %s" % sorted(set(contact.sum(axis=1).tolist())))
+    check("a swinging foot carries exactly zero weight",
+          bool(np.all(weight[~contact] == 0.0)))
+    check("the weight never steps (the handover is a ramp)",
+          float(np.abs(np.diff(weight, axis=0)).max()) < 0.03,
+          "worst change %.4f per 2 ms"
+          % float(np.abs(np.diff(weight, axis=0)).max()))
+    check("reset starts the clock at FULL four-foot weight -- entering moves "
+          "nothing", bool(np.all(weight[0] == 1.0)) and gait.full_support(0.0))
+    first_lift = ts[np.argmax(~contact.all(axis=1))]
+    close("...and the first foot lifts entry_s later", first_lift,
+          gait.entry_s, 0.0021, " s")
+    settle = np.array([gait.settling(t) for t in ts])
+    check("every settle is four feet at full weight",
+          settle.any() and bool(np.all(weight[settle] >= 1.0 - 1e-9)),
+          "%.2f s of settle in %.1f s" % (settle.mean() * t_end, t_end))
+    leads = []
+    for n in range(3 * gait.settle_every):
+        span = (ts >= gait.cycle_start(n)) & (ts < gait.cycle_start(n + 1))
+        off = [np.flatnonzero(~contact[span, leg]) for leg in (fl, fr)]
+        leads.append(fl if off[0][0] < off[1][0] else fr)
+    check("the lead diagonal alternates cycle by cycle (DOG5 trot_demo)",
+          all(a != b for a, b in zip(leads, leads[1:])),
+          " ".join("FL/RR" if leg == fl else "FR/RL" for leg in leads))
+    try:
+        GAIT.TrotGait(duty=0.5)
+        refused = False
+    except ValueError:
+        refused = True
+    check("duty 0.5 is refused: no window to hand the load across in",
+          refused)
+
+    # -- the allocator's trot path ----------------------------------------
+    fold = POSE.FOLD
+    at_fold = state_at(cfg.H_LIFT, foot_xy=fold.foot_xy, q_seed=fold.q,
+                       srb=fold.srb)
+    b_stand = np.array([0.0, 0.0, cfg.WEIGHT, 0.12, -0.3, 0.0])
+    a_none = ALLOC.allocate(at_fold.r_w, b_stand)
+    a_ones = ALLOC.allocate(at_fold.r_w, b_stand, contact=np.ones(4))
+    close("contact all ones is the stand's allocation (nothing clips)",
+          a_ones.f_w, a_none.f_w, 1e-9, " N")
+    diag = np.array([1.0, 0.0, 0.0, 1.0])
+    a_diag = ALLOC.allocate(at_fold.r_w, b_stand, contact=diag)
+    check("a swinging foot gets EXACTLY zero force -- not fz_min, not 1e-6",
+          bool(np.all(a_diag.f_w[[fr, rl]] == 0.0)),
+          "fz %s N" % np.array2string(a_diag.fz, precision=2))
+    # To the allocator's LAMBDA floor, not to 1e-6: the Tikhonov damping
+    # leaves a few hundredths of a newton in the force rows on two feet.
+    close("...and the diagonal still carries the robot's weight",
+          a_diag.fz.sum(), cfg.WEIGHT, 0.05, " N")
+    ramp_w = np.array([1.0, 0.002, 0.002, 1.0])
+    a_ramp = ALLOC.allocate(at_fold.r_w, b_stand, contact=ramp_w)
+    check("a foot ramping out is bounded by its weight (fz <= w fz_max)",
+          bool(np.all(a_ramp.fz <= ramp_w * cfg.FZ_MAX + 1e-9)),
+          "fz %s N" % np.array2string(a_ramp.fz, precision=2))
+
+    # -- the height over the stance feet ----------------------------------
+    close("on_stance over all four feet is read() exactly",
+          [STATE.on_stance(at_fold, np.ones(4, bool), fold.srb).p_cz,
+           STATE.on_stance(at_fold, np.ones(4, bool), fold.srb).h],
+          [at_fold.p_cz, at_fold.h], 1e-12, " m")
+    rest = SWING.rest_feet_b(cfg.H_LIFT, fold.foot_xy)
+    close("rest_feet_b is where the IK put the feet",
+          rest, at_fold.x_b, 1e-9, " m")
+    q_up = C.unflat(at_fold.q).copy()
+    apex = rest[fr] + np.array([0.0, 0.0, cfg.SWING_HEIGHT])
+    hip = apex.copy()
+    hip[:2] -= P.HIP_OFFSET[fr][:2]
+    q_up[fr] = HK.leg_ik(fr, hip, q_seed=q_up[fr])
+    lifted = STATE.read(C.flat(q_up), np.zeros(12),
+                        IMU.TrunkOrientation.level(), srb=fold.srb)
+    stance_fr = np.array([True, False, True, True])
+    check("a foot at its apex reads the trunk LOW over all four feet...",
+          lifted.h < cfg.H_LIFT - 0.009,
+          "h %.1f mm against %.1f" % (1e3 * lifted.h, 1e3 * cfg.H_LIFT))
+    close("...and exactly right over the stance feet",
+          STATE.on_stance(lifted, stance_fr, fold.srb).h, cfg.H_LIFT, 1e-9,
+          " m")
+
+    # -- the swing arc and law --------------------------------------------
+    p0, v0 = SWING.swing_reference(rest[fl], 0.0, gait.swing_duration)
+    pm, _ = SWING.swing_reference(rest[fl], 0.5, gait.swing_duration)
+    p1, v1 = SWING.swing_reference(rest[fl], 1.0, gait.swing_duration)
+    close("the arc leaves and lands on the resting site, at rest",
+          [*p0, *p1, *v0, *v1], [*rest[fl], *rest[fl], 0, 0, 0, 0, 0, 0],
+          1e-12)
+    close("...straight up: apex SWING_HEIGHT above it, no x or y",
+          pm - rest[fl], [0.0, 0.0, cfg.SWING_HEIGHT], 1e-12, " m")
+    close("the swing impedance is zero on the reference, at rest",
+          SWING.swing_torque(at_fold, fl, rest[fl], np.zeros(3)),
+          np.zeros(3), 1e-12, " N*m")
+
+    # A tracked trot through two settle blocks: the law in the fold stance,
+    # the swing legs where the arc says, the stance legs at the IK.
+    trot_gains = CTRL.BalanceGains()
+    trot_gains.kp_att[0], trot_gains.kd_att[0] = FS.ROLL_GAINS
+    trot_law = LAW.BalanceLaw(gains=trot_gains, foot_xy=fold.foot_xy,
+                              dynamic_setpoint=False, srb=fold.srb,
+                              tilt_stop_deg=FS.TILT_STOP_DEG,
+                              track_stop_deg=25.0)
+    trot_law.arm(0.0, at_fold)
+    trot_law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
+    clock = GAIT.TrotGait()
+    clock.reset(0.0)
+    q_stance = C.unflat(at_fold.q)
+    trips, taus, fz_sum, lifted_h = set(), [], [], []
+    for t in np.arange(0.0, clock.cycle_start(2 * clock.settle_every), 0.004):
+        sample = clock.sample(t)
+        q_t = q_stance.copy()
+        for leg in np.flatnonzero(~sample.contact):
+            p_arc, _ = SWING.swing_reference(rest[leg], sample.swing_s[leg],
+                                             clock.swing_duration)
+            hip = p_arc.copy()
+            hip[:2] -= P.HIP_OFFSET[leg][:2]
+            q_t[leg] = HK.leg_ik(leg, hip, q_seed=q_stance[leg])
+        body = STATE.read(C.flat(q_t), np.zeros(12),
+                          IMU.TrunkOrientation.level(), srb=fold.srb)
+        out = trot_law.update(t, body, gait=clock)
+        if out.trip:
+            trips.add(out.trip)
+        taus.append(out.tau)
+        fz_sum.append(out.allocation.fz.sum())
+        lifted_h.append(out.state.h)
+    taus = np.array(taus)
+    step = float(np.abs(np.diff(taus, axis=0)).max())
+    check("two settle blocks of trot: no trip, every torque finite",
+          not trips and bool(np.all(np.isfinite(taus))),
+          "; ".join(sorted(trips))[:60])
+    check("peak torque inside the trot's 9 N*m cap",
+          float(np.abs(taus).max()) < FT.TAU_CAP,
+          "%.2f N*m (the staged 3.0 would clip it)" % np.abs(taus).max())
+    close("the stance feet carry the weight every sweep (lambda floor)",
+          fz_sum, cfg.WEIGHT, 0.05, " N")
+    close("the height the law acts on does not see the swing apex",
+          lifted_h, cfg.H_LIFT, 1e-9, " m")
+    check("no handover step the gate's trot slew cannot follow in 2 sweeps",
+          step < 2 * cfg.TAU_SLEW_TROT_NM_S * 0.004,
+          "worst %.3f N*m in one 4 ms sweep (%.0f N*m/s)" % (step, step / 0.004))
+
+    # The residual trip: suppressed on two feet, live on four.  A monitor that
+    # fires on the first sweep with ANY residual makes the two cases differ
+    # only in which sweep the clock is on.
+    res_law = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                             srb=fold.srb, track_stop_deg=0.0)
+    res_law.arm(0.0, at_fold)
+    res_law.residual = ALLOC.ResidualMonitor(force_n=0.0, moment_nm=0.0,
+                                             streak=1)
+    two = next(t for t in ts if gait.sample(t).contact.sum() == 2)
+    two_out = res_law.update(two, at_fold, gait=gait)
+    check("on two feet the residual trip does not count the geometry",
+          two_out.trip is None and two_out.allocation.residual_moment > 0.5,
+          "residual %.2f N*m, no trip" % two_out.allocation.residual_moment)
+    four_out = res_law.update(0.0, at_fold, gait=gait)
+    check("...and on four feet the same monitor still trips",
+          four_out.trip is not None and "residual" in four_out.trip,
+          "residual %.1e N*m" % four_out.allocation.residual_moment)
+
+    # -- the phase machine --------------------------------------------------
+    seq = SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                            balance=LAW.BalanceLaw(
+                                foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                                srb=fold.srb, track_stop_deg=0.0),
+                            gait=GAIT.TrotGait())
+    refusal = seq.toggle_trot(0.0)
+    check("T is refused outside HOLD", "ignored" in refusal, refusal[:50])
+    seq.phase = SEQ.PHASES.index("hold")
+    seq.body = at_fold
+    seq.gate.start(0.0, q=at_fold.q)
+    seq.balance.arm(0.0, at_fold)
+    seq.toggle_trot(1.0)
+    check("T from HOLD trots, and the phase NAME says so",
+          seq.trotting and seq.phase_name == "trot")
+    check("ENTER is refused while trotting",
+          isinstance(seq.advance(1.1, at_fold.q), str))
+    seq.toggle_trot(1.0 + seq.gait.entry_s + 0.05)       # latched mid-swing
+    t_latch = 1.0 + seq.gait.entry_s + 0.05
+    mid = seq.update(t_latch, at_fold)
+    check("a latched exit is NOT taken mid-swing",
+          seq.trotting and mid[0] == "torque")
+    t = t_latch
+    while seq.trotting and t < t_latch + 2.0:
+        t += 0.004
+        seq.update(t, at_fold)
+    check("...it is taken at the next four-foot window, back to HOLD",
+          seq.phase_name == "hold" and seq.gait.full_support(t),
+          "%.2f s after the latch" % (t - t_latch))
+    try:
+        SAFE.SafetyGate(FT.TAU_CAP)
+        default_refuses = False
+    except ValueError:
+        default_refuses = True
+    knee = list(C.LEGS).index("RR") * 3 + 2
+    def _knee_trip(trip_on):
+        gate = SAFE.SafetyGate(3.0, overspeed_trip=trip_on)
+        q_run, qd_run = np.zeros(12), np.zeros(12)
+        qd_run[knee] = 7.5
+        gate.start(0.0, q=q_run)
+        reason = None
+        for i in range(1, 6):
+            q_run = q_run.copy()
+            q_run[knee] += 7.4 * 0.004
+            reason = reason or gate.estop_reason(q_run, qd_run, 0.004 * i)
+        return reason, gate.qd_peak[knee]
+    on, _ = _knee_trip(True)
+    off, peak = _knee_trip(False)
+    check("the 2026-09-16 knee speed trips the stand's gate, not the trot's",
+          on is not None and off is None and peak == 7.5,
+          "trot gate kept the %.1f rad/s peak" % peak)
+    check("the 9 N*m cap needs the ceiling raised explicitly",
+          default_refuses and SAFE.SafetyGate(
+              FT.TAU_CAP, ceiling=FT.TAU_CAP).tau_cap == SAFE.TAU_HARD_NM)
 
     # =====================================================================
     print("\n" + "=" * 78)

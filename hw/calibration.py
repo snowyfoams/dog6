@@ -4,16 +4,18 @@ Ported from DOG5, whose version of this ran on a real robot.  Same drivers,
 same 0x9C register, same 10:1 gearbox, so the CONTRACT carries across intact.
 
 WHAT DOES NOT CARRY ACROSS IS THE DIRECTION COLUMN IT MULTIPLIES BY.  DOG5's
-was confirmed on DOG5; `hardware_map` is empty on DOG6, and every function
-here that touches joint coordinates therefore raises `MapIncomplete` rather
-than working on somebody else's signs.  `joint_directions()` is a function
-and not a module-level array for exactly that reason: an array would have had
-to contain SOMETHING at import time, and any something is a lie.
+was confirmed on DOG5.  DOG6's was read off DOG6 on 2026-09-15, confirmed
+joint by joint, and it lives in `hardware_map` -- measured, not borrowed.
+Every function here still goes through `joint_directions()`, which still
+raises `MapIncomplete` when a row is missing: the measurement satisfied that
+guard, it did not remove it.  `joint_directions()` is a function and not a
+module-level array for exactly that reason -- an array would bind whatever
+the table said at import time, and a re-flashed driver would go unseen.
 
-Runnable today with an empty map: `soft_limits`, `EncoderUnwrap`,
-`new_unwrappers`, and the parts of `validate` that do not need wiring.  Those
-are the motor's own frame and the project's conventions -- neither depends on
-which driver is which.
+Independent of the wiring, and so runnable even with no map at all:
+`soft_limits`, `EncoderUnwrap`, `new_unwrappers`, and the parts of `validate`
+that do not need it.  Those are the motor's own frame and the project's
+conventions -- neither depends on which driver is which.
 
 THE CONTRACT, IN TWO LINES, WITH NOTHING HIDDEN IN IT
 
@@ -38,7 +40,10 @@ THE CALIBRATION POSE IS `coordinates.Q_ZERO` -- flat on the belly, all twelve
 joints reading zero, legs straight out fore-and-aft.  That is a convention
 DOG6 inherits from DOG5 unchanged, and `coordinates` explains why it is the
 pose a human can actually put a robot into on a bench.  DOG6's CAD is drawn
-STANDING, so the flat pose is a reconstruction -- it is still the zero.
+STANDING, so the flat pose is a reconstruction -- and on 2026-09-15 DOG6's
+twelve drivers were zeroed at it, which makes it the robot's zero and not
+just the model's.  `coordinates` records which way the leg plane folds there;
+that fold is fixed by the built robot.
 
 The 16-bit register wraps.  :class:`EncoderUnwrap` turns it into a continuous
 angle by counting the wraps, centring the FIRST sample into [-180, 180) deg so
@@ -80,14 +85,16 @@ __all__ = ["ENCODER_GAIN", "joint_directions", "LIMIT_ESTOP_MARGIN",
 def joint_directions() -> np.ndarray:
     """The measured direction column as a (12,) vector of +/-1.
 
-    A FUNCTION, NOT A CONSTANT, AND THAT IS THE WHOLE POINT.  Nothing has been
-    measured on DOG6, so there is no vector to bind at import time -- and a
-    module-level array of twelve plausible values is exactly the artifact that
-    lets an unmeasured robot run.  Every conversion below calls this, so every
-    one of them raises `MapIncomplete` until the map is real.
+    A FUNCTION, NOT A CONSTANT, AND THAT IS STILL THE WHOLE POINT.  DOG6's
+    twelve are measured now, so this returns them -- but binding them at
+    import time would freeze the column against a table that can change, and
+    a module-level array of twelve plausible values is the artifact that lets
+    an UNMEASURED robot run.  Every conversion below calls this, so every one
+    of them raises `MapIncomplete` the moment a row goes missing rather than
+    carrying on with a stale copy.
 
     It goes through `hardware_map.directions()` rather than reading the table
-    directly, so the lookup happens at call time and a hand-edited row takes
+    directly, so the lookup happens at call time and a re-measured row takes
     effect without an import dance.
     """
     return np.asarray(directions(), dtype=float)

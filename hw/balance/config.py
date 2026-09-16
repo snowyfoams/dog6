@@ -51,6 +51,8 @@ WHY THE CoM IS A CONSTANT HERE, AND WHAT THAT COSTS
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 if __package__ in (None, ""):        # allow `python hw/balance/config.py` too
@@ -127,6 +129,54 @@ COM_BODY.flags.writeable = False
 INERTIA_BODY = np.array(_inertia, dtype=float)
 INERTIA_BODY.flags.writeable = False
 
+
+@dataclass(frozen=True)
+class SrbModel:
+    """The two pinned numbers, KEPT TOGETHER because they must not drift apart.
+
+    c^b and I^b are both DERIVED FROM ONE POSE, and three places consume them:
+    `state.read` (the moment arms and the measured CoM height),
+    `reference.com_command` (the commanded CoM height) and
+    `controller.balance_wrench` (I_G).  Passing them separately is how the
+    reference ends up converting with one c^b while the measurement uses
+    another -- and `com_command`'s docstring is explicit that the whole offset
+    only cancels out of the z error because BOTH SIDES USE THE SAME CONSTANT.
+    One object, passed whole, is what makes that structural instead of a rule.
+
+    STILL PINNED, STILL CONSTANT.  This is not a step toward evaluating the
+    CoM per sweep -- that would break exactly the cancellation above and make
+    the commanded CoM rate 48 % too fast over the ramp.  What it fixes is the
+    POSE THE CONSTANT IS DERIVED AT: the model wants "the stance it will
+    actually hold", and holding a folded crouch is a different stance from
+    holding the nominal one.
+    """
+
+    name: str
+    com_body: np.ndarray             # (3,) m, whole-robot CoM from the origin
+    inertia_body: np.ndarray         # (3, 3) kg m^2, about that CoM
+
+    @classmethod
+    def from_pose(cls, name: str, q) -> "SrbModel":
+        """Derive both from a (4, 3) joint pose -- the stance that will be held."""
+        com, inertia = SK.body_inertia(np.asarray(q, dtype=float))
+        com = np.array(com, dtype=float)
+        inertia = np.array(inertia, dtype=float)
+        com.flags.writeable = False
+        inertia.flags.writeable = False
+        return cls(name=name, com_body=com, inertia_body=inertia)
+
+    def describe(self) -> str:
+        return ("c^b (%+.1f, %+.1f, %+.1f) mm   I^b diag (%.4f, %.4f, %.4f) "
+                "kg m^2   [%s]"
+                % (*(1e3 * self.com_body), *np.diag(self.inertia_body),
+                   self.name))
+
+
+#: The nominal model: what `hw.stand` has always flown.  Identical to the two
+#: constants above, which stay because `describe`, `selftest` and the banner
+#: all name them.
+SRB = SrbModel(name="nominal", com_body=COM_BODY, inertia_body=INERTIA_BODY)
+
 MASS = float(P.MASS)                                    # 5.8828 kg   [CAD]
 WEIGHT = float(P.WEIGHT)                                # 57.71 N     [CAD]
 
@@ -185,6 +235,54 @@ KD_YAW = 10.0           # 1/s
 #: way to name.
 KP_XY = 0.0
 KD_XY = 0.0
+
+
+# ===========================================================================
+# the attitude SETPOINT  (law.py, latched by sequence.py)
+# ===========================================================================
+#: WHAT "LEVEL" MEANS FOR A RUN.  Ported from DOG5's config, where it flew as
+#: SETPOINT_DYNAMIC from 2026-08-28 -- the IMU mount is the same board in the
+#: same orientation on both robots, so the convention ports with it.
+#:
+#: With this True, `sequence.StandSequence` reads the roll/pitch the IMU
+#: reports during the LIMP phase -- zero torque, the robot resting wherever
+#: the operator put it -- and latches the attitude setpoint to THAT reading.
+#: `law.BalanceLaw.arm` then builds R_des from the latched pair at the
+#: arm-time heading, so body <-> world is EXACTLY (0, 0, 0) at the initial
+#: stand on all three axes.  It is the yaw lock's "world := body here"
+#: convention, completed: yaw already had it, roll and pitch did not.
+#:
+#: WHAT IT ABSORBS, PER RUN, WITH NOTHING TO MEASURE OR TRANSCRIBE: the IMU
+#: mount tilt, the floor's slope, and the resting pose's lean, all three at
+#: once.  That is why DOG5 stopped typing a setpoint into this file.
+#:
+#: WHAT IT COSTS, AND IT IS THE SAME COST DOG5 ACCEPTED: "level" for the run
+#: is the LIMP attitude.  Start the robot on a slope and it will hold that
+#: slope, and `TILT_STOP_DEG` measures from it too.  For a stand on one patch
+#: of floor that is the right trade -- the legs push against the floor that is
+#: there.  It is the wrong trade the day the robot has to stay upright across
+#: a slope it did not start on.
+#:
+#: LATCHED ONCE PER RUN, IN LIMP ONLY.  Deliberately NOT re-latched when a
+#: later phase passes back through zero torque, and the asymmetry with the yaw
+#: lock is the point: heading has no truth to return to, but LEVEL does, and
+#: re-latching roll/pitch mid-run would redefine level as whatever tilt the
+#: robot was limping at and drag the tilt stop's reference along with it.
+SETPOINT_DYNAMIC = True
+
+#: The PRE-LATCH pair, and the sanity reference the latch is warned against.
+#: These are DOG5's measured values for this board on a level floor; with
+#: SETPOINT_DYNAMIC False they are the whole story, exactly as DOG5 ran before
+#: the dynamic latch existed.  UNVERIFIED ON DOG6 -- the board is not mounted,
+#: and the moment it is these become the number to re-measure.
+SETPOINT_ROLL_DEG = -0.29
+SETPOINT_PITCH_DEG = 0.12
+
+#: How far the latched pair may sit from the statics above before the runner
+#: says so.  Not a trip: a robot legitimately limps at a few degrees on an
+#: uneven floor.  It is the warning DOG5 printed, and it is what catches the
+#: case the convention cannot -- the robot propped against something at WAIT.
+SETPOINT_WARN_DEG = 2.0
 
 
 # ===========================================================================
@@ -269,6 +367,53 @@ RESIDUAL_MOMENT_NM = 0.25 * WEIGHT * 0.065       # 0.94 N*m
 RESIDUAL_STREAK = 25                             # sweeps -> 0.10 s at 250 Hz
 
 
+# ===========================================================================
+# the trot in place  (gait.py, swing.py, and the trot half of law/sequence)
+# ===========================================================================
+# EVERY NUMBER IN THIS SECTION IS ONE DOG5 FLEW in
+# dog5/src/dog5_trot_quasi_static_model/config.py (trot_demo.py's run), and
+# is tagged [DOG5 FLOWN].  The STRUCTURE is cMPC's -- `sim.cmpc.gait`'s phase
+# arithmetic and `sim.cmpc.swing`'s arc -- and the operator's two decisions of
+# 2026-09-16 sit on top: no foot placement (the foot rises and lands on the
+# spot it left, in the trunk frame), and a torque cap at the motors' own 9 N*m.
+
+#: One full cycle, the duty, and the diagonal pairing over (FL, FR, RL, RR).
+#: DUTY > 0.5 IS NOT A PREFERENCE: the contact ramp below needs a window with
+#: both diagonals down to hand the load across in, and at 0.5 there is none.
+GAIT_PERIOD = 1.2                   # s       [DOG5 FLOWN]
+DUTY = 0.80                         #         [DOG5 FLOWN]
+PHASE_OFFSET = np.array([0.0, 0.5, 0.5, 0.0])    # FL+RR, FR+RL   [DOG5 FLOWN]
+
+#: Fraction of stance over which a foot's share of the load smoothsteps up
+#: after touchdown and down before liftoff.  DOG5 measured a 2.2 N*m torque
+#: step per handover without it, and collapsed eight runs in a row on
+#: 2026-08-28 the one time it was removed.  [DOG5 FLOWN]
+CONTACT_RAMP = 0.15
+
+#: trot_demo's re-level: every SETTLE_EVERY full cycles the gait clock freezes
+#: for SETTLE_S with all four feet at full weight, and the lead diagonal
+#: alternates every cycle so an order-dependent drift flips sign instead of
+#: integrating.  DOG5 never solved its trot roll; this is how its demo held.
+SETTLE_S = 0.2                      # s       [DOG5 FLOWN]
+SETTLE_EVERY = 2                    # cycles  [DOG5 FLOWN]
+ALTERNATE_LEAD = True               #         [DOG5 FLOWN]
+
+#: The swing apex above the resting foot, in the trunk frame.  [DOG5 FLOWN]
+SWING_HEIGHT = 0.040                # m
+
+#: Swing-foot Cartesian impedance, TRUNK frame, (x, y, z).  N/m and N s/m --
+#: FORCE gains on the foot, not the balance PD's acceleration gains.
+#: DOG5's, not cMPC's 500/20: those were tuned in MuJoCo against a
+#: feedforward this runner does not carry (see swing.py).  [DOG5 FLOWN]
+KP_SWING = np.array([140.0, 140.0, 180.0])
+KD_SWING = np.array([8.0, 8.0, 15.0])
+
+#: `safety.SafetyGate`'s slew for a trot.  The gate's default 5 N*m/s is the
+#: stand's and would take 0.35 s to follow one handover -- longer than the
+#: ramp it is following.  60 is what every DOG5 trot run used.  [DOG5 FLOWN]
+TAU_SLEW_TROT_NM_S = 60.0
+
+
 def describe() -> str:
     return "\n".join([
         "DOG6 balance controller configuration",
@@ -310,12 +455,28 @@ def describe() -> str:
         "    mu %.2f   fz [%.1f, %.1f] N   W (t,t,n) = (%.0f, %.0f, %.0f)"
         "   lambda %.1e" % (MU, FZ_MIN, FZ_MAX, W_TANGENTIAL, W_TANGENTIAL,
                             W_NORMAL, LAMBDA),
+        "  attitude setpoint",
+        "    %s" % ("DYNAMIC -- latched from the LIMP reading, once per run"
+                    if SETPOINT_DYNAMIC else
+                    "STATIC -- the config pair below, as DOG5 ran pre-2026-08-28"),
+        "    statics     roll %+.2f  pitch %+.2f deg   (%s; warn past %.1f)"
+        % (SETPOINT_ROLL_DEG, SETPOINT_PITCH_DEG,
+           "pre-latch + sanity reference" if SETPOINT_DYNAMIC else "IN USE",
+           SETPOINT_WARN_DEG),
         "  trips",
         "    tilt %.0f deg   tracking %.0f deg   imu age %.0f ms (freeze, "
         "not trip)" % (TILT_STOP_DEG, np.rad2deg(TRACK_STOP_RAD),
                        1e3 * IMU_MAX_AGE_S),
         "    residual %.1f N / %.2f N*m sustained %d sweeps"
         % (RESIDUAL_FORCE_N, RESIDUAL_MOMENT_NM, RESIDUAL_STREAK),
+        "  trot in place  [DOG5 FLOWN]",
+        "    period %.2f s  duty %.2f  ramp %.2f  settle %.2f s every %d "
+        "cycles, lead %s"
+        % (GAIT_PERIOD, DUTY, CONTACT_RAMP, SETTLE_S, SETTLE_EVERY,
+           "alternating" if ALTERNATE_LEAD else "fixed"),
+        "    swing apex %.0f mm, no placement   Kp %s N/m  Kd %s N s/m   "
+        "slew %.0f N*m/s"
+        % (1e3 * SWING_HEIGHT, KP_SWING, KD_SWING, TAU_SLEW_TROT_NM_S),
     ])
 
 

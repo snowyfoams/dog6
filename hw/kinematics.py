@@ -25,6 +25,20 @@ WHY A SECOND KINEMATICS EXISTS AT ALL, WHEN `sim.kinematics` SAYS IT MUST NOT
     really about speed.  None of this is a reason to trust the file; the gate
     is.
 
+READ AGAINST THE ROBOT, 2026-09-15
+    This file is the YARDSTICK the hardware map's direction column was
+    measured against.  `hw.bringup spin --joint <label>` prints what a
+    POSITIVE joint angle here does to that foot; the operator drove each of
+    the twelve and recorded which way the foot actually went.  All twelve
+    agreed, and `hw.bringup check` then re-drove each in joint coordinates
+    through the measured sign.  So the closed form below is not only gated
+    against `sim.kinematics` -- its predictions have been compared with a
+    real foot, twelve times, from the flat zero.
+
+    That is a statement about the FK and the frames, not about the torques.
+    `hw.stand`'s lift phase did not hold on 2026-09-15; nothing in this file
+    is implicated in that, and `hw.balance` is where it is being addressed.
+
 WHAT THE ROBOT ACTUALLY HAS TO CARRY
     This module, `hw/__init__.py`, `sim/__init__.py`, `sim/coordinates.py`,
     `sim/params.py`, and numpy.  Five files.  No MuJoCo, no model/, no meshes,

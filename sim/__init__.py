@@ -1,10 +1,16 @@
-"""DOG6 simulation module -- the robot as a model, before the robot exists.
+"""DOG6 simulation module -- the robot as a model, independent of the robot.
 
-DOG6's hardware is on the bench being assembled.  This module is what can be
-true about the robot before a single motor is powered: the CAD's geometry, its
-mass properties, the frames everything is expressed in, and the maps between
-joint angles and foot positions.  Nothing here talks to hardware; that is
-`hw`, which is deliberately still empty.
+This module is what is true of the DESIGN: the CAD's geometry, its mass
+properties, the frames everything is expressed in, and the maps between joint
+angles and foot positions.  It was written before a single motor was powered.
+Nothing here talks to hardware; that is `hw`, whose wiring was measured on the
+assembled DOG6 on 2026-09-15.
+
+    What that measurement reached back into this module is `coordinates`:
+    the flat zero's leg fold is fixed by the BUILT robot, and where it and the
+    CAD pipeline disagree, the robot wins.  `coordinates.R_BODY_IMU` is a
+    separate matter and is still an identity PLACEHOLDER -- the stand sequence
+    used no IMU, so nothing has checked it.
 
     coordinates   frames, signs, naming, pose conventions.  No numbers.
     params        masses, inertias, lengths, limits, actuator spec.  No logic.

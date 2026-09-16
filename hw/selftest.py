@@ -7,36 +7,35 @@ WHAT THIS CAN AND CANNOT TELL YOU
             direction convention is applied consistently in BOTH directions,
             that the encoder unwrap survives a wrap, that the safety gate
             shapes and trips the way it claims, that the IMU frame maths is
-            self-consistent -- and that every path needing joint coordinates
-            REFUSES while `hardware_map` is empty.  All of that is code, and
-            code can be checked on a laptop.
+            self-consistent, and that the torque gate refuses a map with a
+            hole in it.  All of that is code, and code can be checked on a
+            laptop.
 
     CANNOT  which motor is which joint, or which way it turns.  Those are
-            physical facts about an assembled robot.  Nothing here can supply
+            physical facts about an assembled robot.  DOG6's were established
+            on 2026-09-15 by `hw.bringup`, on the robot, and they live in
+            `hardware_map` -- not here.  Nothing in this file can re-derive
             them and nothing here pretends to.
 
     So a green run means "the plumbing is sound", never "it is safe to power
     the robot".  That distinction is why this file exists separately from
     `sim.selftest`, which gates the kinematics against MuJoCo.
 
-THE MAP IS EMPTY, SO THE PROTOCOL SECTION SUPPLIES ITS OWN
-    `hardware_map` has no CAN ids and no directions -- see there for why
-    DOG5's are not borrowed.  Section 5 therefore installs a SYNTHETIC map
-    with deliberately awkward ids and mixed signs, and drives the real code
-    through it: `motor_ids`, `motor_directions`, `MotorBus`, `joint_state`,
-    `set_zero_all`, `SafetyGate`.  The synthetic table lives for the length of
-    a `with` block and is never importable, so nothing can accidentally run on
-    it -- but every line it exercises is a line the real map will run through.
-
-    Section 3 checks the other half: that those same paths REFUSE on the real,
-    empty map, with `MapIncomplete` and no override.
+THE PROTOCOL SECTION SUPPLIES ITS OWN MAP, AND STILL SHOULD
+    Section 4 installs a SYNTHETIC map with deliberately awkward ids and mixed
+    signs and drives the real code through it: `motor_ids`,
+    `motor_directions`, `MotorBus`, `joint_state`, `set_zero_all`,
+    `SafetyGate`.  Running it against DOG6's own table instead would prove
+    LESS, not more -- ids 1..12 in ascending order are exactly the arrangement
+    in which an off-by-one indexes the right value by accident.  The synthetic
+    table lives for the length of a `with` block and is never importable.
 
 THE DIRECTION ROUND-TRIP IS THE CHECK WORTH HAVING
     `MotorBus.position` applies a joint's direction on the way out;
     `MotorBus.encoders_deg` does NOT apply it on the way back, while
     `speeds_dps` and `torques_nm` DO.  Three conventions in one class, all
     correct, all easy to mix up -- and a mix-up is a joint that reads the
-    mirror of where it is.  Section 5 drives all twelve through a real 0xA4
+    mirror of where it is.  Section 4 drives all twelve through a real 0xA4
     and reads them back through `hw.calibration`, which is the only
     combination a controller actually uses.
 """
@@ -102,6 +101,15 @@ def raises(label: str, fn, exc=Exception, detail: str = "") -> None:
 _SYNTHETIC_IDS = [7, 14, 21, 28, 35, 42, 49, 56, 63, 70, 77, 84]
 _SYNTHETIC_DIRS = [+1, -1, -1, +1, +1, -1, -1, +1, -1, +1, +1, -1]
 
+#: DOG6's own bring-up, 2026-09-15, restated here ON PURPOSE.  This is a
+#: SECOND COPY of a measurement, which anywhere else in this project would be
+#: the bug -- but a copy that is only ever COMPARED is the opposite of a stale
+#: one.  Nothing reads these to drive a motor; they exist so an edit to
+#: `hardware_map` nobody meant turns this file red rather than passing quietly.
+#: Re-wire the robot and both change together, in one commit.
+_MEASURED_IDS = frozenset(range(1, 13))
+_MEASURED_NEGATIVE_IDS = frozenset({3, 6, 7, 9, 10, 12})
+
 
 @contextlib.contextmanager
 def _synthetic_map():
@@ -111,7 +119,7 @@ def _synthetic_map():
     `motor_ids`, `directions`, `is_complete`, `hw.calibration`, `hw.safety` --
     reaches the table through a FUNCTION that resolves it at call time, which
     is exactly why they are functions.  A module that imported the tuple by
-    name would not see this, and would silently keep testing the empty map.
+    name would not see this, and would silently keep testing DOG6's own.
     """
     original = HM.HARDWARE_JOINTS
     HM.HARDWARE_JOINTS = tuple(
@@ -127,22 +135,56 @@ def _synthetic_map():
         HM.HARDWARE_JOINTS = original
 
 
+@contextlib.contextmanager
+def _holed_map():
+    """Blank ONE row for the length of a block, to prove the guard still fires.
+
+    `hw.safety` refuses a map it cannot read every sign from, and that refusal
+    is a SAFETY GATE, not a note about how far the bring-up has got: a driver
+    that is replaced or re-flashed puts its row back to None, and the gate is
+    what stops a torque law running on the eleven signs that are left.  DOG6's
+    table is complete, so the hole has to be made here.
+
+    One row, not twelve -- a single hole is the case that actually happens and
+    the harder one to catch.
+    """
+    original = HM.HARDWARE_JOINTS
+    HM.HARDWARE_JOINTS = (
+        (HM.HardwareJoint(original[0].leg, original[0].joint,
+                          original[0].model_name),) + original[1:])
+    try:
+        HM.validate()
+        yield
+    finally:
+        HM.HARDWARE_JOINTS = original
+
+
 # ===========================================================================
 def main() -> int:
     print("DOG6 hardware self-test  (no robot, no adapter, no MuJoCo)\n")
 
     # -- 1. the tables ------------------------------------------------------
     print("tables")
+    real_table = HM.HARDWARE_JOINTS   # to prove every patch below is undone
     HM.validate()
     CAL.validate()
-    check("hardware_map and calibration validate on an EMPTY map", True,
-          "%d rows, %d wired" % (HM.N_JOINTS, len(HM.assigned())))
+    check("hardware_map and calibration validate", True,
+          "%d rows, %d wired, %d confirmed"
+          % (HM.N_JOINTS, len(HM.assigned()), HM.confirmed_count()))
     check("the map is in coordinates.JOINT_NAMES order",
           tuple(j.model_name for j in HM.HARDWARE_JOINTS) == C.JOINT_NAMES)
-    check("no row carries a borrowed CAN id or direction",
-          all(j.can_id is None and j.direction is None
-              for j in HM.HARDWARE_JOINTS),
-          "DOG5's table is deliberately absent")
+    check("every row is a measurement read off DOG6",
+          HM.is_complete() and HM.confirmed_count() == HM.N_JOINTS,
+          "2026-09-15, `bringup spin` then `bringup check`, one motor at a time")
+    # A TRIPWIRE, NOT A DERIVATION.  Nothing reads these to drive a motor --
+    # see `_MEASURED_IDS`.  An unintended edit to `hardware_map` turns this
+    # red instead of passing quietly.
+    check("...and it is still the record from that day",
+          {j.can_id for j in HM.HARDWARE_JOINTS} == _MEASURED_IDS
+          and {j.can_id for j in HM.HARDWARE_JOINTS if j.direction < 0}
+          == _MEASURED_NEGATIVE_IDS,
+          "ids 1..12, -1 on %s"
+          % ", ".join(str(i) for i in sorted(_MEASURED_NEGATIVE_IDS)))
     check("the module flag cannot be True on an incomplete map",
           not (CONFIRMED_ON_DOG6 and not HM.is_complete()),
           "%d/%d wired, %d/%d confirmed, CONFIRMED_ON_DOG6=%s"
@@ -184,7 +226,7 @@ def main() -> int:
                                   base[0].model_name, confirmed=True),)
                + base[1:]), ValueError)
 
-    # -- 2. what survives an empty map -------------------------------------
+    # -- 2. the motor's own frame, which needs no map ----------------------
     print("\nthe motor frame, which needs no map")
     check("the conversion has NO gearbox division",
           abs(CAL.ENCODER_GAIN - 360.0 / 65535.0) < 1e-15,
@@ -207,30 +249,19 @@ def main() -> int:
           "abd +-%.2f  pitch +-%.2f  knee +-%.2f rad"
           % (P.ABD_LIM, P.PITCH_LIM, P.KNEE_LIM))
 
-    # -- 3. what REFUSES on an empty map -----------------------------------
-    print("\nthe refusals, which are the point of the empty map")
-    probe = np.linspace(-2.5, 2.5, HM.N_JOINTS)
-    raises("motoroutput_deg -> joint_rad refuses",
-           lambda: CAL.motoroutput_deg_to_joint_rad(probe), MapIncomplete,
-           "MapIncomplete naming the %d rows still to measure"
-           % len(HM.unassigned()))
-    raises("...and joint_rad -> motoroutput_deg refuses",
-           lambda: CAL.joint_rad_to_motoroutput_deg(probe), MapIncomplete)
-    raises("hardware_map.motor_ids() refuses", HM.motor_ids, MapIncomplete)
-    raises("hardware_map.motor_directions() refuses", HM.motor_directions,
-           MapIncomplete)
-    raises("SafetyGate refuses to construct", SAFE.SafetyGate, MapIncomplete)
-    raises("...and unconfirmed_reason does NOT override that tier",
-           lambda: SAFE.SafetyGate(0.5, unconfirmed_reason="a good reason"),
-           MapIncomplete, "there are no signs for a reason to override")
-    raises("FakeDriverBus refuses to invent a default id list",
-           lambda: __import__("hw.fake_bus", fromlist=["x"]).FakeDriverBus(),
-           MapIncomplete)
-    check("hw.require_confirmed() refuses",
-          _refuses(lambda: __import__("hw", fromlist=["x"]).require_confirmed()))
-
-    # -- 4. the safety gate, under a synthetic map -------------------------
+    # -- 3. the safety gate, under a synthetic map -------------------------
     print("\nthe safety gate")
+    # The torque gate still refuses a map with a HOLE in it, and that is a
+    # safety gate rather than a statement about DOG6: it is what stands
+    # between a re-flashed driver and a torque law running on a sign nobody
+    # measured.  DOG6's own table is complete, so the state has to be made.
+    with _holed_map():
+        raises("a torque gate refuses a map with a hole in it",
+               SAFE.SafetyGate, MapIncomplete,
+               "one row blanked; `MapIncomplete` names it")
+        raises("...and unconfirmed_reason does NOT override that tier",
+               lambda: SAFE.SafetyGate(0.5, unconfirmed_reason="a good reason"),
+               MapIncomplete, "there are no signs for a reason to override")
     check("the staged ceiling stands but does not trot",
           2.20 < SAFE.TAU_STAGED_MAX < 4.46,
           "%.1f N*m, against 2.20 measured to stand and 4.46 to trot"
@@ -318,7 +349,7 @@ def main() -> int:
                                       errors={_SYNTHETIC_IDS[0]: 0x80}),
               "0x80 is recovered over CAN by the arming ladder")
 
-    # -- 5. the protocol path, against fake drivers ------------------------
+    # -- 4. the protocol path, against fake drivers ------------------------
     print("\nthe protocol path, against hw.fake_bus under a synthetic map")
     from .fake_bus import FakeDriverBus
     from .motor import motorbus
@@ -382,10 +413,12 @@ def main() -> int:
                    lambda: CAL.set_zero_all(mb), RuntimeError)
 
     check("the synthetic map is gone again afterwards",
-          not HM.is_complete() and len(HM.assigned()) == 0,
-          "the real table is still empty, as it should be")
+          HM.HARDWARE_JOINTS is real_table
+          and HM.confirmed_count() == HM.N_JOINTS,
+          "DOG6's measured table is back, %d/%d wired and confirmed"
+          % (len(HM.assigned()), HM.N_JOINTS))
 
-    # -- 6. the IMU frame maths --------------------------------------------
+    # -- 5. the IMU frame maths --------------------------------------------
     print("\nthe IMU frame maths (no device)")
     check("SENSOR_TO_FLU is Rx(180 deg) and is its own inverse",
           np.allclose(IMU.SENSOR_TO_FLU @ IMU.SENSOR_TO_FLU, np.eye(3))
@@ -393,9 +426,11 @@ def main() -> int:
           "diag%s" % (tuple(int(v) for v in np.diag(IMU.SENSOR_TO_FLU)),))
     close("SENSOR_TO_TRUNK == R_BODY_IMU @ SENSOR_TO_FLU",
           IMU.SENSOR_TO_TRUNK, C.R_BODY_IMU @ IMU.SENSOR_TO_FLU, 1e-15)
-    check("R_BODY_IMU is still the identity PLACEHOLDER",
-          bool(np.allclose(C.R_BODY_IMU, np.eye(3))),
-          "the board is not mounted; sim.selftest gates it against the MJCF")
+    check("R_BODY_IMU is the identity AND that is a measurement",
+          bool(np.allclose(C.R_BODY_IMU, np.eye(3)))
+          and bool(C.R_BODY_IMU_MEASURED),
+          "board mounted aligned with the trunk, as DOG5; sim.selftest gates "
+          "it against the MJCF's imu site quat")
     roll, pitch, yaw, wx, wy, wz = IMU.sensor_to_trunk(5.0, 3.0, 20.0,
                                                        (0.1, 0.2, 0.3))
     check("NED -> FLU negates pitch, heading and the y/z rates",
@@ -406,7 +441,7 @@ def main() -> int:
           IMU.wrap_deg(180.0) == 180.0 and IMU.wrap_deg(-180.0) == 180.0
           and IMU.wrap_deg(190.0) == -170.0)
 
-    # -- 7. the yardstick the bring-up reads directions against ------------
+    # -- 6. the yardstick the bring-up read directions against -------------
     print("\nhw.kinematics, which is what makes a measured direction readable")
     rows = HM.direction_check_table(0.1)
     check("the direction-check table needs no map at all",
@@ -429,8 +464,10 @@ def main() -> int:
         for name in _FAILURES:
             print("  FAILED: %s" % name)
         return 1
-    print("the hardware plumbing is sound.  The map is EMPTY -- see "
-          "hw/README.md, then `python -m hw.bringup plan`.")
+    print("the hardware plumbing is sound, over the map measured on DOG6 on "
+          "2026-09-15.\nThat is still not 'safe to power': section 4 ran "
+          "against `fake_bus`, which obeys whatever\nmap it is handed.  "
+          "`python -m hw.bringup plan` for where the robot is.")
     return 0
 
 

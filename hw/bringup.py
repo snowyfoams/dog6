@@ -11,9 +11,14 @@
     ...any of them with --fake to run the whole path against software drivers.
 
 DISCOVERY, NOT VERIFICATION, AND THAT IS THE DIFFERENCE FROM DOG5
-    DOG5's tools checked a table that already existed.  DOG6 has no table --
-    `hardware_map` is empty on purpose -- so these build one.  The two halves
-    are found separately because they are found by different observations:
+    DOG5's tools checked a table that already existed.  These BUILD one, and
+    on 2026-09-15 they built DOG6's: twelve rows, each spun, then re-driven
+    in joint coordinates and confirmed.  They remain the tools -- a replaced
+    or re-flashed driver sends its row back to empty and it is re-measured the
+    same way, not guessed from the eleven others.
+
+    The two halves are found separately because they are found by different
+    observations:
 
         WHICH JOINT   `spin --id 7` turns motor 7 in the MOTOR's own frame.
                       You watch which limb moves.  That is the can_id.
@@ -22,10 +27,12 @@ DISCOVERY, NOT VERIFICATION, AND THAT IS THE DIFFERENCE FROM DOG5
                       does to that foot.  Moved that way -> direction +1.
                       Moved the other way -> -1.
 
-    `spin` commands with direction +1 because no direction is known yet, which
-    is what "unknown" has to mean: it drives the motor's own positive
-    direction and reports the motor's own encoder.  No joint coordinates are
-    involved anywhere in it, so it works on a completely empty map.
+    `spin` commands with direction +1 whatever the table says, which is what
+    "unknown" has to mean: it drives the motor's own positive direction and
+    reports the motor's own encoder.  No joint coordinates are involved
+    anywhere in it, so it works on a completely empty map -- and that is why
+    it is still the right tool for a row being re-measured: it cannot be
+    biased by the value already sitting in that row.
 
     `check` is the second pass.  It needs a filled-in row and drives in JOINT
     coordinates through the measured direction, so it exercises the same path
@@ -35,8 +42,9 @@ NOTHING IN STEPS 1-4 COMMANDS TORQUE.  `scan` and the arming ladder stream
     iq=0 keep-alives, which hold the drivers' 50 ms input watchdog open
     without producing motion -- every motor stays back-drivable.  `spin` and
     `check` use the drivers' own 0xA4 position loop with a low speed cap.  The
-    torque path is `hw.safety`, and it refuses on an empty map with no
-    override at all.
+    torque path is `hw.safety`, and it still refuses a map with a hole in it,
+    with no override at all -- the measurement satisfied that gate rather than
+    removing it.
 """
 from __future__ import annotations
 
@@ -412,10 +420,16 @@ def cmd_plan(args) -> int:
 
 
 def _imu_measured():
-    import numpy as np
+    """Has anyone established how the board sits, or is identity a guess?
 
+    THE VALUE CANNOT ANSWER THIS.  Identity is both the obvious placeholder
+    and, on DOG6, the right answer -- the board is mounted aligned with the
+    trunk -- so `allclose(R_BODY_IMU, I)` reads the same either way and used
+    to report a measured mounting as an outstanding bring-up step.  The flag
+    is the only thing that distinguishes them.
+    """
     from sim import coordinates as C
-    return not np.allclose(C.R_BODY_IMU, np.eye(3))
+    return bool(C.R_BODY_IMU_MEASURED)
 
 
 def _tau_start():

@@ -114,10 +114,11 @@ class _Driver:
 class FakeDriverBus:
     """A ``python-can``-shaped bus that answers like twelve LK drivers.
 
-    ids               which CAN IDs exist on this bus.  REQUIRED while
-                      `hardware_map` is empty -- there is no default list of
-                      twelve to fall back on, and inventing one here would put
-                      the guess this project is avoiding into the test double
+    ids               which CAN IDs exist on this bus.  ALWAYS REQUIRED,
+                      even though `hardware_map` is measured -- defaulting to
+                      the real table would make the test double agree with it
+                      by construction rather than by being told, which is the
+                      one thing a test double must not do
     pose_deg          starting MOTOR-OUTPUT angles (12,), or a {can_id: deg}
                       dict, or None for all zero
     latched_at_boot   start with the input-signal-lost latch set, which is what
@@ -165,10 +166,12 @@ class FakeDriverBus:
         Applies the same direction convention the real map uses, so a test can
         say "the robot is at the crouch" without doing the sign arithmetic.
 
-        `dirs` defaults to the MEASURED directions and therefore raises while
-        `hardware_map` is empty: a joint pose has no meaning before the signs
-        exist.  Pass an explicit ``{can_id: +/-1}`` to place the virtual robot
-        under a hypothetical map.
+        `dirs` defaults to the MEASURED directions -- DOG6's, since
+        2026-09-15 -- and raises if a row is missing: a joint pose has no
+        meaning without the signs.  Pass an explicit ``{can_id: +/-1}`` to
+        place the virtual robot under a hypothetical map, which is what
+        `hw.selftest` does so its protocol checks do not lean on the real
+        one.
         """
         if dirs is None:
             dirs = motor_directions()

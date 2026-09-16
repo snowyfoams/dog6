@@ -2,23 +2,56 @@
 
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V -m hw.stand --fake --auto 1 --no-imu   the whole path, no robot
-    $V -m hw.stand --tau-cap 1.0 --log run.npz
+    $V -m hw.stand --tau-cap 3.0 --log run.npz
     $V -m hw.stand --law per-leg --tau-cap 1.0 --log baseline.npz
 
-Six phases.  ENTER steps them; X is an E-STOP at any point:
+    ATTITUDE GAINS, all in the PD's own units (kp 1/s^2, kd 1/s):
+    $V -m hw.stand --kp-att 90 --kd-att 17           roll AND pitch together
+    $V -m hw.stand --kp-roll 290 --kd-roll 23        roll only; pitch keeps
+                                                     --kp-att / --kd-att
+    $V -m hw.stand --kp-att 120 --kp-roll 290        pitch 120, roll 290; roll
+                                                     kd follows --kd-att (17)
+    --kp-roll and --kd-roll are independent: pass one and the other follows
+    --kp-att / --kd-att.  The banner prints what each axis actually got.
+
+Seven phases.  ENTER steps them -- except RISE, which ends on its own clock.
+X is an E-STOP at any point:
 
     limp     0xA1 iq=0 keep-alives.  NO TORQUE.  Joint angles, the FK height
              and the trunk attitude are printed, so a wrong sign or a wrong
              zero is READ here, before anything moves
     settle   driver position mode (0xA4), holding the pose latched at ENTER
     crouch   0xA4, smoothstep to `sim.stand.Q_CROUCH` -- trunk on the floor
-    lift     0xA1 TORQUE, one of two laws (below), through
-             `hw.safety.SafetyGate`
-    park     0xA4, back to Q_CROUCH from wherever the lift left it
+    rise     0xA1 TORQUE, one of two laws (below), through
+             `hw.safety.SafetyGate`.  Ends WITHOUT a keypress, the sweep the
+             S-curve arrives; ENTER is refused until then
+    hold     the same law, same gains, at height.  THIS IS THE EXPERIMENT:
+             push the trunk and watch whether it comes back.  The status line
+             carries the worst tilt from the setpoint, the moment the law
+             asked for, and how long recovery took
+    park     0xA4, back to Q_CROUCH from wherever the hold left it
     done     0xA4, holding Q_CROUCH.  ENTER exits and stops the motors
 
 `sim.stand` explains why the sequence is shaped this way.  This file only
 explains what is different about running it on twelve MG5010 drivers.
+
+
+WHAT IS IN THIS FILE, AND WHAT IS IN `hw.balance`
+    This file is the RUNNER: the CAN loop and its slots, the key poller, the
+    per-sweep log, the exit report and the command line.  Every one of those
+    is I/O, and I/O is the dividing line.
+
+    THE SEQUENCE ITSELF IS `hw.balance.sequence.StandSequence` -- the six
+    phases, what each one sends, the 0xA4 speed caps and the tracking trips
+    that decide to stop.  It sits next to the law it hands the lift to,
+    because every seam between a position phase and the lift is a statement
+    about that law: the lift arms from the pose the CROUCH left, `arm` latches
+    h0 and the heading from what is MEASURED there, and the PARK starts from
+    wherever the lift settled rather than from Q_CROUCH.
+
+    Nothing in that file opens a bus, reads a clock of its own or prints, so
+    the object `--fake` exercises is exactly the object the robot runs, and it
+    can be stepped in a test with a hand-built state and no hardware at all.
 
 
 TWO LIFT LAWS, AND KEEPING BOTH IS THE POINT
@@ -101,12 +134,15 @@ THE 50 MS INPUT-LOST PROTECTION IS WHAT SHAPES THE LOOP
         own e-stop.
 
 
-AN E-STOP IS A LIMP ROBOT, AND DURING THE LIFT THAT IS A DROP
+AN E-STOP IS A LIMP ROBOT, AND DURING RISE OR HOLD THAT IS A DROP
     X, Ctrl-C, a trip and a crash all end in `MotorBus.close()`: 0x81 stop
     then iq=0 to every motor.  From limp, settle, crouch, park and done that
     is harmless -- the crouch holds at zero torque (sim measured 0.1 mm of
-    trunk drop in 3 s released).  From LIFT it drops the trunk onto its belly
-    from up to 157 mm.  Run the first lifts with the robot supported.
+    trunk drop in 3 s released).  From RISE or HOLD it drops the trunk onto
+    its belly from up to 157 mm.  Run the first lifts with the robot
+    supported -- and note that HOLD is the phase an operator deliberately
+    PUSHES, so it is the phase in which a trip is most likely and a drop
+    least expected.
 
     `--tau-cap` defaults to `safety.TAU_START_MAX` = 1.0 N*m, which CANNOT
     lift the robot: the lift phase will push, saturate, and leave the trunk on
@@ -141,58 +177,24 @@ if __package__ in (None, ""):        # allow `python hw/stand.py` too
     __package__ = "hw"
 
 from sim import coordinates as C     # noqa: E402
-from sim import kinematics as SK     # noqa: E402
-from sim import params as P          # noqa: E402
-from sim import stand as ST          # noqa: E402
 
 from . import CONFIRMED_ON_DOG6      # noqa: E402
 from . import calibration as CAL     # noqa: E402
 from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
-from . import kinematics as HK       # noqa: E402
 from . import safety as SAFE         # noqa: E402
 from .balance import config as BCFG  # noqa: E402
 from .balance import controller as BCTRL   # noqa: E402
 from .balance import law as BLAW     # noqa: E402
+from .balance import posture as POSE  # noqa: E402
 from .balance import state as BSTATE  # noqa: E402
-from .motor import MAX_SPEED_POS     # noqa: E402
+from .balance.sequence import (      # noqa: E402
+    LAWS, PHASES, StandSequence, phase_blurb)
 
-__all__ = ["PHASES", "GAP_ESTOP_S", "LAWS", "HardwareStand", "StandLog",
+#: Re-exported from `balance.sequence`, which owns the sequence itself.
+#: This module is the RUNNER: the bus, the slots, the keys, the log, the CLI.
+__all__ = ["PHASES", "LAWS", "StandSequence", "GAP_ESTOP_S", "StandLog",
            "run", "main"]
-
-#: The two lift laws, and the whole point of there being two.
-#:
-#:   srb       the SRB balance controller of `hw.balance`: attitude is
-#:             MEASURED, gravity enters once as m*g, and the allocator splits
-#:             it across four feet by the geometry the robot actually has.
-#:   per-leg   `sim.stand.compliance_torque`: four independent Cartesian
-#:             springs, a fixed mg/4 feedforward, and no variable anywhere in
-#:             it that names the trunk's orientation.
-#:
-#: THE SECOND ONE IS KEPT DELIBERATELY.  Without it the first question after a
-#: bad run -- "is this worse than what we had?" -- has no answer.  It is also
-#: the A/B that says whether a fault is above or below the model: if the
-#: PER-LEG law misbehaves too, nothing a controller swap can do will fix it.
-LAWS = ("srb", "per-leg")
-
-PHASES = ("limp", "settle", "crouch", "lift", "park", "done")
-BLURB = {
-    "limp":   "NO TORQUE -- check the angles, move a foot by hand",
-    "settle": "driver position mode, holding the pose it was in",
-    "crouch": "driver position mode -> crouch (trunk on the floor)",
-    "lift":   "TORQUE mode -- LIFT_BLURB says which law",
-    "park":   "driver position mode -> crouch",
-    "done":   "driver position mode, holding crouch.  ENTER exits",
-}
-
-#: What the lift phase is actually doing, which depends on `--law`.  The
-#: phase banner is the one place an operator reads it, so it says which.
-LIFT_BLURB = {
-    "srb": "TORQUE, SRB balance controller -- attitude MEASURED, one wrench "
-           "allocated across four feet",
-    "per-leg": "TORQUE, per-leg Cartesian compliance (THE BASELINE) -- xy "
-               "pinned, z lifts, mg/4 each",
-}
 
 #: Per-motor command rate.  DOG5's 250 Hz: 3000 frames/s out and 3000 back is
 #: about 72 % of a 1 Mbit/s bus, and 4 ms is far inside the 50 ms window.
@@ -209,201 +211,7 @@ STATUS_EVERY_SWEEPS = 2
 #: only -- see `calibration.joint_state` for why it is not trusted alone.
 QD_FILTER_HZ = 40.0
 
-#: 0xA4 speed caps, MOTOR side (1 dps/LSB, 10:1 to the output).  A ramp's cap
-#: is its smoothstep peak rate times SPEED_MARGIN, so the driver can follow
-#: the reference but a frame error cannot run away at full speed.
-SETTLE_MOTOR_DPS = 60.0
-MIN_MOTOR_DPS = 60.0
-SPEED_MARGIN = 1.5
-
-#: Tracking-error trips in position mode.  Settle's is tight on purpose: it
-#: holds the pose it just READ, so any real error there means the driver's
-#: position frame and the encoder disagree -- found at 6 deg/s, not at speed.
-SETTLE_TRACK_ESTOP = np.deg2rad(5.0)
-TRACK_ESTOP = np.deg2rad(15.0)
-
 STATUS_PERIOD_S = 0.5
-
-
-def ramp_motor_dps(q_from, q_to, seconds: float) -> np.ndarray:
-    """(12,) motor-side 0xA4 caps for a smoothstep from `q_from` to `q_to`.
-
-    The smoothstep's peak slope is pi/2, so its peak joint rate is
-    ``pi/2 * |dq| / T``.
-    """
-    peak_rad_s = 0.5 * np.pi * np.abs(C.flat(q_to) - C.flat(q_from)) / seconds
-    motor_dps = np.rad2deg(peak_rad_s) * P.GEAR_RATIO * SPEED_MARGIN
-    return np.clip(motor_dps, MIN_MOTOR_DPS, MAX_SPEED_POS)
-
-
-class HardwareStand:
-    """The phase machine.  Pure decisions: no bus, no clock of its own.
-
-    `update` is called once per sweep with the measured state and returns
-    what every motor should be sent this sweep.  Keeping it free of I/O is what
-    lets `--fake` exercise exactly the object the robot runs.
-    """
-
-    def __init__(self, gate: SAFE.SafetyGate, *, law: str = "srb",
-                 balance: BLAW.BalanceLaw | None = None):
-        if law not in LAWS:
-            raise ValueError("law must be one of %s, got %r" % (LAWS, law))
-        self.gate = gate
-        self.law = law
-        self.balance = balance if balance is not None else BLAW.BalanceLaw()
-        self.phase = 0
-        self.t_phase = 0.0
-        self.q_ref0 = np.zeros((C.N_LEGS, C.N_JOINTS_PER_LEG))
-        self.q_des = np.zeros(C.N_JOINTS)
-        self.h_cmd = ST.CROUCH_HEIGHT
-        self.gravity = np.zeros((C.N_LEGS, C.N_JOINTS_PER_LEG))
-        self.tau = np.zeros(C.N_JOINTS)
-        self.tau_request = np.zeros(C.N_JOINTS)
-        self.tau_peak = 0.0
-        self.max_dps = np.full(C.N_JOINTS, SETTLE_MOTOR_DPS)
-        #: The last sweep`s measurement and law output, for the status line
-        #: and the log.  None until the lift arms.
-        self.body = None
-        self.out = None
-        self._sweep = 0
-
-    @property
-    def phase_name(self) -> str:
-        return PHASES[self.phase]
-
-    @property
-    def finished(self) -> bool:
-        return self.phase_name == "done"
-
-    def ramp_remaining(self, now: float) -> float:
-        """Seconds until the current position ramp has arrived; 0 if none."""
-        seconds = {"crouch": ST.RAMP_POSITION, "park": ST.RAMP_POSITION,
-                   "lift": ST.RAMP_LIFT}.get(self.phase_name, 0.0)
-        return max(0.0, seconds - (now - self.t_phase))
-
-    def advance(self, now: float, q) -> str | None:
-        """Enter the next phase.  Returns why it refused, or None."""
-        if self.finished:
-            return None
-        if self.phase_name in ("crouch", "park") and self.ramp_remaining(now) > 0:
-            return ("%s ramp still running, %.1f s left"
-                    % (self.phase_name, self.ramp_remaining(now)))
-        self.phase += 1
-        self.t_phase = now
-        # From WHERE THE ROBOT IS, as in sim.stand -- after the lift that is
-        # wherever the compliance law settled, not Q_CROUCH.
-        self.q_ref0 = C.unflat(q).copy()
-        name = self.phase_name
-        if name == "settle":
-            self.max_dps = np.full(C.N_JOINTS, SETTLE_MOTOR_DPS)
-        elif name in ("crouch", "park"):
-            self.max_dps = ramp_motor_dps(self.q_ref0, ST.Q_CROUCH,
-                                          ST.RAMP_POSITION)
-        elif name == "lift":
-            self.gate.start(now, q=q)
-            q4 = C.unflat(q)
-            self.gravity = np.stack([SK.leg_gravity_torque(i, q4[i])
-                                     for i in range(C.N_LEGS)])
-            if self.law == "srb":
-                # h0 and the heading are latched HERE, from what is measured
-                # at the handover -- see `balance.law.BalanceLaw.arm`.
-                self.balance.arm(now, self.body)
-        elif name == "done":
-            self.max_dps = np.full(C.N_JOINTS, SETTLE_MOTOR_DPS)
-        return None
-
-    def update(self, now: float, body):
-        """One sweep.  Returns ``(mode, values, trip)``.
-
-        `body` is a `balance.state.BodyState` -- the sweep's measurement,
-        built by the caller so that `advance` and this method see the same
-        one.  `mode` is "keepalive" (values None), "position" (values: (12,)
-        joint rad) or "torque" (values: (12,) N*m).  `trip` is a reason to
-        stop, or None.
-        """
-        self._sweep += 1
-        self.body = body
-        q, qd = body.q, body.qd
-        name = self.phase_name
-        elapsed = now - self.t_phase
-        q4 = C.unflat(q)
-
-        if name == "limp":
-            self.h_cmd = float("nan")
-            return "keepalive", None, None
-
-        if name == "lift":
-            if self.law == "srb":
-                return self._lift_srb(now, body)
-            return self._lift_per_leg(now, elapsed, q, q4, qd)
-
-        self.tau = np.zeros(C.N_JOINTS)
-        if name == "settle":
-            target = self.q_ref0
-            limit = SETTLE_TRACK_ESTOP
-        elif name in ("crouch", "park"):
-            alpha = ST.smoothstep(elapsed / ST.RAMP_POSITION)
-            target = self.q_ref0 + alpha * (ST.Q_CROUCH - self.q_ref0)
-            limit = TRACK_ESTOP
-        else:                                            # done
-            target = ST.Q_CROUCH
-            limit = TRACK_ESTOP
-        self.h_cmd = ST.CROUCH_HEIGHT if name != "settle" else float("nan")
-        self.q_des = C.flat(target)
-
-        error = np.abs(q - self.q_des)
-        if np.any(error > limit):
-            index = int(np.argmax(error))
-            trip = ("%s: %s is %.1f deg from its position target (limit %.0f)"
-                    % (name, HM.JOINT_LABELS[index], np.rad2deg(error[index]),
-                       np.rad2deg(limit)))
-            if name == "settle":
-                trip += (" -- the driver's position frame disagrees with the "
-                         "encoder, or something is pushing the leg")
-            return "position", self.q_des, trip
-        return "position", self.q_des, None
-
-    # -- the two lift laws -------------------------------------------------
-    def _lift_srb(self, now: float, body):
-        """The SRB balance controller.  Five stages, once, at slot 0.
-
-        The law returns a trip reason; the GATE still shapes the torque
-        afterwards, so there is exactly one limiter per quantity.  A trip
-        during the lift is a drop, which is why the law reports and this
-        method -- and ultimately `run` -- decides.
-        """
-        self.out = self.balance.update(now, body, clock=time.perf_counter)
-        self.h_cmd = BSTATE.height_to_origin(self.out.command.h)
-        self.q_des = self.out.q_ref
-        self.gravity = self.balance.gravity
-        self.tau_request = self.out.tau
-        self.tau = self.gate.apply(self.tau_request, body.q, now)
-        self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))
-        return "torque", self.tau, self.out.trip
-
-    def _lift_per_leg(self, now: float, elapsed: float, q, q4, qd):
-        """`sim.stand.compliance_torque`: THE A/B BASELINE, unchanged.
-
-        Four Cartesian springs in their own hip frames, a fixed mg/4
-        feedforward, a raised-cosine height ramp, and the leg gravity term
-        refreshed one leg per sweep -- so at any instant the four legs carry
-        terms computed 0, 4, 8 and 12 ms ago.  Every one of those is a thing
-        the SRB law changes, and leaving them exactly as they were is what
-        makes the comparison mean something.
-
-        It reads no IMU, so it trips on nothing an IMU could see.
-        """
-        alpha = ST.smoothstep(elapsed / ST.RAMP_LIFT)
-        self.h_cmd = ST.CROUCH_HEIGHT + alpha * (ST.LIFT_HEIGHT
-                                                 - ST.CROUCH_HEIGHT)
-        leg = self._sweep % C.N_LEGS
-        self.gravity[leg] = SK.leg_gravity_torque(leg, q4[leg])
-        request = ST.compliance_torque(q4, C.unflat(qd), self.h_cmd,
-                                       kin=HK, gravity=self.gravity)
-        self.tau_request = C.flat(request)
-        self.tau = self.gate.apply(self.tau_request, q, now)
-        self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))
-        return "torque", self.tau, None
 
 
 class StandLog:
@@ -430,6 +238,9 @@ class StandLog:
         "q": (C.N_JOINTS,), "qd": (C.N_JOINTS,), "q_ref": (C.N_JOINTS,),
         "tau_cmd": (C.N_JOINTS,), "tau_meas": (C.N_JOINTS,),
         "tau_req": (C.N_JOINTS,),
+        # the trot: NaN outside it.  x_b beside p_swing is the swing error.
+        "contact_w": (C.N_LEGS,), "swing_s": (C.N_LEGS,),
+        "p_swing": (C.N_LEGS, 3), "x_b": (C.N_LEGS, 3),
     }
 
     def __init__(self) -> None:
@@ -496,14 +307,31 @@ class KeyPoller:
         self.ok = False
 
 
-def _print_phase(stand: HardwareStand) -> None:
-    blurb = (LIFT_BLURB[stand.law] if stand.phase_name == "lift"
-             else BLURB[stand.phase_name])
-    print("\n>> phase %d %-6s : %s" % (stand.phase, stand.phase_name, blurb),
-          flush=True)
+def _print_phase(stand: StandSequence) -> None:
+    print("\n>> phase %d %-6s : %s"
+          % (stand.phase, stand.phase_name, phase_blurb(stand)), flush=True)
 
 
-def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
+def _torque_lines(tau_cmd, tau_meas) -> str:
+    """All twelve joints, commanded beside measured, in N*m, JOINT frame.
+
+    Printed in RISE and HOLD, the two torque phases.  `tau_cmd` is what went
+    out AFTER the safety gate; `tau_meas` is the q-axis current each driver
+    reported back, with the direction already applied, so the two rows are
+    directly comparable joint by joint.  A column where cmd moves and meas
+    does not is a driver that is not following; a column where both move and
+    the robot does not is torque being absorbed downstream of the motor.
+    """
+    rows = []
+    for tag, tau in (("cmd ", tau_cmd), ("meas", tau_meas)):
+        t4 = C.unflat(np.asarray(tau, dtype=float))
+        rows.append("          tau %s %s" % (tag, "  ".join(
+            "%s %+5.2f %+5.2f %+5.2f" % (leg, *t4[i])
+            for i, leg in enumerate(("FL", "FR", "RL", "RR")))))
+    return "\n".join(rows)
+
+
+def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         auto_s: float | None = None, clock=time.perf_counter,
         imu=None, log: "StandLog | None" = None) -> str | None:
     """Drive `stand` on an ARMED `mb` until done, X, or a trip.
@@ -535,6 +363,9 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
     worst_gap = np.zeros(n)
     overruns = 0
     imu_warned = False
+    # The phase NAME as well as the index: the trot is a sub-state of hold
+    # and changes the name without changing the index.
+    last_phase = (stand.phase, stand.phase_name)
     last_status = stand.t_phase = clock()
     _print_phase(stand)
 
@@ -556,7 +387,9 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
             # decides what to do about the age.  A sweep that blocks on the
             # IMU is a sweep that misses its CAN deadline.
             orientation = level if imu is None else (imu.orientation() or level)
-            body = BSTATE.read(q, qd_ctrl, orientation)
+            # The SRB model is the POSTURE'S, not the module constant's -- the
+            # measurement must use the same c^b the reference does.
+            body = BSTATE.read(q, qd_ctrl, orientation, srb=stand.crouch.srb)
             stand.body = body
             if body.imu_stale and not imu_warned and imu is not None:
                 imu_warned = True
@@ -568,10 +401,23 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
             pressed = key.get() if key is not None else None
             if pressed in ("x", "X"):
                 return "operator X"
+            if pressed in ("t", "T"):
+                print("\n   " + stand.toggle_trot(now), flush=True)
             wants_next = pressed in ("\r", "\n")
             # --auto: `auto_s` after the phase's ramp has ARRIVED.  Asking
-            # ramp_remaining about `auto_s` ago is exactly that test.
-            if (auto_s is not None and now - stand.t_phase >= auto_s
+            # ramp_remaining about `auto_s` ago is exactly that test.  With a
+            # gait, the hold presses T once and the trot latches its own exit
+            # after two settles' worth of cycles.
+            auto_trot = (auto_s is not None and stand.gait is not None
+                         and (stand.trotting or (stand.phase_name == "hold"
+                                                 and stand.trot_runs == 0)))
+            if auto_trot:
+                trot_s = stand.gait.cycle_start(2 * stand.gait.settle_every)
+                if (not stand.trotting and now - stand.t_phase >= auto_s) or (
+                        stand.trotting and not stand.trot_exit
+                        and now - stand.t_phase >= trot_s):
+                    print("\n   " + stand.toggle_trot(now), flush=True)
+            elif (auto_s is not None and now - stand.t_phase >= auto_s
                     and stand.ramp_remaining(now - auto_s) <= 0.0):
                 wants_next = True
             if wants_next:
@@ -580,11 +426,22 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
                 refused = stand.advance(now, q)
                 if refused:
                     print("\n   ENTER ignored: " + refused, flush=True)
-                else:
-                    _print_phase(stand)
 
             # -- the law ----------------------------------------------------
             mode, values, trip = stand.update(now, body)
+            # THE BANNER FOLLOWS THE PHASE, NOT THE KEYSTROKE.  RISE ends on
+            # its own clock, so a banner printed only where ENTER is handled
+            # would silently skip the one phase change nobody pressed a key
+            # for -- and that is the phase the operator is waiting for.
+            if (stand.phase, stand.phase_name) != last_phase:
+                last_phase = (stand.phase, stand.phase_name)
+                _print_phase(stand)
+            # The sequence does no I/O, so anything it needs an operator to
+            # read comes back as text and is printed here.  Generic on
+            # purpose: this is a channel, not a feature.
+            notice = stand.take_notice()
+            if notice:
+                print("\n   " + notice, flush=True)
             if trip:
                 return trip
 
@@ -616,6 +473,8 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
 
             if log is not None and mode == "torque":
                 out = stand.out
+                if out is not None and out.state is not None:
+                    body = out.state          # the height the law acted on
                 log.add(t=now - stand.t_phase, phase=stand.phase_name,
                         h_cmd=BSTATE.origin_to_height(stand.h_cmd), h=body.h,
                         p_cz=body.p_cz, p_cz_dot=body.p_cz_dot,
@@ -628,22 +487,57 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
                         residual=None if out is None else out.allocation.residual,
                         q=body.q, qd=body.qd, q_ref=stand.q_des,
                         tau_cmd=stand.tau, tau_meas=tau_meas,
-                        tau_req=stand.tau_request)
+                        tau_req=stand.tau_request,
+                        contact_w=None if out is None else out.contact,
+                        swing_s=None if out is None else out.swing_s,
+                        p_swing=None if out is None else out.p_swing,
+                        x_b=body.x_b)
 
             if now - last_status >= STATUS_PERIOD_S:
                 last_status = now
-                print("   %-6s t=%5.1f  h_cmd=%6.1f  %s  |tau|=%.2f/%.2f"
-                      "  gap=%.1f ms  overrun=%d%s"
-                      % (stand.phase_name, now - stand.t_phase,
-                         1e3 * BSTATE.origin_to_height(stand.h_cmd),
-                         body.status(),
-                         float(np.abs(stand.tau).max()), stand.tau_peak,
-                         1e3 * worst_gap.max(), overruns,
-                         "" if stand.out is None else
-                         "  res %.1fN/%.2fNm" % (
-                             stand.out.allocation.residual_force,
-                             stand.out.allocation.residual_moment)),
-                      flush=True)
+                tail = ("  |tau|=%.2f/%.2f  gap=%.1f ms  overrun=%d%s"
+                        % (float(np.abs(stand.tau).max()), stand.tau_peak,
+                           1e3 * worst_gap.max(), overruns,
+                           "" if stand.out is None else
+                           "  res %.1fN/%.2fNm"
+                           % (stand.out.allocation.residual_force,
+                              stand.out.allocation.residual_moment)))
+                # THE HOLD PRINTS SOMETHING ELSE ENTIRELY, and REPLACES the
+                # usual line rather than adding to it.  Every other phase is
+                # asking "is it getting there"; the hold is asking "is the
+                # attitude loop correcting", and the three numbers that answer
+                # that -- rpy, rpy MINUS setpoint, and the moment being asked
+                # for -- do not fit beside h_cmd and the gyro.
+                watch = {"hold": stand.hold,
+                         "trot": stand.trot}.get(stand.phase_name)
+                if watch is not None and watch.live:
+                    print("   %-6s t=%5.1f  %s"
+                          % (stand.phase_name, now - stand.t_phase,
+                             watch.status()), flush=True)
+                    # IMU AGE IS BACK ON THE HOLD LINE.  A stiffer roll loop
+                    # has less latency margin than the freeze threshold, so
+                    # the age is now the number that says whether a roll
+                    # oscillation is the gain or the stream.
+                    if stand.trotting:
+                        print("          cycle %d  weight %s%s%s"
+                              % (stand.gait.cycles(now),
+                                 np.array2string(stand.gait.contact_weight(now),
+                                                 precision=2),
+                                 "  SETTLE" if stand.gait.settling(now) else "",
+                                 "  exit latched" if stand.trot_exit else ""),
+                              flush=True)
+                    print("          %s  imu %3.0f ms%s%s"
+                          % (watch.moment_status(),
+                             1e3 * body.imu_age_s,
+                             " STALE" if body.imu_stale else "", tail),
+                          flush=True)
+                else:
+                    print("   %-6s t=%5.1f  h_cmd=%6.1f  %s%s"
+                          % (stand.phase_name, now - stand.t_phase,
+                             1e3 * BSTATE.origin_to_height(stand.h_cmd),
+                             body.status(), tail), flush=True)
+                if stand.phase_name in ("rise", "hold", "trot"):
+                    print(_torque_lines(stand.tau, tau_meas), flush=True)
             sweep += 1
 
         # -- one frame, to one motor --------------------------------------
@@ -679,13 +573,33 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
     # unreachable
 
 
-def main(argv=None) -> int:
+def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
+         dynamic_setpoint: bool = None, only_law: str = None,
+         tilt_stop: float = None, roll_gains: tuple = None,
+         track_stop: float = None, gait=None, tau_cap: float = None,
+         tau_ceiling: float = None, tau_slew: float = None,
+         overspeed_trip: bool = True) -> int:
+    """The runner.  `crouch` is the posture the lift starts from and PARK
+    returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
+    `only_law` pins the lift law and drops `--law` from the parser.
+
+    `gait` (a `balance.gait.TrotGait`) enables T; `tau_cap`, `tau_ceiling`
+    and `tau_slew` are the gate's default cap, the ceiling it will accept and
+    its slew -- None keeps the stand's.  `overspeed_trip` False keeps the
+    joint-speed peaks and stops nothing on them (`safety.SafetyGate`).
+
+    They are arguments rather than flags-only so that `hw.fold_stand` is three
+    lines instead of a copy of this parser.
+    """
     ap = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--tau-cap", type=float, default=SAFE.TAU_START_MAX,
+    ceiling = SAFE.TAU_STAGED_MAX if tau_ceiling is None else float(tau_ceiling)
+    slew = SAFE.DEFAULT_TAU_SLEW_NM_S if tau_slew is None else float(tau_slew)
+    ap.add_argument("--tau-cap", type=float,
+                    default=SAFE.TAU_START_MAX if tau_cap is None else tau_cap,
                     help="lift-phase torque cap, N*m (SafetyGate allows up to "
-                         "%.1f)" % SAFE.TAU_STAGED_MAX)
+                         "%.1f)" % ceiling)
     ap.add_argument("--rate", type=float, default=RATE_HZ,
                     help="per-motor command rate, Hz")
     ap.add_argument("--bitrate", type=int, default=1_000_000)
@@ -702,9 +616,14 @@ def main(argv=None) -> int:
     law = ap.add_argument_group(
         "the lift law",
         "`srb` is the balance controller of hw.balance; `per-leg` is the "
-        "Cartesian compliance law it replaces, kept as the A/B baseline.")
-    law.add_argument("--law", choices=LAWS, default="srb",
-                     help="which law drives the lift phase")
+        "Cartesian compliance law it replaces, kept as the A/B baseline."
+        if only_law is None else
+        "pinned to `%s` by this entry point." % only_law)
+    if only_law is None:
+        law.add_argument("--law", choices=LAWS, default="srb",
+                         help="which law drives the lift phase")
+    else:
+        ap.set_defaults(law=only_law)
     law.add_argument("--rise", type=float, default=BCFG.T_RISE,
                      metavar="SECONDS",
                      help="S-curve duration; the only knob the reference has")
@@ -716,6 +635,14 @@ def main(argv=None) -> int:
     law.add_argument("--kd-z", type=float, default=BCFG.KD_Z)
     law.add_argument("--kp-att", type=float, default=BCFG.KP_ATT)
     law.add_argument("--kd-att", type=float, default=BCFG.KD_ATT)
+    law.add_argument("--kp-roll", type=float,
+                     default=None if roll_gains is None else roll_gains[0],
+                     help="roll only, same units as --kp-att; default follows "
+                          "--kp-att")
+    law.add_argument("--kd-roll", type=float,
+                     default=None if roll_gains is None else roll_gains[1],
+                     help="roll only, same units as --kd-att; default follows "
+                          "--kd-att")
     law.add_argument("--mu", type=float, default=BCFG.MU,
                      help="friction coefficient the allocator PROJECTS onto; "
                           "it bounds what is asked for, not what the floor gives")
@@ -723,6 +650,23 @@ def main(argv=None) -> int:
                      help="zero both attitude gains -- the other half of the "
                           "A/B.  Height loop and gravity only; the trunk will "
                           "NOT push back")
+    law.add_argument("--tilt-stop", type=float,
+                     default=BCFG.TILT_STOP_DEG if tilt_stop is None
+                     else tilt_stop, metavar="DEG",
+                     help="e-stop past this many degrees FROM THE SETPOINT.  "
+                          "IT IS A TRIP: raising it lets the robot reach an "
+                          "attitude it cannot come back from, and an e-stop "
+                          "there is a harder fall.  Raise it to WATCH a "
+                          "steady-state tilt the default stops you seeing")
+    law.add_argument("--track-stop", type=float,
+                     default=(np.rad2deg(BCFG.TRACK_STOP_RAD) if track_stop is None
+                              else track_stop), metavar="DEG",
+                     help="e-stop when any joint is this far from the IK at "
+                          "the commanded height; 0 turns it OFF.  A MONITOR "
+                          "ONLY -- the SRB torque never reads that IK, so "
+                          "this changes no N*m the drivers get.  It is what "
+                          "notices a leg that has gone wrong while the "
+                          "attitude still reads fine")
     law.add_argument("--gravity-legs", type=int, default=4, choices=(1, 2, 4),
                      metavar="N", help="leg-gravity terms refreshed per sweep; "
                                        "4 removes the 12 ms cross-leg skew")
@@ -736,7 +680,20 @@ def main(argv=None) -> int:
                               "the SRB law degenerates to height + gravity")
     sensing.add_argument("--log", default=None, metavar="FILE.npz",
                          help="record every torque-mode sweep")
+    datum = sensing.add_mutually_exclusive_group()
+    datum.add_argument("--latch-setpoint", dest="latch", action="store_true",
+                       default=None,
+                       help="take the attitude setpoint at zero torque, in "
+                            "LIMP -- 'level' becomes the attitude the robot "
+                            "was resting at")
+    datum.add_argument("--fixed-setpoint", dest="latch", action="store_false",
+                       help="do NOT latch: fly config.SETPOINT_ROLL/PITCH_DEG. "
+                            "A run comparing two postures wants this, or the "
+                            "two are measured against two different 'level's")
     args = ap.parse_args(argv)
+    if args.latch is None:
+        args.latch = (bool(BCFG.SETPOINT_DYNAMIC) if dynamic_setpoint is None
+                      else bool(dynamic_setpoint))
 
     if args.auto is not None and not args.fake:
         ap.error("--auto is only allowed with --fake: on the robot a person "
@@ -753,7 +710,9 @@ def main(argv=None) -> int:
     # Everything that can refuse, refuses BEFORE the bus opens.
     ids = HM.motor_ids()
     try:
-        gate = SAFE.SafetyGate(args.tau_cap, unconfirmed_reason=reason)
+        gate = SAFE.SafetyGate(args.tau_cap, unconfirmed_reason=reason,
+                               ceiling=ceiling, tau_slew=slew,
+                               overspeed_trip=overspeed_trip)
     except (RuntimeError, ValueError) as refusal:
         print("[stand] REFUSED before opening the bus:\n  %s" % refusal,
               file=sys.stderr)
@@ -765,13 +724,21 @@ def main(argv=None) -> int:
     gains.kp_pos[2], gains.kd_pos[2] = args.kp_z, args.kd_z
     gains.kp_att[0] = gains.kp_att[1] = args.kp_att
     gains.kd_att[0] = gains.kd_att[1] = args.kd_att
+    if args.kp_roll is not None:
+        gains.kp_att[0] = args.kp_roll
+    if args.kd_roll is not None:
+        gains.kd_att[0] = args.kd_roll
     if args.ablate_attitude:
         gains.ablate_attitude()
     balance = BLAW.BalanceLaw(gains=gains, rise_s=args.rise,
                               h_lift=1e-3 * args.height,
                               gravity_legs_per_sweep=args.gravity_legs,
-                              mu=args.mu)
-    stand = HardwareStand(gate, law=args.law, balance=balance)
+                              mu=args.mu, foot_xy=crouch.foot_xy,
+                              dynamic_setpoint=args.latch,
+                              tilt_stop_deg=args.tilt_stop,
+                              track_stop_deg=args.track_stop, srb=crouch.srb)
+    stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
+                          gait=gait)
     log = StandLog() if args.log else None
     key = KeyPoller()
     if not key.ok and not args.fake:
@@ -785,18 +752,36 @@ def main(argv=None) -> int:
     print("  map confirmed: %s%s" % (CONFIRMED_ON_DOG6,
                                      "" if CONFIRMED_ON_DOG6
                                      else "  (running on: %r)" % reason))
-    print("  lift tau cap %.2f N*m (standing needs ~2.2)" % args.tau_cap)
+    print("  lift tau cap %.2f N*m (standing needs ~2.2), slew %.0f N*m/s"
+          % (args.tau_cap, slew))
+    if gait is not None:
+        print("  TROT on T from HOLD: %s" % gait)
+        print("       swing apex %.0f mm straight up, NO placement; Kp %s N/m "
+              "Kd %s N s/m" % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING,
+                               BCFG.KD_SWING))
+        print("       residual trip counts four-foot sweeps only while "
+              "trotting")
+    if not overspeed_trip:
+        print("  OVERSPEED TRIP OFF: joint speed is recorded, never stopped "
+              "on (the peaks print at exit)")
     print("  HEIGHTS BELOW ARE FLOOR TO TRUNK BOTTOM -- a ruler reaches them.")
     print("  crouch %.0f mm -> lift %.0f mm over %.1f s; the code's own frame "
-          "is %.1f mm higher" % (1e3 * BCFG.H_CROUCH, args.height, args.rise,
+          "is %.1f mm higher" % (1e3 * crouch.h, args.height, args.rise,
                                  1e3 * BCFG.TRUNK_BOTTOM_OFFSET))
+    print("  CROUCH POSTURE: %s" % crouch.name.upper())
+    for line in crouch.describe().splitlines()[1:]:
+        print("   %s" % line)
+    print("  attitude setpoint: %s"
+          % ("LATCHED at zero torque, in limp" if args.latch else
+             "FIXED at the config statics %+.2f / %+.2f deg"
+             % (BCFG.SETPOINT_ROLL_DEG, BCFG.SETPOINT_PITCH_DEG)))
     if args.law == "srb":
         print("  LAW: SRB balance controller.  %s" % gains)
-        print("       mu %.2f, leg gravity %d leg%s/sweep, CoM PINNED at "
-              "(%+.1f, %+.1f, %+.1f) mm"
+        print("       mu %.2f, leg gravity %d leg%s/sweep"
               % (args.mu, args.gravity_legs,
-                 "" if args.gravity_legs == 1 else "s",
-                 *(1e3 * BCFG.COM_BODY)))
+                 "" if args.gravity_legs == 1 else "s"))
+        print("       SRB PINNED at the %s stance: %s"
+              % (crouch.name, crouch.srb.describe()))
         if args.ablate_attitude:
             print("       ATTITUDE GAINS ZEROED -- the ablation half of the "
                   "A/B; the trunk will NOT push back")
@@ -817,12 +802,16 @@ def main(argv=None) -> int:
           "drivers' %.0f ms input-lost window"
           % (args.rate, 1e3 / args.rate, 1e3 * GAP_ESTOP_S,
              1e3 * SAFE.INPUT_LOST_S))
-    print("  trips: tilt %.0f deg, tracking %.0f deg, residual %.1f N / "
+    print("  trips: tilt %.0f deg%s, tracking %s, residual %.1f N / "
           "%.2f N*m sustained"
-          % (BCFG.TILT_STOP_DEG, np.rad2deg(BCFG.TRACK_STOP_RAD),
+          % (args.tilt_stop,
+             "" if args.tilt_stop == BCFG.TILT_STOP_DEG else
+             "  <-- RAISED from %.0f, the robot can reach an attitude it "
+             "cannot recover from" % BCFG.TILT_STOP_DEG,
+             ("%.0f deg" % args.track_stop) if args.track_stop > 0 else "OFF",
              BCFG.RESIDUAL_FORCE_N, BCFG.RESIDUAL_MOMENT_NM))
-    print("  ENTER steps the phase.  X is an E-STOP -- during lift it DROPS "
-          "the robot.")
+    print("  ENTER steps the phase (RISE ends on its own).  X is an E-STOP "
+          "-- from rise or hold it DROPS the robot.")
     if args.fake and args.law == "srb":
         print("  NOTE: hw.fake_bus has NO DYNAMICS.  The legs do not move "
               "under torque, so the")
@@ -879,6 +868,22 @@ def main(argv=None) -> int:
     if args.law == "srb" and stand.balance.armed:
         print("[stand] the lift, as the law saw it:")
         print(stand.balance.report())
+    if stand.hold.live:
+        print("[stand] the hold -- whether the controller CORRECTS:")
+        print(stand.hold.report())
+    if stand.trot.live:
+        print("[stand] the trot (%d run%s, the last one below):"
+              % (stand.trot_runs, "" if stand.trot_runs == 1 else "s"))
+        print(stand.trot.report().replace("  hold  ", "  trot  "))
+    if gate.started_at is not None:
+        print("[stand] peak joint speed, driver / encoder (rad/s; trip %s at "
+              "%.1f):" % ("ON" if gate.overspeed_trip else "OFF",
+                          gate.qd_estop))
+        for leg in range(C.N_LEGS):
+            row = slice(3 * leg, 3 * leg + 3)
+            print("  %s  %s" % (C.LEGS[leg], "   ".join(
+                "%4.1f / %4.1f" % pair for pair in zip(
+                    gate.qd_peak[row], gate.encoder_qd_peak[row]))))
     if log is not None:
         print("[stand] log: %s" % log.save(args.log))
     if stop is None:

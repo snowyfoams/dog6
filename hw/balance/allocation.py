@@ -164,7 +164,26 @@ def allocate(r_w, b_d, *, mu=None, fz_min=None, fz_max=None,
 
     A = grasp_map(r_w)
     b_d = np.asarray(b_d, dtype=float).reshape(6)
-    w_inv = 1.0 / weight_vector(contact)
+    if contact is None:
+        w_inv = 1.0 / weight_vector(contact)
+        planted = np.ones(C.N_LEGS, dtype=bool)
+    else:
+        # THE TROT PATH -- DOG5's `force_totorque.distribute`, in this file's
+        # formulation.  A foot with weight 0 is SWINGING: it is not in the
+        # solve at all (w_inv 0 gives it exactly zero force, not a floored
+        # one-in-a-million share), and it is never floored to fz_min, because
+        # a foot in the air asked for 1 N of ground reaction is a leg pushed
+        # down onto a floor it is not touching.  A planted foot's weight is
+        # floored at 1e-3 as DOG5's was, so the ramp's first sweeps cannot
+        # make the normal matrix singular.
+        weight = np.clip(np.asarray(contact, dtype=float).reshape(C.N_LEGS),
+                         0.0, 1.0)
+        planted = weight > 0.0
+        per_foot = 1.0 / np.array([cfg.W_TANGENTIAL, cfg.W_TANGENTIAL,
+                                   cfg.W_NORMAL])
+        w_inv = np.concatenate([
+            (max(weight[i], 1.0e-3) if planted[i] else 0.0) * per_foot
+            for i in range(C.N_LEGS)])
 
     # (A W^-1 A^T + lambda I) y = b_d, then f = W^-1 A^T y.
     #
@@ -182,16 +201,36 @@ def allocate(r_w, b_d, *, mu=None, fz_min=None, fz_max=None,
 
     # -- the cone, axis-aligned because the frame is world --------------
     f_w = f_unclipped.copy()
-    f_w[:, 2] = np.clip(f_w[:, 2], fz_min, fz_max)
+    if contact is None:
+        f_w[planted, 2] = np.clip(f_w[planted, 2], fz_min, fz_max)
+    else:
+        # THE WEIGHT BOUNDS THE NORMAL FORCE -- DOG5's rule ("it reaches the
+        # robot as a bound on that foot's normal force").  The weighting alone
+        # does not do it: a diagonal pair cannot make the moment the wrench
+        # asks for, and least squares hands the unreachable part to the foot
+        # that is ramping out -- 3.7 N at weight 0.002, measured, gone in one
+        # sweep at liftoff.  Bounded by w * [fz_min, fz_max] the foot's load
+        # goes to zero with its weight, continuously.
+        f_w[:, 2] = np.clip(f_w[:, 2], weight * fz_min, weight * fz_max)
     tangent = np.linalg.norm(f_w[:, :2], axis=1)
     limit = mu * f_w[:, 2]
-    over = tangent > limit
+    over = planted & (tangent > limit)
     if np.any(over):
         scale = np.where(over, limit / np.maximum(tangent, 1.0e-12), 1.0)
         f_w[:, :2] *= scale[:, None]
+    if contact is not None:
+        # THE UNILATERAL CLIP ONLY EVER RAISES fz, SO IT ADDS TOTAL FORCE --
+        # DOG5 measured 122 N commanded on a 57 N robot before it rescaled.  A
+        # diagonal pair cannot make a moment about its own support line, so a
+        # trot asks for exactly such an unreachable moment every swing.  Total
+        # support is what holds the robot up; the moment is the trim that
+        # saturates.  Scaling the whole force keeps every foot in its cone.
+        fz_sum = float(f_w[:, 2].sum())
+        if b_d[2] > 0.0 and fz_sum > b_d[2] * (1.0 + 1e-9):
+            f_w *= b_d[2] / fz_sum
 
     residual = A @ f_w.reshape(-1) - b_d
-    clipped = over | (f_unclipped[:, 2] != f_w[:, 2])
+    clipped = planted & (over | (f_unclipped[:, 2] != f_w[:, 2]))
     return Allocation(f_w=f_w, f_unclipped=f_unclipped, residual=residual,
                       clipped=clipped)
 

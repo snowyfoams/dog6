@@ -1,13 +1,39 @@
 # DOG6 dependencies.
 #
-# The project is sim-only right now -- `hw/` is empty because the robot is
-# being assembled -- so this list is short and will grow when it isn't.
-# `hw/README.md` names what is coming: python-can and pyserial land here the
-# day hw/motorbus.py does, not before.
+# `hw/` is no longer sim-only: the robot is assembled, its map was measured on
+# 2026-09-15, and `hw/motor/` speaks to real drivers over CAN.  So python-can
+# is a dependency now, not a promise.
 #
-# There is an interpreter that already satisfies this:
-#     D:\mujoco\.venv\Scripts\python.exe
-# which is also the one the model's build pipeline runs under.
+# The two machines need different halves of this list -- the sim box runs
+# mujoco and scipy, the robot's Pi runs python-can, and numpy is on both.
+#     D:\mujoco\.venv\Scripts\python.exe   the sim box, also the interpreter
+#                                            the model's build pipeline uses
 
 numpy>=1.24
+
+# sim/ -- the model and the viewer.
 mujoco>=3.0
+
+# sim/cmpc -- the convex MPC assembles its QP sparse (qp.py) and discretises
+# with a matrix exponential (dynamics.py).
+scipy>=1.10
+
+# hw/ -- the CAN transport.  `hw.motor.motorbus` builds can.Message frames
+# before handing them to a bus, so this is needed even for `--fake` runs
+# against `hw.fake_bus`: without it `python -m hw.selftest` stops at the
+# protocol section and `hw.bringup` cannot import at all.
+python-can>=4.0
+
+# hw/imu.py -- the DETA10 driver.  A private local package, not on PyPI, so it
+# cannot be a plain line above; it is one command and it belongs in whichever
+# interpreter runs `hw.stand`:
+#     python -m pip install -e /home/robot01/Documents/IMU_sensor
+# Without it `hw.stand` refuses with "[stand] no IMU" and exits 2, because the
+# default `--law srb` MEASURES the trunk's attitude.  `--no-imu` runs the
+# level-trunk ablation instead, which is a different experiment, not a
+# workaround.
+
+# Optional, imported lazily and only by the tool that needs them:
+#   pygame       sim/cmpc/gamepad.py, teleop only
+#   matplotlib   sim/cmpc/teleop.py, plotting a logged run
+#   pyusb        hw/motor/mac_can.py, macOS adapter detection only

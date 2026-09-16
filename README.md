@@ -1,15 +1,16 @@
 # DOG6
 
-A quadruped, sim first. The hardware is on the bench being assembled; this
-repository is what can be established about the robot before a motor is
-powered, arranged so that the day hardware arrives it plugs into a description
-that has already been checked.
+A quadruped, sim first. The model was built and gated before a motor was
+powered, so that when the hardware arrived it plugged into a description that
+had already been checked. It has: DOG6 is assembled, and on **2026-09-15** its
+zero, its twelve direction signs and its kinematics were measured on the robot
+and agreed with that description.
 
 ```
 dog6/
   sim/     the robot as a model — geometry, mass, frames, kinematics
     cmpc/  convex MPC, reproducing MIT Cheetah 3 (IROS 2018)
-  hw/      empty, on purpose. The robot does not exist yet.
+  hw/      the robot itself — CAN, the measured map, safety, stand, balance
 ```
 
 ```
@@ -27,9 +28,10 @@ saturates and it falls at 0.5 — the envelope is set by the actuators, not by
 the controller. `sim/cmpc/README.md` has the numbers and the three bugs worth
 recording.
 
-## Why two modules, and why one of them is empty
+## Why two modules
 
-The split is not organisational tidiness — it is a claim about what is known.
+The split is not organisational tidiness — it is a claim about what is known,
+and about how each thing came to be known.
 
 `sim` contains things that are **true of the design**: the Fusion 360 CAD's
 geometry and mass properties, the frame and sign conventions, and the maps
@@ -37,11 +39,23 @@ between joint angles and foot positions. Every number in it is either measured
 off the CAD or checked against `sim/model/dog6.xml`, and `sim/selftest.py` is
 what keeps that honest.
 
-`hw` would contain things that are **true of the built robot**: CAN ids,
-direction signs, encoder zeros, the IMU's mounting rotation, what the motors
-actually do at a commanded current. None of that has been observed, because
-there is no robot to observe. So the module holds a `CONFIRMED_ON_DOG6 = False`
-and nothing else.
+`hw` contains things that are **true of the built robot**: CAN ids, direction
+signs, encoder zeros, the IMU's mounting rotation, what the motors actually do
+at a commanded current. These cannot be derived — only observed.
+
+**Observed on 2026-09-15**, and now the reference everything else is measured
+against:
+
+| | |
+|---|---|
+| **zero** | twelve drivers zeroed at `Q_ZERO`, flat on the belly |
+| **dir** | twelve direction signs, `spin` then `check`, one motor at a time |
+| **kinematics** | `hw/kinematics.py`'s prediction is what each sign was read against — the feet went where it said |
+| **coordinates** | the flat-zero leg fold is fixed by the built robot; where it and the CAD disagree, the robot wins |
+
+**Not yet observed**, and marked as such where it lives: the IMU's mounting
+rotation (`R_BODY_IMU`, still identity — the stand sequence used no IMU) and
+every gain in `hw/balance/`.
 
 The temptation this structure exists to resist is porting DOG5's hardware layer
 across and calling it DOG6's. DOG5 is the same motors and, on the operator's
@@ -49,7 +63,9 @@ word, the same wiring — which makes it an excellent starting point and not a
 measurement. A wrong CAN id sends a knee command to an abduction motor; a wrong
 direction sign is a joint whose feedback and command disagree, which under a
 torque law is a robot driving itself into the floor at full current. Neither
-shows up in simulation. `hw/README.md` has the bring-up order.
+shows up in simulation. That is why the table was built from the robot rather
+than copied, and why the refusals around it stayed after it was filled in.
+`hw/README.md` has the bring-up order and the measured table.
 
 ## What is in `sim`
 
@@ -126,7 +142,14 @@ written against one reads the other correctly.
       gait, swing law. 83 gates. Trots, strafes and turns, from an Xbox pad.
 - [ ] state estimation — the controller is handed ground truth. Everything it
       achieves is an upper bound on what it does behind a real filter.
-- [ ] `hw` — waiting on the assembly. See `hw/README.md`.
+- [x] `hw` — assembled, wired and measured: zero, twelve directions,
+      kinematics read against the robot. 48 gates. See `hw/README.md`.
+- [ ] `hw.stand` lift — the position phases run on the drivers; the lift phase
+      did not hold on 2026-09-15. `hw/balance/` is the SRB controller written
+      to replace the law that failed it, with every gain untuned.
+- [ ] `R_BODY_IMU` — the IMU's mounting rotation, still an identity
+      placeholder. The stand sequence used no IMU; the balance controller
+      needs it.
 
 An older trot stack exists against this model in `D:\mujoco\dog6_trot`; it has
 not been folded in here, and `sim.cmpc` does not depend on it.

@@ -74,7 +74,8 @@ from sim import coordinates as C     # noqa: E402
 
 from . import config as cfg          # noqa: E402
 
-__all__ = ["BalanceGains", "Wrench", "balance_wrench", "level_attitude"]
+__all__ = ["BalanceGains", "Wrench", "balance_wrench", "level_attitude",
+           "latched_attitude"]
 
 
 @dataclass
@@ -112,10 +113,11 @@ class BalanceGains:
         return not (self.kp_att.any() or self.kd_att.any())
 
     def __str__(self) -> str:
-        return ("gains kp_z %.0f kd_z %.0f  kp_att %.0f kd_att %.0f  "
-                "kp_yaw %.0f kd_yaw %.0f"
+        return ("gains kp_z %.0f kd_z %.0f  roll kp %.0f kd %.1f  "
+                "pitch kp %.0f kd %.1f  kp_yaw %.0f kd_yaw %.0f"
                 % (self.kp_pos[2], self.kd_pos[2], self.kp_att[0],
-                   self.kd_att[0], self.kp_att[2], self.kd_att[2]))
+                   self.kd_att[0], self.kp_att[1], self.kd_att[1],
+                   self.kp_att[2], self.kd_att[2]))
 
 
 class Wrench(NamedTuple):
@@ -137,7 +139,7 @@ class Wrench(NamedTuple):
 
 
 def level_attitude(yaw: float) -> np.ndarray:
-    """R_des for a stand: level, facing `yaw`.  Rz(psi_0) and nothing else.
+    """R_des for a stand: TRUE level, facing `yaw`.  Rz(psi_0), nothing else.
 
     LATCH psi_0 WHEN TORQUE ARMS, do not track it.  Absolute yaw is the
     magnetometer's and `hw.imu` labels it untrusted -- but with
@@ -146,12 +148,42 @@ def level_attitude(yaw: float) -> np.ndarray:
     keep the log map away from its large-angle branch.  Set KP_YAW non-zero
     and this number starts to matter; that is the moment to check the
     magnetometer under power first.
+
+    This is `latched_attitude` at a zero setpoint, and it is what flies with
+    `config.SETPOINT_DYNAMIC` off.
     """
-    return C.rot_z(float(yaw))
+    return latched_attitude(0.0, 0.0, yaw)
+
+
+def latched_attitude(roll_sp: float, pitch_sp: float,
+                     yaw: float) -> np.ndarray:
+    """R_des from the LATCHED setpoint triple, all three in RADIANS.
+
+    DOG5's convention, ported whole: "world := body here".  The heading half
+    of it has always been here -- psi_0 is latched when torque arms, because
+    yaw has no truth to be right about.  This adds the other two axes, which
+    DOG5 added on 2026-08-28 and DOG6 has been missing: roll and pitch are
+    latched from the LIMP reading, so R_des is the attitude the robot was
+    resting at rather than the attitude gravity says is level.
+
+    WHY IT IS ONE ROTATION AND NOT A SUBTRACTION.  DOG5 formed its attitude
+    error by subtracting the setpoint from the estimator's roll and pitch,
+    which is exact for DOG5's RPY wrench and would NOT be exact here: this law
+    forms e_R from the SO(3) log map of R_des^T R, and two Euler triples
+    subtracted componentwise are not the rotation between them.  Building the
+    setpoint INTO R_des gives the identical answer at small angles and the
+    correct one at large ones, and it keeps the error a single log map with
+    nothing subtracted anywhere -- which is what `state.TrunkOrientation`'s
+    docstring demands of anything that touches an attitude.
+
+    At roll_sp = pitch_sp = 0 this is exactly `level_attitude`.
+    """
+    return C.rot_zyx(float(roll_sp), float(pitch_sp), float(yaw))
 
 
 def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
-                   omega_des=None, hold_attitude: bool = False) -> Wrench:
+                   omega_des=None, hold_attitude: bool = False,
+                   srb=None) -> Wrench:
     """The PD of the module docstring.  A pure function -- no state, no clock.
 
     `state` is a `state.BodyState`, `com_cmd` a `reference.ComCommand`.
@@ -190,7 +222,7 @@ def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
     # I_G is the composite inertia carried into the world by a similarity
     # transform.  I^b is PINNED (see config), so this is the only pose
     # dependence left in it -- and at a level trunk it is the identity.
-    inertia_w = R @ cfg.INERTIA_BODY @ R.T
+    inertia_w = R @ (cfg.SRB if srb is None else srb).inertia_body @ R.T
     force = cfg.MASS * (acc_lin - cfg.GRAVITY_W)
     moment = inertia_w @ acc_ang
 

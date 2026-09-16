@@ -137,17 +137,20 @@ class SafetyGate:
                  qd_estop: float = QD_ESTOP,
                  qd_estop_hard: float = QD_ESTOP_HARD,
                  limits=None,
-                 unconfirmed_reason: str | None = None):
+                 unconfirmed_reason: str | None = None,
+                 ceiling: float = TAU_STAGED_MAX,
+                 overspeed_trip: bool = True):
         # Tier 1: no signs exist.  No override, because there is nothing to
         # override -- `soft_limits` below is in joint coordinates and there is
         # no map from a joint to a motor to shape a torque through.
         if not is_complete():
             raise MapIncomplete(
-                "a torque gate needs joint coordinates, and %d of %d rows of "
-                "hw/hardware_map.py are still empty (%s).  Nothing has been "
-                "measured on DOG6.\n"
-                "  Build the map: `python -m hw.bringup scan`, then "
-                "`python -m hw.bringup spin --id <n>` per motor."
+                "a torque gate needs joint coordinates, and %d of %d rows "
+                "of hw/hardware_map.py are empty (%s).\n"
+                "  DOG6's twelve were measured on 2026-09-15, so an empty row "
+                "means an edited table or a\n  replaced driver -- and eleven "
+                "signs out of twelve is not a map.\n"
+                "  Re-measure that row: `python -m hw.bringup spin --id <n>`."
                 % (len(unassigned()), N_JOINTS, ", ".join(unassigned())))
         # Tier 2: the signs exist but nobody has watched them move.
         if not CONFIRMED_ON_DOG6 and not unconfirmed_reason:
@@ -163,10 +166,14 @@ class SafetyGate:
         if tau_cap > tau_hard:
             raise ValueError(f"tau_cap {tau_cap} exceeds the hard limit "
                              f"{tau_hard} N*m")
-        if tau_cap > TAU_STAGED_MAX:
+        # `ceiling` IS A DELIBERATE ARGUMENT, NOT A FLAG.  The stand keeps the
+        # staging ceiling; `hw.fold_trot` raises it to TAU_HARD_NM on the
+        # operator's decision of 2026-09-16 (a diagonal pair in the fold stance
+        # needs 3.3 N*m offline).  tau_hard still bounds it from above.
+        if tau_cap > ceiling:
             raise ValueError(
                 f"tau_cap {tau_cap} is above the staging ceiling "
-                f"{TAU_STAGED_MAX} N*m.  If you meant params.TAU_MAX_SIM "
+                f"{ceiling} N*m.  If you meant params.TAU_MAX_SIM "
                 f"({P.TAU_MAX_SIM}), that is a SIMULATION number and does not "
                 "belong on hardware.  Raise TAU_STAGED_MAX deliberately, from "
                 "a log, one step at a time.")
@@ -177,6 +184,10 @@ class SafetyGate:
         self.qd_estop = float(qd_estop)
         self.qd_estop_hard = float(qd_estop_hard)
         self.unconfirmed_reason = unconfirmed_reason
+        #: False is DOG5's trot runner (`trot_hw.TorqueGate.overspeed_reason`):
+        #: both tiers still measure and keep their peaks for the exit report,
+        #: and neither stops the run.  `hw.fold_trot` passes it -- see there.
+        self.overspeed_trip = bool(overspeed_trip)
         self.low, self.high = soft_limits() if limits is None else limits
 
         self.started_at = None
@@ -255,6 +266,8 @@ class SafetyGate:
                 confirmed = np.zeros(N_JOINTS, dtype=bool)
         self._overspeed_last_q = q.copy()
         self._overspeed_last_time = float(now)
+        if not self.overspeed_trip:
+            return None
 
         if np.any(speed > self.qd_estop_hard):
             index = int(np.argmax(speed))

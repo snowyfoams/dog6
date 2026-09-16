@@ -3,8 +3,9 @@
     BalanceLaw.arm(now, state)      latch h0 and the heading, plan the ramp
     BalanceLaw.update(now, state)   -> LawOutput
 
-`hw.stand` owns WHEN this runs -- the phase machine, the CAN slots, the keys.
-This owns WHAT it computes.  Keeping the two apart is what lets the whole law
+`sequence` owns WHEN this runs -- it is the phase machine, and the lift phase
+is the one place it calls this.  `hw.stand` owns the CAN slots and the keys.
+This owns WHAT it computes.  Keeping the three apart is what lets the whole law
 be exercised offline, against a `state.BodyState` built by hand, with no bus
 and no IMU in the process.
 
@@ -58,6 +59,7 @@ if __package__ in (None, ""):        # allow `python hw/balance/law.py` too
     __package__ = "hw.balance"
 
 from sim import coordinates as C     # noqa: E402
+from sim import params as P          # noqa: E402
 from sim import stand as ST          # noqa: E402
 
 from .. import kinematics as HK      # noqa: E402
@@ -65,17 +67,37 @@ from . import allocation as ALLOC    # noqa: E402
 from . import config as cfg          # noqa: E402
 from . import controller as CTRL     # noqa: E402
 from . import reference as REF       # noqa: E402
+from . import state as STATE         # noqa: E402
+from . import swing as SWING         # noqa: E402
 from . import torque as TRQ          # noqa: E402
 
 __all__ = ["BalanceLaw", "LawOutput", "Timing", "ik_reference"]
 
 
-def ik_reference(h_cmd: float, q_seed) -> np.ndarray:
-    """(4, 3) joint angles putting the four feet at FOOT_XY and height `h_cmd`.
+def _wrap_pi(a: float) -> float:
+    """Wrap to (-pi, pi]."""
+    return float(np.remainder(a + np.pi, 2.0 * np.pi) - np.pi)
+
+
+def ik_reference(h_cmd: float, q_seed, foot_xy=None) -> np.ndarray:
+    """(4, 3) joint angles putting the four feet at `foot_xy` and height `h_cmd`.
 
     THE TRACKING TRIP'S TARGET, and nothing else -- it is never commanded.
     `h_cmd` is in h (floor to trunk bottom); `sim.stand.foot_targets` is in
     the trunk-origin frame, so the conversion happens here and in one place.
+
+    `foot_xy` IS WHERE THE FEET ARE PINNED WHILE THE TRUNK RISES, in each
+    leg's own HIP frame, and None means `sim.stand.FOOT_XY` -- the nominal
+    crouch's.  It is an argument because it is a property of the POSTURE THE
+    LIFT STARTED FROM, not of the robot: a crouch folded by hand puts the feet
+    somewhere else entirely, and measuring the tracking error against the
+    nominal stance would then report the difference between two postures as a
+    tracking failure.  From `posture.FOLD` that reads 91.6 deg on the first
+    sweep, against a 25 deg trip.
+
+    Only z carries the height, for all four, which is to say THE REFERENCE IS
+    A LEVEL TRUNK -- the attitude the law is driving toward, whatever the
+    crouch was resting at.
 
     `hw.kinematics`' CLOSED-FORM inverse, seeded with the measured pose:
     20 us a leg against `sim.kinematics.leg_ik`'s 463 us, a fixed operation
@@ -83,7 +105,13 @@ def ik_reference(h_cmd: float, q_seed) -> np.ndarray:
     The seed also stops the solver returning a mirrored elbow or a 2 pi step,
     which as a trip threshold would read as a leg that is wildly wrong.
     """
-    targets = ST.foot_targets(h_cmd + cfg.TRUNK_BOTTOM_OFFSET)
+    height = float(h_cmd) + cfg.TRUNK_BOTTOM_OFFSET
+    if foot_xy is None:
+        targets = ST.foot_targets(height)
+    else:
+        targets = np.zeros((C.N_LEGS, 3))
+        targets[:, :2] = np.asarray(foot_xy, dtype=float)
+        targets[:, 2] = -(height - P.FOOT_RADIUS)
     return HK.all_leg_ik(targets, q_seed=q_seed)
 
 
@@ -134,6 +162,13 @@ class LawOutput:
     q_ref: np.ndarray                # (12,) the tracking trip's target
     imu_held: bool                   # the attitude half was frozen this sweep
     trip: str | None
+    #: The state the law ACTED ON.  In a stand this is the caller's; in a
+    #: trot its height is re-taken over the stance feet (`state.on_stance`).
+    state: object = None
+    #: The trot, when one is running; all None in a stand.
+    contact: np.ndarray | None = None    # (4,) the weight the allocator got
+    swing_s: np.ndarray | None = None    # (4,) swing progress, 0 in stance
+    p_swing: np.ndarray | None = None    # (4, 3) swing target, TRUNK; NaN in stance
 
 
 @dataclass
@@ -145,11 +180,56 @@ class BalanceLaw:
     h_lift: float = cfg.H_LIFT
     gravity_legs_per_sweep: int = C.N_LEGS
     mu: float = cfg.MU
+    #: (4, 2) HIP-frame foot xy the tracking reference pins; None = nominal.
+    #: `posture.CrouchPose.foot_xy` is what fills it.
+    foot_xy: np.ndarray | None = None
+    #: Whether the attitude setpoint is LATCHED at zero torque or taken from
+    #: the config statics.  None defers to `config.SETPOINT_DYNAMIC`; False is
+    #: a FIXED OFFSET, which is what a run that wants two postures compared
+    #: needs -- a per-run datum would move "level" between the two and the
+    #: comparison would be against two different references.
+    dynamic_setpoint: bool | None = None
+    #: Where the tilt e-stop fires, in degrees from the SETPOINT.  None takes
+    #: `config.TILT_STOP_DEG`.  IT IS A TRIP, NOT A TUNING -- raising it is a
+    #: deliberate act by whoever is standing next to the robot, which is why
+    #: it is an argument and why the banner prints it on every run.
+    tilt_stop_deg: float | None = None
+    #: The joint TRACKING trip, in degrees.  None takes `config.TRACK_STOP_RAD`;
+    #: 0 (or less) turns it OFF.  It is a MONITOR and nothing else --
+    #: `ik_reference` feeds only `_trip` and the log, never the torque -- so
+    #: switching it off changes no N*m the drivers receive.  What it gives up
+    #: is the one check that notices a LEG far from where the model thinks it
+    #: is while the attitude still reads fine.  `q_ref` is still computed and
+    #: still logged either way.
+    track_stop_deg: float | None = None
+    #: The pinned c^b and I^b, `posture.CrouchPose.srb`.  None is the nominal
+    #: `config.SRB`.  It reaches BOTH the reference and the measurement from
+    #: here, which is what keeps the CoM offset cancelling in the z error.
+    srb: "cfg.SrbModel | None" = None
 
     def __post_init__(self) -> None:
+        if self.srb is None:
+            self.srb = cfg.SRB
+        if self.dynamic_setpoint is None:
+            self.dynamic_setpoint = bool(cfg.SETPOINT_DYNAMIC)
+        if self.tilt_stop_deg is None:
+            self.tilt_stop_deg = float(cfg.TILT_STOP_DEG)
+        if self.track_stop_deg is None:
+            self.track_stop_deg = float(np.rad2deg(cfg.TRACK_STOP_RAD))
         self.ramp: REF.Quintic | None = None
         self.t0 = 0.0
         self.R_des = np.eye(3)
+        #: The attitude setpoint, RADIANS, the pair that defines "level" for
+        #: this run.  `latch_setpoint` moves them; until it does they are the
+        #: config statics, which is exactly what DOG5 flew before the dynamic
+        #: latch existed and is what `SETPOINT_DYNAMIC = False` still flies.
+        self.sp_roll = float(np.radians(cfg.SETPOINT_ROLL_DEG))
+        self.sp_pitch = float(np.radians(cfg.SETPOINT_PITCH_DEG))
+        #: The heading half, latched by `arm`.  NaN until then -- there is no
+        #: yaw reference before torque is live and saying so beats reporting
+        #: an error against zero.
+        self.sp_yaw = float("nan")
+        self.setpoint_latched = False
         self.h0 = float("nan")
         self.residual = ALLOC.ResidualMonitor()
         self.timing = Timing()
@@ -157,6 +237,80 @@ class BalanceLaw:
         self.tau_peak = 0.0
         self.imu_held_sweeps = 0
         self._sweep = 0
+
+    # -- the setpoint, latched at ZERO TORQUE ----------------------------
+    def latch_setpoint(self, state) -> tuple | None:
+        """setpoint := the roll/pitch being measured RIGHT NOW.  -> (r, p) deg.
+
+        DOG5's SETPOINT_DYNAMIC latch, ported.  `sequence` calls this during
+        the LIMP phase -- the one phase with no torque anywhere and the trunk
+        resting wherever the operator put it -- and from then on "level" for
+        this run means that attitude.  Returns the pair in DEGREES for the
+        banner, or None if it refused.
+
+        IT LATCHES ONCE.  A second call is ignored, which is what makes "once
+        per run, in limp only" a property of this object rather than a rule
+        the caller has to keep.  The asymmetry with the yaw lock is deliberate
+        and `config.SETPOINT_DYNAMIC` explains it: heading has no truth to
+        return to, level does.
+
+        IT REFUSES A STALE IMU.  A setpoint latched from a packet that arrived
+        before the operator put the robot down is a constant the attitude loop
+        then fights for the whole run, and unlike the yaw lock there is no
+        later re-latch to correct it.  Better to fly the config statics and
+        say so.
+        """
+        if self.setpoint_latched or not self.dynamic_setpoint:
+            return None
+        if state is None or state.imu_stale:
+            return None
+        self.sp_roll = float(state.roll)
+        self.sp_pitch = float(state.pitch)
+        self.setpoint_latched = True
+        return (float(np.degrees(self.sp_roll)),
+                float(np.degrees(self.sp_pitch)))
+
+    def attitude_error_deg(self, state) -> np.ndarray:
+        """(3,) measured rpy MINUS the setpoint, in degrees.  The operator's
+        view of the error, not the law's.
+
+        THE LAW DOES NOT SUBTRACT EULER ANGLES -- it forms `e_R` from the
+        SO(3) log map of R_des and R, and this is not that.  It is the same
+        quantity to within the small-angle agreement of the two, and it is
+        what a person means by "how far off is it".  Read `wrench.e_R` for
+        what actually multiplies the gain.
+
+        Yaw is against the heading latched at `arm`; before that it is NaN,
+        because there is no reference to be wrong about yet.
+        """
+        yaw_err = (float("nan") if not np.isfinite(self.sp_yaw)
+                   else np.degrees(_wrap_pi(state.yaw - self.sp_yaw)))
+        return np.array([np.degrees(state.roll - self.sp_roll),
+                         np.degrees(state.pitch - self.sp_pitch),
+                         yaw_err])
+
+    def setpoint_drift_deg(self) -> float:
+        """How far the latched pair sits from the config statics, in degrees.
+
+        The number `config.SETPOINT_WARN_DEG` is compared against.  Big means
+        the robot was not resting flat when the datum was taken -- propped
+        against something, or held.
+        """
+        return max(abs(np.degrees(self.sp_roll) - cfg.SETPOINT_ROLL_DEG),
+                   abs(np.degrees(self.sp_pitch) - cfg.SETPOINT_PITCH_DEG))
+
+    def tilt_from_setpoint_deg(self, state) -> float:
+        """max(|roll|, |pitch|) measured FROM THE SETPOINT, in degrees.
+
+        What the tilt stop reads.  `state.tilt_deg` measures from true level
+        and is the right number for the log and the operator's status line;
+        this is the right one for the trip, because the trip has to mean
+        "the robot has left the attitude the law is holding it at".  On a
+        floor with any slope in it those two differ by the slope, and DOG5
+        made the same choice for the same reason.
+        """
+        return float(np.degrees(max(abs(state.roll - self.sp_roll),
+                                    abs(state.pitch - self.sp_pitch))))
 
     # -- arming ----------------------------------------------------------
     def arm(self, now: float, state) -> None:
@@ -166,11 +320,21 @@ class BalanceLaw:
         a height the robot is not at is a step input -- into k_d,z, which
         differentiates it.  The same argument is why the heading is latched
         here rather than tracked: R_des must not move under the loop.
+
+        THE HEADING IS LATCHED HERE AND THE SETPOINT IS NOT.  Yaw is taken at
+        the handover, which is the first sweep torque is live, so by
+        construction the yaw error is exactly zero on the sweep it is taken
+        and arming can never step the wrench -- DOG5's reason, unchanged.
+        Roll and pitch were latched earlier, at LIMP, because by the time this
+        runs the crouch has already put the trunk on the floor and its lean is
+        not what "level" should mean.
         """
         self.t0 = float(now)
         self.h0 = float(state.h)
         self.ramp = REF.Quintic.ramp(self.h0, self.h_lift, self.rise_s)
-        self.R_des = CTRL.level_attitude(state.yaw)
+        self.sp_yaw = float(state.yaw)
+        self.R_des = CTRL.latched_attitude(self.sp_roll, self.sp_pitch,
+                                           self.sp_yaw)
         self.gravity = TRQ.all_leg_gravity_torque(state.q, state.R)
 
     def replan(self, now: float, state, h_target: float, seconds: float) -> None:
@@ -199,26 +363,40 @@ class BalanceLaw:
         return max(0.0, self.ramp.T - (float(now) - self.t0))
 
     # -- the sweep -------------------------------------------------------
-    def update(self, now: float, state, clock=None) -> LawOutput:
-        """Stages 1-5 for one sweep.  `state` is a `state.BodyState`."""
+    def update(self, now: float, state, clock=None, gait=None) -> LawOutput:
+        """Stages 1-5 for one sweep.  `state` is a `state.BodyState`.
+
+        `gait` is a `gait.TrotGait` while the robot trots, None while it
+        stands.  It changes three things and nothing else: the allocator is
+        given the clock's contact weights, a swinging leg gets the swing
+        impedance on top of its own weight, and the residual trip only counts
+        sweeps with all four feet at full weight.  The wrench, the gains and
+        the reference are the stand's, unchanged.
+        """
         if self.ramp is None:
             raise RuntimeError("BalanceLaw.arm() has not been called")
         started = None if clock is None else clock()
         self._sweep += 1
+        clock_now = None if gait is None else gait.sample(now)
+        if clock_now is not None:
+            # THE HEIGHT FROM THE FEET THAT ARE DOWN -- see `state.on_stance`.
+            state = STATE.on_stance(state, clock_now.contact, self.srb)
 
         # -- the reference -------------------------------------------------
         command = self.ramp.at(float(now) - self.t0)
-        com_cmd = REF.com_command(command, state.R)
+        com_cmd = REF.com_command(command, state.R, self.srb)
 
         # -- stage 3 -------------------------------------------------------
         held = bool(state.imu_stale)
         if held:
             self.imu_held_sweeps += 1
         wrench = CTRL.balance_wrench(state, com_cmd, self.R_des, self.gains,
-                                     hold_attitude=held)
+                                     hold_attitude=held, srb=self.srb)
 
         # -- stage 4 -------------------------------------------------------
-        allocation = ALLOC.allocate(state.r_w, wrench.b_d, mu=self.mu)
+        weight = None if clock_now is None else clock_now.weight
+        allocation = ALLOC.allocate(state.r_w, wrench.b_d, mu=self.mu,
+                                    contact=weight)
 
         # -- stage 5 -------------------------------------------------------
         # Sub-rated when asked: `gravity_legs_per_sweep` legs are refreshed,
@@ -233,9 +411,35 @@ class BalanceLaw:
                 self.gravity[leg] = TRQ.leg_gravity_torque(leg, q4[leg], state.R)
         tau = TRQ.stance_torque(state, allocation.f_w, self.gravity)
 
+        # -- the swing legs ------------------------------------------------
+        q_ref = ik_reference(command.h, C.unflat(state.q), self.foot_xy)
+        swing_s = p_swing = None
+        if clock_now is not None:
+            swinging = ~clock_now.contact
+            swing_s = clock_now.swing_s
+            p_swing = np.full((C.N_LEGS, 3), np.nan)
+            if swinging.any():
+                rest = SWING.rest_feet_b(command.h, self.foot_xy)
+                q4 = C.unflat(state.q)
+                for i in np.flatnonzero(swinging):
+                    p, v = SWING.swing_reference(rest[i], float(swing_s[i]),
+                                                 gait.swing_duration)
+                    p_swing[i] = p
+                    tau[3 * i:3 * i + 3] += SWING.swing_torque(state, i, p, v)
+                    # THE TRACKING REFERENCE FOLLOWS A SWINGING LEG, as DOG5's
+                    # q_ref did: pinned at the stance IK, the trip would read
+                    # a 40 mm apex as a leg gone wrong.
+                    q_ref[i] = q4[i]
+
         # -- the trips -----------------------------------------------------
-        q_ref = ik_reference(command.h, C.unflat(state.q))
-        trip = self._trip(state, allocation, C.flat(q_ref))
+        # THE RESIDUAL TRIP COUNTS ONLY FOUR-FOOT SWEEPS IN A TROT.  A pair of
+        # diagonal feet has no moment about its own support line, so on two
+        # feet a residual is geometry, not a contact about to go -- in the
+        # fold stance it is ~0.97 N*m, over the 0.94 limit, every swing.  The
+        # trip keeps its meaning where it has one.
+        monitor = clock_now is None or clock_now.full_support
+        trip = self._trip(state, allocation, C.flat(q_ref),
+                          monitor_residual=monitor)
         if trip is None:
             self.tau_peak = max(self.tau_peak, float(np.abs(tau).max()))
 
@@ -243,25 +447,34 @@ class BalanceLaw:
             self.timing.add(clock() - started)
         return LawOutput(tau=tau, command=command, com_cmd=com_cmd,
                          wrench=wrench, allocation=allocation,
-                         q_ref=C.flat(q_ref), imu_held=held, trip=trip)
+                         q_ref=C.flat(q_ref), imu_held=held, trip=trip,
+                         state=state,
+                         contact=weight, swing_s=swing_s, p_swing=p_swing)
 
-    def _trip(self, state, allocation, q_ref) -> str | None:
+    def _trip(self, state, allocation, q_ref,
+              monitor_residual: bool = True) -> str | None:
         if not np.all(np.isfinite(allocation.f_w)):
             return ("the allocator returned a non-finite force -- the grasp "
                     "map is singular or the state is NaN")
-        if state.tilt_deg > cfg.TILT_STOP_DEG:
-            return ("tilt %.1f deg past the %.0f deg stop (roll %+.1f, "
-                    "pitch %+.1f)" % (state.tilt_deg, cfg.TILT_STOP_DEG,
-                                      np.degrees(state.roll),
-                                      np.degrees(state.pitch)))
+        tilt = self.tilt_from_setpoint_deg(state)
+        if tilt > self.tilt_stop_deg:
+            return ("tilt %.1f deg from the setpoint, past the %.0f deg stop "
+                    "(roll %+.1f, pitch %+.1f; setpoint %+.1f / %+.1f)"
+                    % (tilt, self.tilt_stop_deg,
+                       np.degrees(state.roll), np.degrees(state.pitch),
+                       np.degrees(self.sp_roll), np.degrees(self.sp_pitch)))
         error = np.abs(state.q - q_ref)
-        if np.any(error > cfg.TRACK_STOP_RAD):
+        if (self.track_stop_deg > 0.0
+                and np.any(error > np.deg2rad(self.track_stop_deg))):
             from ..hardware_map import JOINT_LABELS
             index = int(np.argmax(error))
             return ("tracking: %s is %.1f deg from the IK at the commanded "
                     "height (limit %.0f)"
                     % (JOINT_LABELS[index], np.rad2deg(error[index]),
-                       np.rad2deg(cfg.TRACK_STOP_RAD)))
+                       self.track_stop_deg))
+        if not monitor_residual:
+            self.residual.streak = 0
+            return None
         return self.residual.reason(allocation)
 
     # -- the exit report -------------------------------------------------
@@ -272,4 +485,8 @@ class BalanceLaw:
             "  peak residual   %.2f N / %.3f N*m"
             % (self.residual.peak_force, self.residual.peak_moment),
             "  imu held        %d sweeps" % self.imu_held_sweeps,
+            "  att setpoint    roll %+.2f  pitch %+.2f deg  (%s)"
+            % (np.degrees(self.sp_roll), np.degrees(self.sp_pitch),
+               "latched at limp" if self.setpoint_latched
+               else "config statics -- NOT latched"),
         ])

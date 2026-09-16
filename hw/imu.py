@@ -19,9 +19,11 @@ TWO ROTATIONS, NOT ONE -- THE CHANGE FROM DOG5
                           (x fwd, y RIGHT, z DOWN); this project is FLU
                           (x fwd, y LEFT, z UP).  FLU = NED turned 180 deg
                           about x.  Fixed, never measured, never calibrated.
-        R_BODY_IMU        how the BOARD sits in DOG6.  Identity today and that
-                          is a PLACEHOLDER -- DOG6's IMU has not been mounted.
-                          When it is, this becomes a measurement and the MJCF's
+        R_BODY_IMU        how the BOARD sits in DOG6.  THE IDENTITY, AND
+                          THAT IS THE MEASUREMENT: the DETA10 is bolted on
+                          exactly as it is on DOG5, aligned with the trunk, so
+                          the mounting rotation is a no-op.  If the board is
+                          ever moved this becomes non-trivial and the MJCF's
                           imu site quat moves with it or `selftest` fails.
 
     The scalar roll/pitch offsets survive on top of both, because they absorb
@@ -46,14 +48,30 @@ YAW IS EXPOSED AND UNTRUSTED.  It is magnetometer-based and the magnetometer
     different -- it is the gyro's wz, inertial, and fine for short-horizon
     relative heading.
 
-NOTHING HERE HAS BEEN CHECKED ON DOG6.  The board is not mounted.  Verify the
-    signs with a physical tilt test before trusting them in control, exactly
-    as DOG5's `imu_frame_test.py` did: lift one side, watch the sign.
+THE SIGNS ARE VERIFIED.  DOG6 mounts the same DETA10 the same way as DOG5,
+    so DOG5's frame work describes DOG6.  What was done, from
+    `IMU_sensor/review.md` (2026-07-22) -- worth stating because "verified"
+    is otherwise a word:
+
+      * `imu_frame_test.py`, all four hand-rotation moves passed: nose down
+        -> +pitch, right side down -> +roll, and so on, each tilt checked
+        against the table above rather than against the drawing;
+      * an INDEPENDENT cross-check during the first stand, from a path with
+        no IMU in it at all -- the left legs sagged 12-18 mm against 2-11 mm
+        on the right while the IMU read NEGATIVE roll, which is the sign
+        convention confirmed by leg kinematics;
+      * 200 Hz sustained, zero CRC errors, packet age 0-28 ms through a
+        250 Hz control loop, and 0.01-0.03 deg of jitter at HOLD with all
+        twelve motors loaded.
+
+    DOG6's own stream was checked on 2026-09-16 and agrees: 200 Hz, 0 CRC in
+    5 s, 0.06 deg from level sitting still.
 """
 from __future__ import annotations
 
 import json
 import math
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,17 +81,17 @@ import numpy as np
 
 if __package__ in (None, ""):        # allow `python hw/imu.py` too
     import os
-    import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = "hw"
 
 from sim import coordinates as C     # noqa: E402
 
-# The fdilink_imu vendor SDK is not pip-installable and is not vendored here.
-# Install it on the robot host.  The import is guarded so this module stays
-# importable on a machine with no SDK -- most call sites want only the frame
-# maths or DEFAULT_PORT, and a hard import would block every offline test for
-# the sake of one constant.  Opening a real device still fails loudly.
+# The fdilink_imu vendor SDK is not vendored here and is not on PyPI, but it
+# IS a normal installable package -- see requirements.txt for the one line.
+# The import is guarded so this module stays importable on a machine without
+# it: most call sites want only the frame maths or DEFAULT_PORT, and a hard
+# import would block every offline test for the sake of one constant.
+# Opening a real device still fails loudly.
 try:
     from fdilink_imu import DETA10, DEFAULT_BAUD, AHRSData   # noqa: F401
     _FDILINK_IMPORT_ERROR = None
@@ -102,8 +120,10 @@ MAX_AGE_S = 0.05
 SENSOR_TO_FLU = np.diag([1.0, -1.0, -1.0])
 
 #: R_{trunk <- sensor}: the two composed.  `coordinates.R_BODY_IMU` is the
-#: mounting rotation and is an identity PLACEHOLDER until the board is bolted
-#: on and measured.
+#: mounting rotation and is the identity BY MEASUREMENT -- the board is
+#: mounted aligned with the trunk, as on DOG5.  So this is SENSOR_TO_FLU
+#: alone, and the only reason it is written as a product is that the day the
+#: board moves, it is the product that stays correct.
 SENSOR_TO_TRUNK = C.R_BODY_IMU @ SENSOR_TO_FLU
 
 
@@ -161,8 +181,9 @@ def trunk_rotation(roll_rad: float, pitch_rad: float, yaw_rad: float) -> np.ndar
     the imu -> trunk leg on the right, which is R_BODY_IMU^T.
 
     AT R_BODY_IMU = I THE TWO SIDES AGREE EXACTLY, which is why nothing
-    downstream can see the difference today.  When the board is bolted on and
-    the rotation becomes a measurement, both sides start mattering in the
+    downstream can see the difference on DOG6 as built -- the board is
+    mounted aligned, so the identity is the measurement and not a gap in it.
+    The day a board goes on at an angle, both sides start mattering in the
     same instant; that is the reason it is written out here rather than left
     implicit in `SENSOR_TO_TRUNK`.
 
@@ -225,11 +246,12 @@ class ImuDog:
                  calib_path: Path = DEFAULT_CALIB_PATH):
         if DETA10 is None:
             raise ImportError(
-                "the fdilink_imu vendor SDK is required to talk to the IMU but "
-                "was not found on this host.  It is not pip-installable; "
-                "install it on the robot.  Importing hw.imu without it is "
-                "supported -- the constants and the frame maths work -- but "
-                "opening a device is not."
+                "the fdilink_imu vendor SDK is required to talk to the IMU "
+                "but is not installed in THIS interpreter (%s).  Install it:\n"
+                "    python -m pip install -e /home/robot01/Documents/IMU_sensor"
+                "\nImporting hw.imu without it is supported -- the constants "
+                "and the frame maths work -- but opening a device is not."
+                % sys.executable
             ) from _FDILINK_IMPORT_ERROR
         self._imu = DETA10(port, DEFAULT_BAUD if baud is None else baud)
         self._calib_path = Path(calib_path)
@@ -390,7 +412,7 @@ class ImuDog:
 
 
 def describe() -> str:
-    mounted = not np.allclose(C.R_BODY_IMU, np.eye(3))
+    aligned = bool(np.allclose(C.R_BODY_IMU, np.eye(3)))
     trim = DEFAULT_CALIB_PATH.exists()
     return "\n".join([
         "DOG6 IMU adapter (DETA10 -> trunk frame)",
@@ -399,7 +421,10 @@ def describe() -> str:
         "  SENSOR_TO_FLU   diag%s   Rx(180 deg), a sensor property"
         % (tuple(int(v) for v in np.diag(SENSOR_TO_FLU)),),
         "  R_BODY_IMU      %s"
-        % ("measured" if mounted else "IDENTITY -- PLACEHOLDER, board not mounted"),
+        % ("IDENTITY -- MEASURED: mounted aligned with the trunk, as DOG5"
+           if aligned and C.R_BODY_IMU_MEASURED else
+           "measured, non-trivial" if C.R_BODY_IMU_MEASURED else
+           "UNMEASURED -- nobody has checked how the board sits"),
         "  SENSOR_TO_TRUNK %s" % np.array2string(SENSOR_TO_TRUNK,
                                                  precision=3).replace("\n", "\n"
                                                                       + " " * 18),
@@ -410,8 +435,8 @@ def describe() -> str:
                                   "absent (%s) -- frame maths still works"
                                   % type(_FDILINK_IMPORT_ERROR).__name__),
         "",
-        "  Signs are UNVERIFIED on DOG6.  Tilt the robot and watch them before",
-        "  closing any loop.  Yaw is magnetometer-based: display only.",
+        "  Signs are VERIFIED -- see the module docstring for what was done.",
+        "  Yaw is magnetometer-based: display only.",
     ])
 
 
