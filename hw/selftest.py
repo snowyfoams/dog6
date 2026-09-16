@@ -423,6 +423,8 @@ def main() -> int:
 
     # ----------------------------------------------------------------------
     print("\n%d checks, %d failed" % (_PASSES + len(_FAILURES), len(_FAILURES)))
+    print("The stand's balance controller is gated separately, and this file "
+          "does not run it:\n    python -m hw.balance.selftest")
     if _FAILURES:
         for name in _FAILURES:
             print("  FAILED: %s" % name)

@@ -103,22 +103,27 @@ THE ZERO
     inertial) and not in its body frames.  That is what keeps the aligned
     zero, and with it `link_rotations` as a plain product with no offsets.
 
-    UNTIL THE REBUILD, ONLY Q_STAND HAS MOVED.  `model/dog6.xml` is a
-    generated artifact whose generator is not in this repository, so the XML
-    still carries the old fold.  The rebuild rolls each leg body's geoms,
-    sites and inertial 180 deg about x -- pos (x, y, z) -> (x, -y, -z), quat
-    pre-multiplied by Rx(180 deg), the inertia's ixy and ixz negated -- and
-    negates the `stand` keyframe's twelve joint entries.  Every body `pos`,
-    every absent body `quat` and all twelve joint `axis` attributes stay
-    exactly as they are.  The same roll goes through `params`, which copies
-    the MJCF: every leg link's `com` y and z negate, every leg link inertia's
-    ixy and ixz negate, and `knee_to_foot`'s z flips from -0.005 to +0.005.
-    Masses, link lengths and the trunk's own inertial are untouched, and so
-    is L3, which is a norm.  Until that lands ONE gate in `selftest` is RED,
-    `Q_STAND == the stand keyframe`, and that is the honest signal that the
-    artifact is behind the convention.  Do not read the feet-on-the-floor
-    gate as agreement: it checks only z, and the old fold lands the foot ball
-    10 mm to the other side of the shin at the same height.
+    THE REBUILD LANDED WITH THE CORRECTION, IN THE SAME COMMIT.  What it did,
+    written out because `model/dog6.xml` is a generated artifact whose
+    generator is not in this repository and this is the only record of it:
+    each leg body's geoms, sites and inertial rolled 180 deg about x -- pos
+    (x, y, z) -> (x, -y, -z), quat pre-multiplied by Rx(180 deg), the
+    inertia's ixy and ixz negated -- and the `stand` keyframe's twelve joint
+    entries negated.  Every body `pos`, every absent body `quat` and all
+    twelve joint `axis` attributes stayed exactly as they were.  The same
+    roll went through `params`, which copies the MJCF: every leg link's `com`
+    y and z negated, every leg link inertia's ixy and ixz negated, and
+    `knee_to_foot`'s z flipped from -0.005 to +0.005.  Masses, link lengths
+    and the trunk's own inertial were untouched, and so was L3, which is a
+    norm.
+
+    THE GATE THAT SAYS SO IS `Q_STAND == the stand keyframe`, in `selftest`,
+    and it is GREEN.  It is the one that has to be read, because the
+    feet-on-the-floor gate beside it would pass either way: that one checks
+    only z, and the old fold lands the foot ball 10 mm to the other side of
+    the shin at the same height.  So a green `sim.selftest` is what says the
+    MJCF, `params`, `kinematics` and `hw.kinematics` all agree on THIS zero
+    -- and it is the only thing that says it.
 
 
 THE JOINT AXES
@@ -259,6 +264,73 @@ def rot_x(angle: float) -> np.ndarray:
 def rot_z(angle: float) -> np.ndarray:
     c, s = np.cos(angle), np.sin(angle)
     return np.array(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)))
+
+
+def rot_y(angle: float) -> np.ndarray:
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array(((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c)))
+
+
+def rot_zyx(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """R_{world <- trunk} from the ZYX (yaw-pitch-roll) triple, RADIANS.
+
+    ``R = Rz(yaw) @ Ry(pitch) @ Rx(roll)``, so ``v_world = R @ v_trunk``.  On
+    FLU axes the right-hand rule fixes the signs, and they are worth writing
+    down because they are what a physical tilt test has to reproduce:
+
+        roll  > 0   right side DOWN, left side rises
+        pitch > 0   nose DOWN     <- the FLU consequence, and the OPPOSITE of
+        yaw   > 0   nose LEFT        the aeronautical NED convention the
+                                     DETA10 reports in.  `hw.imu` flips it.
+
+    This is the parameterisation `hw.imu` hands the balance controller.  The
+    control law carries R and never the triple; the triple exists for the tilt
+    trip, the status line and the log.
+    """
+    return rot_z(yaw) @ rot_y(pitch) @ rot_x(roll)
+
+
+def zyx_from_rot(R) -> tuple[float, float, float]:
+    """(roll, pitch, yaw) in radians from R.  The inverse of `rot_zyx`.
+
+    Degenerate at pitch = +-90 deg, where roll and yaw stop being separable.
+    A standing quadruped is nowhere near it -- the tilt trip that reads this
+    fires at a tenth of the way there -- so no branch is taken for it.
+    """
+    R = np.asarray(R, dtype=float).reshape(3, 3)
+    pitch = float(np.arctan2(-R[2, 0], np.hypot(R[0, 0], R[1, 0])))
+    roll = float(np.arctan2(R[2, 1], R[2, 2]))
+    yaw = float(np.arctan2(R[1, 0], R[0, 0]))
+    return roll, pitch, yaw
+
+
+def log_so3(R) -> np.ndarray:
+    """The rotation vector of R: ``log(R)^vee``, axis times angle.  Shape (3,).
+
+    THE ATTITUDE ERROR IS FORMED WITH THIS, NOT BY SUBTRACTING EULER ANGLES.
+    An Euler difference is not a vector: it does not compose, it is not
+    frame-covariant, and near a gimbal it is not even continuous.  The log map
+    is the exact axis-angle of the residual rotation, which is the thing a
+    moment can be produced about.
+
+    Three branches, and the two outer ones are not optimisations.  At
+    theta -> 0 the ``1 / (2 sin theta)`` factor is 0/0 and the antisymmetric
+    part alone IS the answer to second order.  At theta -> pi, sin theta
+    collapses again and the axis has to be recovered from R + I instead, where
+    the antisymmetric part has gone to zero and carries no axis at all.
+    """
+    R = np.asarray(R, dtype=float).reshape(3, 3)
+    theta = float(np.arccos(min(1.0, max(-1.0, 0.5 * (float(np.trace(R)) - 1.0)))))
+    antisym = np.array([R[2, 1] - R[1, 2],
+                        R[0, 2] - R[2, 0],
+                        R[1, 0] - R[0, 1]])
+    if theta < 1.0e-6:
+        return 0.5 * antisym
+    if theta > np.pi - 1.0e-6:
+        k = int(np.argmax(np.diag(R)))
+        column = R[:, k] + np.eye(3)[:, k]
+        return theta * (column / np.linalg.norm(column))
+    return (theta / (2.0 * np.sin(theta))) * antisym
 
 
 def link_rotations(q) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

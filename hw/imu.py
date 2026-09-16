@@ -86,8 +86,15 @@ except ImportError as _exc:          # no SDK on this host
 DEFAULT_PORT = "/dev/fdilink_imu"
 DEFAULT_CALIB_PATH = Path(__file__).resolve().parent / "imu_calib.json"
 
-__all__ = ["ImuDog", "TrunkAttitude", "SENSOR_TO_FLU", "sensor_to_trunk",
-           "wrap_deg", "DEFAULT_PORT", "DEFAULT_CALIB_PATH", "describe"]
+__all__ = ["ImuDog", "TrunkAttitude", "TrunkOrientation", "SENSOR_TO_FLU",
+           "SENSOR_TO_TRUNK", "sensor_to_trunk", "trunk_rotation", "wrap_deg",
+           "MAX_AGE_S", "DEFAULT_PORT", "DEFAULT_CALIB_PATH", "describe"]
+
+#: How old the last packet may be before the balance law stops believing it.
+#: The DETA10 streams at 200 Hz on its own clock, so one missed packet is
+#: 5 ms and this is ten of them.  `hw.balance` freezes its attitude terms
+#: rather than running them on a stale error -- see `ImuDog.orientation`.
+MAX_AGE_S = 0.05
 
 #: R_{FLU <- NED}: the DETA10's own axis convention against this project's.
 #: Rx(180 deg).  A property of the sensor, not of the mounting -- see the
@@ -135,6 +142,80 @@ def sensor_to_trunk(roll_deg, pitch_deg, heading_deg, angular_rates):
     yaw = wrap_deg(-heading_deg)
     rates = np.rad2deg(SENSOR_TO_TRUNK @ np.asarray(angular_rates, dtype=float))
     return roll, pitch, yaw, float(rates[0]), float(rates[1]), float(rates[2])
+
+
+def trunk_rotation(roll_rad: float, pitch_rad: float, yaw_rad: float) -> np.ndarray:
+    """R_{world <- trunk} from a TRUNK-frame ZYX triple in RADIANS.
+
+    This is the second half of the chain the module docstring lays out, and
+    the mounting rotation enters it on the OPPOSITE SIDE from the gyro's:
+
+        omega^b = R_BODY_IMU @ SENSOR_TO_FLU @ omega^s        (left)
+        R       = Rzyx(roll, pitch, yaw) @ R_BODY_IMU^T       (right)
+
+    The asymmetry is not a choice and cannot be folded into one matrix.
+    `omega` is a VECTOR expressed in the board's frame, so carrying it into
+    the trunk is a rotation on the left.  The triple passed in here already
+    describes a frame chain that TERMINATES in the board's frame -- it is the
+    ZYX triple of R_{world <- imu} -- so reaching the trunk means appending
+    the imu -> trunk leg on the right, which is R_BODY_IMU^T.
+
+    AT R_BODY_IMU = I THE TWO SIDES AGREE EXACTLY, which is why nothing
+    downstream can see the difference today.  When the board is bolted on and
+    the rotation becomes a measurement, both sides start mattering in the
+    same instant; that is the reason it is written out here rather than left
+    implicit in `SENSOR_TO_TRUNK`.
+
+    THE TRIM IS APPLIED BEFORE THIS, NOT AFTER.  `TrunkAttitude` subtracts the
+    roll/pitch offsets from the imu-frame triple, so the trim is a rotation of
+    R_{world <- imu} and this function carries the trimmed value through.  At
+    an identity mounting that is the same thing as trimming the trunk; at a
+    real one they differ by the mounting rotation, and the trim is small
+    enough that it belongs on whichever side the operator captured it on.
+    """
+    return C.rot_zyx(roll_rad, pitch_rad, yaw_rad) @ C.R_BODY_IMU.T
+
+
+@dataclass(frozen=True)
+class TrunkOrientation:
+    """What the balance law consumes: SI, one rotation, one rate vector.
+
+    `TrunkAttitude` is the human-facing view -- degrees, six scalars, a yaw
+    that is labelled untrusted.  This is the control-facing one, and the
+    difference is deliberate rather than cosmetic: a law that takes an Euler
+    triple in degrees will sooner or later subtract two of them and call the
+    result an attitude error.  Nothing here can be subtracted.
+    """
+
+    R: np.ndarray            # (3, 3)  world <- trunk, `coordinates.rot_zyx`
+    omega_b: np.ndarray      # (3,)    rad/s in the TRUNK frame -- the gyro's
+    roll: float              # rad, trimmed.  For the tilt trip and the log,
+    pitch: float             # rad, trimmed.  NOT for the control law.
+    yaw: float               # rad, magnetometer -- UNTRUSTED, display only
+    age_s: float             # host seconds since the packet arrived
+
+    @property
+    def omega_w(self) -> np.ndarray:
+        """The same rate in the WORLD frame, which is what the SRB law uses."""
+        return self.R @ self.omega_b
+
+    def is_stale(self, max_age_s: float = MAX_AGE_S) -> bool:
+        return self.age_s > max_age_s
+
+    @property
+    def tilt_deg(self) -> float:
+        """The larger of |roll| and |pitch| in degrees -- what trips."""
+        return float(np.degrees(max(abs(self.roll), abs(self.pitch))))
+
+    @staticmethod
+    def level() -> "TrunkOrientation":
+        """A perfectly level, motionless, infinitely fresh trunk.
+
+        FOR OFFLINE TESTS AND FOR THE NO-IMU PATH ONLY.  `age_s` is zero, so
+        `is_stale` says fresh: anything that accepts this is asserting it does
+        not need an IMU, and `hw.stand --no-imu` is the only caller that does.
+        """
+        return TrunkOrientation(np.eye(3), np.zeros(3), 0.0, 0.0, 0.0, 0.0)
 
 
 class ImuDog:
@@ -214,6 +295,35 @@ class ImuDog:
             yaw_rate_dps=wz,
             age_s=self.age_s(),
             raw=a,
+        )
+
+    def orientation(self) -> Optional[TrunkOrientation]:
+        """`sample()` in SI: R, omega^b in rad/s.  None before the first packet.
+
+        WHAT THE ADAPTER OWED THE CONTROL LAW, AND THIS IS IT.  Nothing new is
+        measured here -- the same packet, the same trim, the same frame chain.
+        What changes is the type: degrees become radians, three scalar rates
+        become one vector, and the triple becomes the rotation matrix the law
+        actually multiplies by.
+
+        DOES NOT BLOCK AND DOES NOT WAIT.  The IMU streams on its own clock,
+        not on the control sweep, so the caller gets the most recent packet
+        whatever its age and `age_s` says what that age is.  A sweep that
+        waits for a packet is a sweep that misses its CAN deadline.
+        """
+        attitude = self.sample()
+        if attitude is None:
+            return None
+        roll = math.radians(attitude.roll_deg)
+        pitch = math.radians(attitude.pitch_deg)
+        yaw = math.radians(attitude.yaw_deg)
+        return TrunkOrientation(
+            R=trunk_rotation(roll, pitch, yaw),
+            omega_b=np.deg2rad([attitude.roll_rate_dps,
+                                attitude.pitch_rate_dps,
+                                attitude.yaw_rate_dps]),
+            roll=roll, pitch=pitch, yaw=yaw,
+            age_s=attitude.age_s,
         )
 
     # -- the mounting TRIM (not the mounting rotation) ---------------------

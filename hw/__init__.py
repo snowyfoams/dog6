@@ -48,6 +48,21 @@ WHAT IS HERE
                       the sensor's NED->FLU convention from the MOUNTING
                       rotation, which is `coordinates.R_BODY_IMU` and still a
                       placeholder because the board is not bolted on.
+                      `orientation()` is the control-facing view: R and
+                      omega^b in SI, with the mounting rotation applied on
+                      the correct side of each.
+
+    balance/          [RUNS]  the stand's balance controller -- an SRB wrench
+                      law with a force allocator, replacing the per-leg
+                      Cartesian compliance in the LIFT PHASE ONLY.  Attitude
+                      is measured rather than emergent; gravity enters once
+                      as m*g rather than as a fixed mg/4 per foot.  78 checks
+                      of its own, no robot needed.  See balance/README.md.
+
+    stand.py          the six-phase sequence on the real drivers, and the
+                      only file that decides WHEN anything runs.  Carries
+                      both lift laws: `--law srb` and `--law per-leg`, the
+                      second unchanged and kept as the A/B baseline.
     safety.py         [REFUSES]  torque ramp, cap, limit block, slew and the
                       e-stop trips.  Cannot be constructed on an empty map,
                       with no override -- there are no signs to shape through.

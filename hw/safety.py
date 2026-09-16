@@ -81,9 +81,10 @@ from .hardware_map import (          # noqa: E402
     unconfirmed,
 )
 
-__all__ = ["SafetyGate", "CanMissMonitor", "TAU_HARD_NM", "TAU_START_MAX",
-           "TAU_STAGED_MAX", "QD_ESTOP", "QD_ESTOP_HARD", "TEMP_ESTOP_C",
-           "MISS_ESTOP", "describe"]
+__all__ = ["SafetyGate", "CanMissMonitor", "TorqueReadback", "TAU_HARD_NM",
+           "TAU_START_MAX", "TAU_STAGED_MAX", "QD_ESTOP", "QD_ESTOP_HARD",
+           "TEMP_ESTOP_C", "MISS_ESTOP", "TAU_BLACKOUT_FRAC",
+           "TAU_BLACKOUT_STREAK", "describe"]
 
 # ---------------------------------------------------------------------------
 # limits
@@ -321,6 +322,99 @@ class SafetyGate:
                                    for mid, err in hard.items())
                 return f"motor fault: {detail}"
         return None
+
+
+#: The measured-torque witness.  A motor is "not producing" when the drivers
+#: report q-axis current under this fraction of what was commanded, and only
+#: when something substantial was commanded (`TAU_BLACKOUT_FLOOR`) -- near
+#: zero the ratio is meaningless.  [INHERITED FROM DOG5, where a blackout read
+#: exactly zero measured torque with the command pinned at the cap]
+TAU_BLACKOUT_FRAC = 0.25
+TAU_BLACKOUT_FLOOR = 0.30               # N*m commanded, below which no test
+TAU_BLACKOUT_STREAK = 50                # sweeps -> 0.2 s at 250 Hz
+
+
+class TorqueReadback:
+    """Commanded torque against the q-axis current the drivers report back.
+
+    THE TRIP NOTHING ELSE CAN STAND IN FOR.  Every other witness in this file
+    asks the drivers how they are, and a driver in a brown-out answers
+    cheerfully: on DOG5 a blackout produced ZERO measured torque with the
+    command pinned at the cap, CAN still replying, no fault bit, no
+    over-speed, no over-temperature, no missed frame.  The only number that
+    disagreed was the one in the reply nobody was reading.
+
+    IT IS A STREAK AND IT HAS A FLOOR, for the same reason the overspeed trip
+    has two witnesses.  The measured current lags the command through the
+    current loop and the gearbox, so an instantaneous ratio is noisy during
+    every transient; and near zero commanded torque the ratio is not a
+    quantity at all.  So the test only runs on motors being asked for real
+    torque, and only fires when a majority of them have been silent together
+    for `TAU_BLACKOUT_STREAK` consecutive checks -- one limp motor is a
+    mechanical fault, and all twelve at once is the power rail.
+
+    Call `reason` exactly once per control decision; the streak counts calls.
+    """
+
+    def __init__(self, n_joints: int = N_JOINTS, *,
+                 fraction: float = TAU_BLACKOUT_FRAC,
+                 floor: float = TAU_BLACKOUT_FLOOR,
+                 streak: int = TAU_BLACKOUT_STREAK):
+        self.fraction = float(fraction)
+        self.floor = float(floor)
+        self.streak_limit = int(streak)
+        self.streak = 0
+        self.peak = np.zeros(n_joints)
+        self.total = np.zeros(n_joints)
+        self.samples = 0
+
+    def reason(self, tau_cmd, tau_meas, *, live: bool = True):
+        """A trip reason, or None.  `live` is False outside torque mode.
+
+        The peak and the MEAN per motor accumulate regardless of `live`, so
+        the exit report can say what the motors actually produced across the
+        whole run -- which is the end-to-end evidence that commanded torque
+        became real current, and the only such evidence there is until the
+        torque constant is calibrated.
+        """
+        tau_cmd = np.asarray(tau_cmd, dtype=float)
+        tau_meas = np.asarray(tau_meas, dtype=float)
+        self.peak = np.maximum(self.peak, np.abs(tau_meas))
+        self.total += np.abs(tau_meas)
+        self.samples += 1
+        if not live:
+            self.streak = 0
+            return None
+
+        asked = np.abs(tau_cmd) > self.floor
+        if not asked.any():
+            self.streak = 0
+            return None
+        silent = asked & (np.abs(tau_meas)
+                          < self.fraction * np.abs(tau_cmd))
+        if silent.sum() <= asked.sum() // 2:
+            self.streak = 0
+            return None
+        self.streak += 1
+        if self.streak < self.streak_limit:
+            return None
+        index = int(np.argmax(np.where(silent, np.abs(tau_cmd), 0.0)))
+        return ("%d of %d loaded motors reported under %.0f %% of their "
+                "commanded torque for %d consecutive sweeps (worst %s: "
+                "asked %.2f, measured %.2f N*m) -- the drivers are answering "
+                "but not producing"
+                % (int(silent.sum()), int(asked.sum()), 100 * self.fraction,
+                   self.streak, JOINT_LABELS[index], tau_cmd[index],
+                   tau_meas[index]))
+
+    def report(self) -> str:
+        if self.samples == 0:
+            return "  torque readback no samples"
+        mean = self.total / self.samples
+        return ("  torque readback  peak %.2f N*m, mean %.2f N*m over %d "
+                "sweeps (worst motor %s)"
+                % (self.peak.max(), mean.max(), self.samples,
+                   JOINT_LABELS[int(np.argmax(self.peak))]))
 
 
 class CanMissMonitor:

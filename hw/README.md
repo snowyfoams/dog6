@@ -2,6 +2,7 @@
 
 ```
 python -m hw.selftest              gate the plumbing, no robot needed  (53 checks)
+python -m hw.balance.selftest      gate the balance controller         (78 checks)
 python -m hw.bringup plan          where the bring-up has got to
 python -m hw.bringup scan --fake   run the whole CAN path against software drivers
 ```
@@ -83,7 +84,9 @@ collapsed the two and the check lived in an operator's memory.
 | `motor/` | **runs** | CAN transport + LK protocol, four modules **byte-for-byte from DOG5**. Addresses raw ids |
 | `hardware_map.py` | — | the two facts. Twelve rows of `None` |
 | `calibration.py` | **half** | motor frame runs; joint coordinates raise |
-| `imu.py` | **runs** (signs unverified) | DETA10 → trunk frame |
+| `imu.py` | **runs** (signs unverified) | DETA10 → trunk frame; `orientation()` gives R and ω^b in SI |
+| `balance/` | **runs** | the stand's SRB balance controller + force allocator. [README](balance/README.md) |
+| `stand.py` | — | the six-phase sequence on the drivers. Both lift laws, `--law srb` / `--law per-leg` |
 | `safety.py` | **refuses** | ramp, cap, limit block, slew, e-stop trips |
 | `fake_bus.py` | needs explicit ids | twelve drivers in software, same protocol |
 | `bringup.py` | — | scan / spin / check / setzero / imu / plan |
