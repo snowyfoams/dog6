@@ -408,6 +408,15 @@ SWING_HEIGHT = 0.040                # m
 KP_SWING = np.array([140.0, 140.0, 180.0])
 KD_SWING = np.array([8.0, 8.0, 15.0])
 
+#: The fold's JOINT swing, (abd, pitch, knee).  N*m/rad and N*m*s/rad.
+#: [DERIVED -- NOT FLOWN; DOG5 had no joint swing to copy]
+#: From the reflected rotor alone, `params.ARMATURE` 0.0085 kg m^2, at the
+#: 250 Hz sweep: omega_n = sqrt(30 / 0.0085) = 59 rad/s, zeta = 0.79, and the
+#: explicit-PD bound Kd dt / I = 0.38 against 2.  Against the Cartesian
+#: swing's 3.8 N*m/rad about abd in the fold stance, abd is 8x stiffer.
+KP_SWING_JOINT = np.array([30.0, 30.0, 30.0])
+KD_SWING_JOINT = np.array([0.8, 0.8, 0.8])
+
 #: `safety.SafetyGate`'s slew for a trot.  The gate's default 5 N*m/s is the
 #: stand's and would take 0.35 s to follow one handover -- longer than the
 #: ramp it is following.  60 is what every DOG5 trot run used.  [DOG5 FLOWN]
@@ -477,6 +486,8 @@ def describe() -> str:
         "    swing apex %.0f mm, no placement   Kp %s N/m  Kd %s N s/m   "
         "slew %.0f N*m/s"
         % (1e3 * SWING_HEIGHT, KP_SWING, KD_SWING, TAU_SLEW_TROT_NM_S),
+        "    joint swing (fold)   Kp %s N*m/rad  Kd %s N*m*s/rad   abd held"
+        % (KP_SWING_JOINT, KD_SWING_JOINT),
     ])
 
 

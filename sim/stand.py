@@ -187,7 +187,7 @@ FOOT_XY = K.hip_to_foot_stance(Q_CROUCH)[:, :2].copy()
 #: 83.6 % of LEG_REACH -- more than Q_STAND's own 76.9 %, because of the splay
 #: above, but nowhere near the 93.9 % the previous thigh-horizontal crouch
 #: needed, which was DOG5's number and the thing DOG6 exists to get away from.
-LIFT_HEIGHT = 0.15
+LIFT_HEIGHT = 0.18
 
 #: Position-mode joint PD.  [SIM TUNING -- NOT THE DRIVER'S GAINS]
 KP_JOINT = 120.0                    # N*m/rad

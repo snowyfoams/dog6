@@ -35,12 +35,11 @@ THE EXPERIMENT, AND WHAT IT IS ACTUALLY ASKING
     agrees with the nominal one about nothing:
 
         h at the crouch     60 mm, NOT 0 -- the trunk starts in the air
-        feet, trunk x       +215 front / -143 rear, against +-237 nominal;
-                            the folded rear legs sit 94 mm forward
-        reach used          0.43 front, 0.35 rear -- the two axles are no
-                            longer doing the same job
-        support polygon     centred 36 mm AHEAD of the trunk origin, so the
-                            pinned CoM sits behind the middle of it
+        feet, trunk x       +-215, against +-237 nominal; since 2026-09-17
+                            the rear folds as the front (knee motor toward
+                            the CoM), no longer tucked forward to -143
+        reach used          0.43, all four legs
+        knees               folded over the trunk, 111 mm from its origin
 
     The law should not care about any of that, and the question is whether it
     does.  Stage 4 builds the grasp map from the MEASURED foot positions, so

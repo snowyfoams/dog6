@@ -403,6 +403,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 return "operator X"
             if pressed in ("t", "T"):
                 print("\n   " + stand.toggle_trot(now), flush=True)
+            if pressed in ("w", "W"):
+                print("\n   " + stand.toggle_step(now), flush=True)
             wants_next = pressed in ("\r", "\n")
             # --auto: `auto_s` after the phase's ramp has ARRIVED.  Asking
             # ramp_remaining about `auto_s` ago is exactly that test.  With a
@@ -411,13 +413,22 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
             auto_trot = (auto_s is not None and stand.gait is not None
                          and (stand.trotting or (stand.phase_name == "hold"
                                                  and stand.trot_runs == 0)))
-            if auto_trot:
+            # With a step: the first hold presses W, the trot runs from the
+            # stepped stance, and the final ENTER steps back before parking.
+            auto_step = (auto_s is not None and stand.step_to is not None
+                         and stand.phase_name == "hold"
+                         and stand.step_runs == 0)
+            if auto_step:
+                if now - stand.t_phase >= auto_s:
+                    print("\n   " + stand.toggle_step(now), flush=True)
+            elif auto_trot:
                 trot_s = stand.gait.cycle_start(2 * stand.gait.settle_every)
                 if (not stand.trotting and now - stand.t_phase >= auto_s) or (
                         stand.trotting and not stand.trot_exit
                         and now - stand.t_phase >= trot_s):
                     print("\n   " + stand.toggle_trot(now), flush=True)
             elif (auto_s is not None and now - stand.t_phase >= auto_s
+                    and stand.phase_name != "step"
                     and stand.ramp_remaining(now - auto_s) <= 0.0):
                 wants_next = True
             if wants_next:
@@ -536,7 +547,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                           % (stand.phase_name, now - stand.t_phase,
                              1e3 * BSTATE.origin_to_height(stand.h_cmd),
                              body.status(), tail), flush=True)
-                if stand.phase_name in ("rise", "hold", "trot"):
+                if stand.phase_name in ("rise", "hold", "trot", "step"):
                     print(_torque_lines(stand.tau, tau_meas), flush=True)
             sweep += 1
 
@@ -578,7 +589,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          tilt_stop: float = None, roll_gains: tuple = None,
          track_stop: float = None, gait=None, tau_cap: float = None,
          tau_ceiling: float = None, tau_slew: float = None,
-         overspeed_trip: bool = True) -> int:
+         overspeed_trip: bool = True, step_to=None,
+         step_period: float = None, swing: str = "cartesian") -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -587,6 +599,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     and `tau_slew` are the gate's default cap, the ceiling it will accept and
     its slew -- None keeps the stand's.  `overspeed_trip` False keeps the
     joint-speed peaks and stops nothing on them (`safety.SafetyGate`).
+    `step_to` ((4, 2) hip-frame foot xy, needs `gait`) enables W: the hold
+    steps the feet there, and steps them back before the park, on its own
+    gait clock of `step_period` seconds (None: the trot's).
+    `swing` is `law.BalanceLaw.swing`: "joint" is the fold's z-only joint PD.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -667,6 +683,29 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           "this changes no N*m the drivers get.  It is what "
                           "notices a leg that has gone wrong while the "
                           "attitude still reads fine")
+    if gait is not None:
+        trot = ap.add_argument_group(
+            "the trot", "the gait clock T starts; the entry point's defaults")
+        trot.add_argument("--period", type=float, default=gait.period,
+                          metavar="SECONDS",
+                          help="one full gait cycle.  Shorter = faster "
+                               "handovers, AND a faster swing: the knee's peak "
+                               "speed and the handover torque rate scale as "
+                               "1/period")
+        trot.add_argument("--duty", type=float, default=gait.duty,
+                          help="stance fraction, in (0.5, 1)")
+        trot.add_argument("--settle", type=float, default=gait.settle_s,
+                          metavar="SECONDS",
+                          help="the four-foot re-level; 0 turns it off")
+        trot.add_argument("--settle-every", type=int,
+                          default=gait.settle_every, metavar="CYCLES")
+        if step_to is not None:
+            trot.add_argument("--step-period", type=float,
+                              default=(gait.period if step_period is None
+                                       else step_period), metavar="SECONDS",
+                              help="the gait cycle W steps the feet on.  The "
+                                   "foot crosses the whole step in one swing, "
+                                   "so this sets the joint speeds of the step")
     law.add_argument("--gravity-legs", type=int, default=4, choices=(1, 2, 4),
                      metavar="N", help="leg-gravity terms refreshed per sweep; "
                                        "4 removes the 12 ms cross-leg skew")
@@ -694,6 +733,24 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     if args.latch is None:
         args.latch = (bool(BCFG.SETPOINT_DYNAMIC) if dynamic_setpoint is None
                       else bool(dynamic_setpoint))
+
+    if gait is not None:
+        from .balance.gait import TrotGait
+        try:
+            gait = TrotGait(period=args.period, duty=args.duty,
+                            offsets=gait.offsets, ramp=gait.ramp,
+                            settle_s=args.settle,
+                            settle_every=args.settle_every,
+                            alternate_lead=gait.alternate_lead)
+            step_gait = (None if step_to is None else TrotGait(
+                period=args.step_period, duty=args.duty, offsets=gait.offsets,
+                ramp=gait.ramp, settle_s=args.settle,
+                settle_every=args.settle_every,
+                alternate_lead=gait.alternate_lead))
+        except ValueError as refusal:
+            ap.error("the gait: %s" % refusal)
+    else:
+        step_gait = None
 
     if args.auto is not None and not args.fake:
         ap.error("--auto is only allowed with --fake: on the robot a person "
@@ -736,9 +793,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               mu=args.mu, foot_xy=crouch.foot_xy,
                               dynamic_setpoint=args.latch,
                               tilt_stop_deg=args.tilt_stop,
-                              track_stop_deg=args.track_stop, srb=crouch.srb)
+                              track_stop_deg=args.track_stop, srb=crouch.srb,
+                              swing=swing)
     stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
-                          gait=gait)
+                          gait=gait, step_to=step_to, step_gait=step_gait)
     log = StandLog() if args.log else None
     key = KeyPoller()
     if not key.ok and not args.fake:
@@ -756,9 +814,15 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
           % (args.tau_cap, slew))
     if gait is not None:
         print("  TROT on T from HOLD: %s" % gait)
-        print("       swing apex %.0f mm straight up, NO placement; Kp %s N/m "
-              "Kd %s N s/m" % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING,
-                               BCFG.KD_SWING))
+        if swing == "joint":
+            print("       swing apex %.0f mm straight up, NO placement; JOINT "
+                  "PD, abd held: Kp %s N*m/rad Kd %s N*m*s/rad"
+                  % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING_JOINT,
+                     BCFG.KD_SWING_JOINT))
+        else:
+            print("       swing apex %.0f mm straight up, NO placement; Kp %s "
+                  "N/m Kd %s N s/m" % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING,
+                                       BCFG.KD_SWING))
         print("       residual trip counts four-foot sweeps only while "
               "trotting")
     if not overspeed_trip:
@@ -812,6 +876,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
              BCFG.RESIDUAL_FORCE_N, BCFG.RESIDUAL_MOMENT_NM))
     print("  ENTER steps the phase (RISE ends on its own).  X is an E-STOP "
           "-- from rise or hold it DROPS the robot.")
+    if step_gait is not None:
+        print("  W in HOLD steps the feet to hip-frame xy %s mm (W again, or "
+              "ENTER, steps them back to the crouch's first), on %s"
+              % (np.array2string(1e3 * np.asarray(step_to)[0], precision=0),
+                 step_gait))
     if args.fake and args.law == "srb":
         print("  NOTE: hw.fake_bus has NO DYNAMICS.  The legs do not move "
               "under torque, so the")

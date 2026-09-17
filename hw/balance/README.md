@@ -1,11 +1,12 @@
 # `hw.balance` — the stand's balance controller
 
 ```
-python -m hw.balance.selftest       181 checks, no robot, no IMU, no simulator
+python -m hw.balance.selftest       188 checks, no robot, no IMU, no simulator
 python -m hw.balance.config          every number, with its provenance
 python -m hw.stand --law srb         run it
 python -m hw.stand --law per-leg     run what it replaces
 python -m hw.fold_trot               the fold stance, then T trots in place
+python -m hw.trot                    the nominal crouch, then T trots in place
 ```
 
 Implements the design note in [`doc/dog6_stand_control.tex`](../../doc): an
@@ -171,7 +172,11 @@ at `NOMINAL_POSE`, and holding a folded crouch is a different stance.
 | `c^b` | (0.0, 0.0, −14.8) mm | **(−13.8, 0.0, −27.1) mm** |
 | `I^b` diag | 0.0281 / 0.2238 / 0.2406 | 0.0346 / **0.1587** / 0.1705 |
 
-The 13.8 mm of `c^b` x is not cosmetic: every moment arm is
+(That fold column is the original, rear-tucked fold. Since 2026-09-17 the rear
+legs fold like the front ones and `FOLD` derives c^b (0.0, 0.0, −29.9) mm,
+I^b 0.0371 / 0.1399 / 0.1493 — no x offset left.)
+
+The 13.8 mm of `c^b` x was not cosmetic: every moment arm is
 `r_w = R(x_b − c^b)`, so on a 57.7 N robot it is **0.80 N·m of phantom pitch
 moment**. With no integrator the attitude loop parks against it, and the first
 fold run held **−2.1° of nose-up with a steady 0.67 N·m** of commanded pitch
@@ -269,7 +274,17 @@ fine: "a gain RISE cannot carry is not thereby a gain TROT cannot carry, and
 one shared table cannot say so." DOG6 has **one** table. Nothing here has been
 measured yet, so there is nothing to split it on.
 
-## Trot in place: `gait.py`, `swing.py`, `hw.fold_trot`
+## Trot in place: `gait.py`, `swing.py`, `hw.trot`, `hw.fold_trot`
+
+Two entry points, one trot (`hw.trot.trot_options`). `hw.trot` is `hw.stand`
+at its own defaults from the **nominal** crouch — setpoint latched, roll
+90/17 — with the tilt stop at 45°, the torque-phase tracking trip off (it
+feeds no torque), and a faster 0.8 s cycle
+(`--period`, `--duty`, `--settle`, `--settle-every` on both entry points).
+`hw.fold_trot` is `hw.fold_stand`'s, at 1.2 s. The fold
+trot tipped in roll on the robot on 2026-09-17; the nominal stance puts both
+diagonal support lines exactly through the CoM (fold: 17.2 mm behind), and
+offline its trot peaks at 1.14 N·m against the fold's 3.30.
 
 ```
 hold --T--> trot --T (latched)--> hold at the next four-foot window

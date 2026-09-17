@@ -206,8 +206,28 @@ class BalanceLaw:
     #: `config.SRB`.  It reaches BOTH the reference and the measurement from
     #: here, which is what keeps the CoM offset cancelling in the z error.
     srb: "cfg.SrbModel | None" = None
+    #: The swing leg's controller, `swing.SWING_MODES`.  "cartesian" is the
+    #: impedance the nominal and wide trots flew; "joint" is the fold's: the
+    #: same z-only arc through the IK, abd held, joint PD.  See swing.py.
+    swing: str = "cartesian"
 
     def __post_init__(self) -> None:
+        if self.swing not in SWING.SWING_MODES:
+            raise ValueError("swing %r: one of %s"
+                             % (self.swing, ", ".join(SWING.SWING_MODES)))
+        # OWN COPY: the foot step moves it leg by leg, and it usually arrives
+        # as a posture's array.
+        if self.foot_xy is not None:
+            self.foot_xy = np.array(self.foot_xy, dtype=float)
+        #: The foot step's destination, (4, 2) HIP frame, or None.  See
+        #: `begin_step`.
+        self.foot_xy_to: np.ndarray | None = None
+        self._swinging = np.zeros(C.N_LEGS, dtype=bool)
+        #: The joint swing's LIFTOFF LATCH, (4, 3) each, NaN while the leg is
+        #: down: the measured trunk-frame foot and joints on the first
+        #: swinging sweep.  See the swing block in `update`.
+        self._lift_x = np.full((C.N_LEGS, 3), np.nan)
+        self._lift_q = np.full((C.N_LEGS, 3), np.nan)
         if self.srb is None:
             self.srb = cfg.SRB
         if self.dynamic_setpoint is None:
@@ -362,6 +382,43 @@ class BalanceLaw:
             return 0.0
         return max(0.0, self.ramp.T - (float(now) - self.t0))
 
+    # -- the foot step --------------------------------------------------
+    def begin_step(self, foot_xy_to) -> None:
+        """Move the feet to `foot_xy_to` (4, 2, HIP frame) with the gait.
+
+        Drive `update` with a gait clock from here.  Every leg that swings
+        lands on its `foot_xy_to` site instead of where it left, and
+        `foot_xy` -- what the tracking reference and the next arc start from
+        -- takes the new site AT TOUCHDOWN, leg by leg.  One gait cycle moves
+        all four; `step_landed` says when.
+
+        THE SRB MODEL STAYS PINNED.  `srb` and `state.read`'s must be the
+        same object or the CoM offset stops cancelling, and the runner reads
+        the posture's.  For WIDE -> under the hips that is c^b z 7 mm off and
+        x exactly 0 either way (a symmetric stance), so no pitch moment.
+
+        REFUSED with the joint swing: that one lifts in z and nothing else.
+        """
+        if self.swing == "joint":
+            raise ValueError("the joint swing only lifts in z; a foot step "
+                             "needs swing='cartesian'")
+        if self.foot_xy is None:
+            self.foot_xy = np.array(ST.FOOT_XY, dtype=float)
+        self.foot_xy_to = np.array(foot_xy_to, dtype=float).reshape(
+            C.N_LEGS, 2)
+        self._swinging[:] = False
+
+    @property
+    def step_landed(self) -> bool:
+        """All four feet are down on the step's destination."""
+        return (self.foot_xy_to is not None and not self._swinging.any()
+                and bool(np.allclose(self.foot_xy, self.foot_xy_to,
+                                     rtol=0.0, atol=1e-12)))
+
+    def end_step(self) -> None:
+        self.foot_xy_to = None
+        self._swinging[:] = False
+
     # -- the sweep -------------------------------------------------------
     def update(self, now: float, state, clock=None, gait=None) -> LawOutput:
         """Stages 1-5 for one sweep.  `state` is a `state.BodyState`.
@@ -416,27 +473,64 @@ class BalanceLaw:
         swing_s = p_swing = None
         if clock_now is not None:
             swinging = ~clock_now.contact
+            if self.foot_xy_to is not None:
+                # TOUCHDOWN: the leg now stands on the step's destination.
+                landed = self._swinging & ~swinging
+                self.foot_xy[landed] = self.foot_xy_to[landed]
+                self._swinging = swinging.copy()
             swing_s = clock_now.swing_s
             p_swing = np.full((C.N_LEGS, 3), np.nan)
             if swinging.any():
                 rest = SWING.rest_feet_b(command.h, self.foot_xy)
+                land = (rest if self.foot_xy_to is None
+                        else SWING.rest_feet_b(command.h, self.foot_xy_to))
                 q4 = C.unflat(state.q)
                 for i in np.flatnonzero(swinging):
                     p, v = SWING.swing_reference(rest[i], float(swing_s[i]),
-                                                 gait.swing_duration)
+                                                 gait.swing_duration,
+                                                 land_b=land[i])
                     p_swing[i] = p
-                    tau[3 * i:3 * i + 3] += SWING.swing_torque(state, i, p, v)
+                    if self.swing == "joint":
+                        # z only, abd held: no step destination to go to.
+                        # THE ARC STARTS WHERE THE FOOT IS, LATCHED AT LIFTOFF
+                        # -- not at `foot_xy` and a height.  The first hardware
+                        # run, 2026-09-17, kicked hard: at 30 N*m/rad 10 mm
+                        # of foot offset is 5 N*m on the knee, and a foot that
+                        # slid, a pitched trunk (2 deg x 215 mm = 7.5 mm) or
+                        # a trunk off the command all make that offset.  In
+                        # MuJoCo with the runner's one-sweep delay and 40 Hz
+                        # velocity filter, 8 mm of z offset demanded 94 N*m;
+                        # latched, 1.0 N*m.  The foot lands where it lifted.
+                        if not np.isfinite(self._lift_x[i, 0]):
+                            self._lift_x[i] = state.x_b[i]
+                            self._lift_q[i] = q4[i]
+                        qj, qdj = SWING.joint_swing_reference(
+                            i, self._lift_x[i], float(swing_s[i]),
+                            gait.swing_duration, self._lift_q[i])
+                        p_swing[i] = SWING.swing_reference(
+                            self._lift_x[i], float(swing_s[i]),
+                            gait.swing_duration)[0]
+                        tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
+                            state, i, qj, qdj)
+                    else:
+                        tau[3 * i:3 * i + 3] += SWING.swing_torque(
+                            state, i, p, v)
                     # THE TRACKING REFERENCE FOLLOWS A SWINGING LEG, as DOG5's
                     # q_ref did: pinned at the stance IK, the trip would read
                     # a 40 mm apex as a leg gone wrong.
                     q_ref[i] = q4[i]
+            self._lift_x[~swinging] = np.nan
+            self._lift_q[~swinging] = np.nan
+        else:
+            self._lift_x[:] = np.nan
+            self._lift_q[:] = np.nan
 
         # -- the trips -----------------------------------------------------
         # THE RESIDUAL TRIP COUNTS ONLY FOUR-FOOT SWEEPS IN A TROT.  A pair of
         # diagonal feet has no moment about its own support line, so on two
         # feet a residual is geometry, not a contact about to go -- in the
-        # fold stance it is ~0.97 N*m, over the 0.94 limit, every swing.  The
-        # trip keeps its meaning where it has one.
+        # old rear-tucked fold it was ~0.97 N*m, over the 0.94 limit, every
+        # swing.  The trip keeps its meaning where it has one.
         monitor = clock_now is None or clock_now.full_support
         trip = self._trip(state, allocation, C.flat(q_ref),
                           monitor_residual=monitor)

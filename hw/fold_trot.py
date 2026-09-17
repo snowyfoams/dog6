@@ -7,23 +7,39 @@
     limp -> settle -> crouch -> rise -> hold --T--> trot --T--> hold -> park
                                                (exit at the next four-foot window)
 
-`hw.fold_stand` plus a gait.  Same crouch (`posture.FOLD`), same fixed IMU
+`hw.fold_stand` plus a gait -- `hw.trot.trot_options`, shared with the
+nominal-crouch trot `hw.trot`.  Same crouch (`posture.FOLD`), same fixed IMU
 datum, same SRB-only law, same 45 deg tilt stop, same tracking trip OFF, same
 roll gains (`fold_stand.ROLL_GAINS`, 290 / 23) -- all imported from it, none
 copied.  What is added is T, and the four things T needs:
 
-    THE GAIT       `balance.gait.TrotGait`: DOG5 trot_demo's clock -- 1.2 s
-                   period, duty 0.80, contact ramp 0.15, a 0.2 s four-foot
-                   settle every 2 cycles, alternating lead.  [DOG5 FLOWN]
+    THE GAIT       `balance.gait.TrotGait`: DOG5 trot_demo's clock -- duty
+                   0.80, contact ramp 0.15, a 0.2 s four-foot settle every 2
+                   cycles, alternating lead [DOG5 FLOWN] -- on the fold's OWN
+                   period, 2.0 s (`PERIOD_S`), not `hw.trot`'s 0.8: a 400 ms
+                   swing.  The joint swing below cannot follow a shorter one
+                   through the 60 N*m/s slew.  `--period` overrides.
     THE SWING      `balance.swing`: cMPC's quintic arc, 40 mm straight up in
                    the trunk frame and back down on the same spot.  NO FOOT
-                   PLACEMENT -- the operator's decision, 2026-09-16.  Cartesian
-                   PD at DOG5's gains, no Lambda feedforward (2.3 ms a leg on
-                   this Pi).
+                   PLACEMENT -- the operator's decision, 2026-09-16.  THE
+                   FOLD'S OWN SWING, NOT `hw.trot`'s (2026-09-17): the arc
+                   through the IK, ABD HELD, joint PD at
+                   `config.KP_SWING_JOINT` 30 / `KD_SWING_JOINT` 0.8.  The
+                   shared Cartesian PD was ~4 N*m/rad about abd in this
+                   stance, and the leg swung round it.
+                   MUJOCO, 2026-09-17 (one leg, trunk pinned in the air, the
+                   4 ms sweep, the 60 N*m/s slew and the 9 N*m cap): the
+                   swing's torque demand outruns the slew below ~0.30 s of
+                   swing, and the PD then winds up -- 160, 240 and 260 ms all
+                   diverge, the knee overshooting by ~90 deg.  At 300 ms the
+                   worst z error is 2.9 mm; at 400 ms 1.9 mm, apex 40.6, abd
+                   0.1 deg (0.5 deg under a 0.5 N*m, 20 ms abd push), peak
+                   1.1 N*m and 5.5 rad/s.  2.0 s keeps the swing 1/3 clear.
     THE CAP        `--tau-cap` defaults to 9.0 N*m, `safety.TAU_HARD_NM`, and
                    the gate's ceiling is raised to match.  The operator's
-                   decision, 2026-09-16.  Offline, a diagonal pair in the fold
-                   stance needs 3.3 N*m on the rear knee against 3.0 staged.
+                   decision, 2026-09-16.  Offline, a diagonal pair in the old
+                   rear-tucked fold needed 3.3 N*m on the rear knee against
+                   3.0 staged.
     THE SLEW       60 N*m/s, `config.TAU_SLEW_TROT_NM_S`, what DOG5 trotted
                    on.  The stand's 5 would take 0.35 s to follow one handover.
     NO OVERSPEED   `safety.SafetyGate(overspeed_trip=False)`, DOG5's trot
@@ -39,22 +55,17 @@ copied.  What is added is T, and the four things T needs:
                    60 N*m/s slew, the cap, and the tilt stop.
 
 
-WHAT THE FOLD STANCE DOES TO A DIAGONAL PAIR -- READ BEFORE THE FIRST RUN
-    The CoM (c^b x = -13.8 mm) sits 17.2 mm BEHIND both diagonal support
-    lines: they cross the midline 33 mm ahead of the trunk origin.  Two feet
-    on a line make no moment about that line, so for every 240 ms swing the
-    allocator is ~0.97 N*m short, and the robot falls backward about the
-    support diagonal -- the same direction for BOTH diagonals, so it does not
-    cancel out.  Nothing in this entry point moves the feet or the trunk to
-    fix it.  What holds it is the DOG5 demo's answer: the four-foot windows
-    and the periodic settle re-level the trunk before the next swing.
+THE FOLD STANCE AND A DIAGONAL PAIR
+    Since 2026-09-17 the rear legs fold like the front ones (`posture.FOLD`):
+    knee motor toward the CoM, feet at +-215 mm x, +-71 mm y.  The stance is
+    symmetric front to back, c^b x = 0.0, and both diagonal support lines
+    pass through the CoM -- the old rear-tucked fold put it 17.2 mm behind
+    them, ~0.97 N*m no diagonal pair could make, and the robot fell backward
+    every swing.
 
-    Watch pitch on the trot line.  A nose-up that grows cycle by cycle is
-    this, not a gain.
-
-    BECAUSE OF THAT, THE RESIDUAL TRIP only counts four-foot sweeps while
-    trotting (see `law.BalanceLaw.update`).  On two feet the residual is the
-    geometry above, and it would trip every swing.
+    THE RESIDUAL TRIP still only counts four-foot sweeps while trotting (see
+    `law.BalanceLaw.update`): on two feet a residual is geometry, not a
+    contact about to go.
 
 
 KEYS
@@ -72,16 +83,15 @@ if __package__ in (None, ""):        # allow `python hw/fold_trot.py` too
     __package__ = "hw"
 
 from . import fold_stand as FS       # noqa: E402
-from . import safety as SAFE         # noqa: E402
 from . import stand as STAND         # noqa: E402
-from .balance import config as BCFG  # noqa: E402
-from .balance import gait as GAIT    # noqa: E402
 from .balance import posture as POSE  # noqa: E402
+from .trot import TAU_CAP, trot_options   # noqa: E402
 
-__all__ = ["main", "TAU_CAP"]
+__all__ = ["main", "TAU_CAP", "PERIOD_S"]
 
-#: The operator's cap for the trot, 2026-09-16: the motors' own limit.
-TAU_CAP = SAFE.TAU_HARD_NM
+#: The fold trot's gait period.  400 ms of swing at duty 0.80; the joint
+#: swing diverges under ~300 (see THE GAIT / THE SWING above).
+PERIOD_S = 2.0
 
 
 def main(argv=None) -> int:
@@ -89,10 +99,7 @@ def main(argv=None) -> int:
     return STAND.main(argv, crouch=POSE.FOLD, dynamic_setpoint=False,
                       only_law="srb", tilt_stop=FS.TILT_STOP_DEG,
                       roll_gains=FS.ROLL_GAINS, track_stop=FS.TRACK_STOP_DEG,
-                      gait=GAIT.TrotGait(), tau_cap=TAU_CAP,
-                      tau_ceiling=TAU_CAP,
-                      tau_slew=BCFG.TAU_SLEW_TROT_NM_S,
-                      overspeed_trip=False)
+                      swing="joint", **trot_options(PERIOD_S))
 
 
 if __name__ == "__main__":

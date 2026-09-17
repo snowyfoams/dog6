@@ -5,6 +5,7 @@
 
     StandSequence.advance(now, q)     step to the next phase (`hw.stand`'s ENTER)
     StandSequence.toggle_trot(now)    enter / leave the trot (`hw.stand`'s T)
+    StandSequence.toggle_step(now)    step the feet to `step_to` or back (W)
     StandSequence.update(now, body)   -> (mode, values, trip), once per sweep
 
 THE TROT IS A SUB-STATE OF HOLD, NOT AN EIGHTH PHASE
@@ -14,6 +15,13 @@ THE TROT IS A SUB-STATE OF HOLD, NOT AN EIGHTH PHASE
     mid-swing.  `phase_name` reads "trot" throughout, so the log slices it and
     the banner names it, while `PHASES` and every stand path stay exactly as
     they were.  Only a sequence built with a `gait` can trot at all.
+
+    THE FOOT STEP IS THE SAME KIND OF SUB-STATE.  W from HOLD runs ONE cycle of
+    `step_gait` with `law.BalanceLaw.begin_step`, every swing landing on the
+    `step_to` site; `phase_name` reads "step" and HOLD comes back at the first
+    four-foot window after the last touchdown.  ENTER in HOLD with the feet
+    away from the crouch's sites steps them home FIRST and parks after --
+    the park is a joint ramp to the crouch and would drag them.
 
 `mode` is the whole interface to the bus: "keepalive" (values None), "position"
 (values: (12,) joint rad, capped by `max_dps`) or "torque" (values: (12,) N*m,
@@ -151,6 +159,8 @@ BLURB = {
     "hold":   "AT HEIGHT -- push the trunk and watch it come back",
     "trot":   "TROTTING IN PLACE -- T latches the exit at the next four-foot "
               "window; ENTER is refused until then",
+    "step":   "STEPPING THE FEET -- one gait cycle, each diagonal lands on the "
+              "new site; HOLD (or PARK) follows at four feet down",
     "park":   "driver position mode -> crouch",
     "done":   "driver position mode, holding crouch.  ENTER exits",
 }
@@ -171,7 +181,7 @@ def phase_blurb(sequence: "StandSequence") -> str:
     The lift's blurb depends on `--law`, and the phase banner is the only
     place that difference is ever stated, so it is stated there.
     """
-    if sequence.phase_name in ("rise", "hold", "trot"):
+    if sequence.phase_name in ("rise", "hold", "trot", "step"):
         return "%s -- %s" % (BLURB[sequence.phase_name],
                              LIFT_BLURB[sequence.law])
     return BLURB[sequence.phase_name]
@@ -334,7 +344,8 @@ class StandSequence:
 
     def __init__(self, gate: SAFE.SafetyGate, *, law: str = "srb",
                  balance: BLAW.BalanceLaw | None = None,
-                 crouch: POSE.CrouchPose = POSE.NOMINAL, gait=None):
+                 crouch: POSE.CrouchPose = POSE.NOMINAL, gait=None,
+                 step_to=None, step_gait=None):
         if law not in LAWS:
             raise ValueError("law must be one of %s, got %r" % (LAWS, law))
         # THE PER-LEG BASELINE IS ONLY A BASELINE AT THE NOMINAL CROUCH.
@@ -396,11 +407,60 @@ class StandSequence:
         self.trot_runs = 0
         #: The same instrument as the hold's, read against the trot.
         self.trot = HoldWatch()
+        #: W: where the hold steps the feet to, (4, 2) HIP frame, or None for
+        #: an entry point that does not step.  W again, or ENTER to park,
+        #: steps them back to the crouch's `foot_xy` first -- the park is a
+        #: joint-space ramp to the crouch and would DRAG feet that are
+        #: anywhere else.
+        self.step_to = (None if step_to is None
+                        else np.array(step_to, dtype=float).reshape(C.N_LEGS, 2))
+        #: The step's own clock -- slower than a fast trot's, because the
+        #: foot also crosses the step distance in one swing.  None: `gait`.
+        self.step_gait = step_gait if step_gait is not None else gait
+        self.stepping = False
+        self.park_after_step = False
+        self.step_runs = 0
         self._sweep = 0
 
     @property
     def phase_name(self) -> str:
+        if self.stepping:
+            return "step"
         return "trot" if self.trotting else PHASES[self.phase]
+
+    @property
+    def feet_home(self) -> bool:
+        """The feet are on the crouch's own sites -- PARK may run."""
+        xy = self.balance.foot_xy
+        return xy is None or bool(np.allclose(xy, self.crouch.foot_xy,
+                                              rtol=0.0, atol=1e-9))
+
+    def toggle_step(self, now: float) -> str:
+        """W.  From HOLD, step the feet to `step_to`, or back home."""
+        if self.step_to is None or self.step_gait is None:
+            return "W ignored: this entry point does not step the feet"
+        if self.phase_name != "hold":
+            return "W ignored: the feet step from HOLD, not %s" % self.phase_name
+        if self.law != "srb":
+            return "W ignored: only the SRB law can step"
+        target = self.crouch.foot_xy if not self.feet_home else self.step_to
+        return self._start_step(now, target, park_after=False)
+
+    def _start_step(self, now: float, target, park_after: bool) -> str:
+        self.balance.begin_step(target)
+        self.step_gait.reset(now)
+        self.stepping = True
+        self.park_after_step = park_after
+        self.t_phase = float(now)
+        self.step_runs += 1
+        home = np.allclose(target, self.crouch.foot_xy, rtol=0.0, atol=1e-9)
+        return ("STEP: feet %s, one %.2f s gait cycle.  The first foot lifts "
+                "in %.2f s.  %sX is an E-STOP."
+                % ("back to the %s crouch's sites" % self.crouch.name if home
+                   else "to the step sites (hip frame %s mm)"
+                   % np.array2string(1e3 * np.asarray(target)[0], precision=0),
+                   self.step_gait.period, self.step_gait.entry_s,
+                   "PARK follows.  " if park_after else ""))
 
     def toggle_trot(self, now: float) -> str:
         """T.  Start the trot from HOLD, or latch its exit.  Returns what to
@@ -452,6 +512,16 @@ class StandSequence:
         if self.trotting:
             return ("trotting -- press T to latch the exit, then ENTER parks "
                     "from HOLD")
+        if self.stepping:
+            return "stepping the feet -- HOLD%s follows at four feet down" % (
+                " then PARK" if self.park_after_step else "")
+        # THE FEET GO HOME BEFORE THE PARK.  The park ramps the joints to the
+        # crouch; from any other stance that slides the feet on the floor.
+        if (self.phase_name == "hold" and self.law == "srb"
+                and self.step_gait is not None and not self.feet_home):
+            self.notice = self._start_step(now, self.crouch.foot_xy,
+                                           park_after=True)
+            return None
         if self.phase_name in ("crouch", "park") and self.ramp_remaining(now) > 0:
             return ("%s ramp still running, %.1f s left"
                     % (self.phase_name, self.ramp_remaining(now)))
@@ -563,13 +633,35 @@ class StandSequence:
             self.hold.start(now)
             name = self.phase_name
             self.notice = ("back in HOLD after %d gait cycles -- all four feet "
-                           "down.  ENTER parks, T trots again."
-                           % self.gait.cycles(now))
+                           "down.  ENTER %s, T trots again."
+                           % (self.gait.cycles(now),
+                              "parks" if self.feet_home
+                              else "steps the feet back and parks"))
 
-        if name in ("rise", "hold", "trot"):
+        if (name == "step" and self.balance.step_landed
+                and self.step_gait.full_support(now)):
+            self.stepping = False
+            self.balance.end_step()
+            self.t_phase = now
+            self.hold.start(now)
+            name = self.phase_name
+            if self.park_after_step:
+                self.park_after_step = False
+                self.notice = "feet home -- parking."
+                self.advance(now, q)
+                name = self.phase_name
+                elapsed = 0.0
+            else:
+                self.notice = ("feet stepped, all four down -- HOLD.  %s"
+                               % ("W steps them back; T trots here; ENTER "
+                                  "steps back and parks." if not self.feet_home
+                                  else "ENTER parks."))
+
+        if name in ("rise", "hold", "trot", "step"):
             if self.law == "srb":
                 result = self._lift_srb(
-                    now, body, self.gait if name == "trot" else None)
+                    now, body,
+                    {"trot": self.gait, "step": self.step_gait}.get(name))
             else:
                 # SINCE THE RISE, not since the phase -- see `t_lift`.
                 result = self._lift_per_leg(now, now - self.t_lift, q, q4, qd)
