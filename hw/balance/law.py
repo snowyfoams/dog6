@@ -210,6 +210,11 @@ class BalanceLaw:
     #: impedance the nominal and wide trots flew; "joint" is the fold's: the
     #: same z-only arc through the IK, abd held, joint PD.  See swing.py.
     swing: str = "cartesian"
+    #: The joint-space layer, `config.KP_JOINT_HOLD`: live only while
+    #: `hold_joints` has latched a pose.  OFF (0 / 0) unless the entry point
+    #: passes gains -- the trot entry points do, the plain stand does not.
+    kp_joint: float = 0.0
+    kd_joint: float = 0.0
 
     def __post_init__(self) -> None:
         if self.swing not in SWING.SWING_MODES:
@@ -228,6 +233,8 @@ class BalanceLaw:
         #: swinging sweep.  See the swing block in `update`.
         self._lift_x = np.full((C.N_LEGS, 3), np.nan)
         self._lift_q = np.full((C.N_LEGS, 3), np.nan)
+        #: (12,) the joint layer's stance target, or None while it is off.
+        self.q_hold: np.ndarray | None = None
         if self.srb is None:
             self.srb = cfg.SRB
         if self.dynamic_setpoint is None:
@@ -249,6 +256,9 @@ class BalanceLaw:
         #: yaw reference before torque is live and saying so beats reporting
         #: an error against zero.
         self.sp_yaw = float("nan")
+        #: (3,) rad, roll/pitch/yaw ADDED to the setpoint -- `offset_attitude`.
+        #: Zero except while `hw.sway` nods or shakes the trunk.
+        self.att_offset = np.zeros(3)
         self.setpoint_latched = False
         self.h0 = float("nan")
         self.residual = ALLOC.ResidualMonitor()
@@ -303,10 +313,11 @@ class BalanceLaw:
         Yaw is against the heading latched at `arm`; before that it is NaN,
         because there is no reference to be wrong about yet.
         """
+        dr, dp, dy = self.att_offset
         yaw_err = (float("nan") if not np.isfinite(self.sp_yaw)
-                   else np.degrees(_wrap_pi(state.yaw - self.sp_yaw)))
-        return np.array([np.degrees(state.roll - self.sp_roll),
-                         np.degrees(state.pitch - self.sp_pitch),
+                   else np.degrees(_wrap_pi(state.yaw - self.sp_yaw - dy)))
+        return np.array([np.degrees(state.roll - self.sp_roll - dr),
+                         np.degrees(state.pitch - self.sp_pitch - dp),
                          yaw_err])
 
     def setpoint_drift_deg(self) -> float:
@@ -329,8 +340,9 @@ class BalanceLaw:
         floor with any slope in it those two differ by the slope, and DOG5
         made the same choice for the same reason.
         """
-        return float(np.degrees(max(abs(state.roll - self.sp_roll),
-                                    abs(state.pitch - self.sp_pitch))))
+        dr, dp, _ = self.att_offset
+        return float(np.degrees(max(abs(state.roll - self.sp_roll - dr),
+                                    abs(state.pitch - self.sp_pitch - dp))))
 
     # -- arming ----------------------------------------------------------
     def arm(self, now: float, state) -> None:
@@ -418,6 +430,32 @@ class BalanceLaw:
     def end_step(self) -> None:
         self.foot_xy_to = None
         self._swinging[:] = False
+
+    # -- a moving attitude target (hw.sway) --------------------------------
+    def offset_attitude(self, droll: float, dpitch: float,
+                        dyaw: float) -> None:
+        """R_des := the latched setpoint PLUS (droll, dpitch, dyaw), rad.
+
+        The tilt stop and the attitude error read the offset too: the trip
+        means "left the attitude the law is holding it at", and while the
+        target moves that is the moved one.  (0, 0, 0) is the latched hold.
+        """
+        if self.ramp is None:
+            raise RuntimeError("BalanceLaw.arm() has not been called")
+        self.att_offset = np.array([droll, dpitch, dyaw], dtype=float)
+        self.R_des = CTRL.latched_attitude(self.sp_roll + droll,
+                                           self.sp_pitch + dpitch,
+                                           self.sp_yaw + dyaw)
+
+    # -- the trot's joint-space layer ------------------------------------
+    def hold_joints(self, q) -> None:
+        """Latch `q` (12,) as the posture the joint layer holds.  `sequence`
+        calls it with the measured angles on the sweep the robot REACHES
+        HOLD, and keeps it through the hold and the trot."""
+        self.q_hold = np.array(q, dtype=float).reshape(C.N_JOINTS)
+
+    def release_joints(self) -> None:
+        self.q_hold = None
 
     # -- the sweep -------------------------------------------------------
     def update(self, now: float, state, clock=None, gait=None) -> LawOutput:
@@ -525,6 +563,19 @@ class BalanceLaw:
             self._lift_x[:] = np.nan
             self._lift_q[:] = np.nan
 
+        # -- the joint-space layer (DOG5's JointImpedance) ------------------
+        # The joint angles latched on reaching HOLD are the target for every
+        # leg, standing or trotting: with the feet planted, fixed joints are
+        # a fixed trunk pose -- position AND rpy.  A swinging leg's target is
+        # where it IS, so it gets the damper and no spring pulling it down.
+        if self.q_hold is not None:
+            target = C.unflat(self.q_hold).copy()
+            if clock_now is not None:
+                off = ~clock_now.contact
+                target[off] = C.unflat(state.q)[off]
+            tau += (self.kp_joint * (C.flat(target) - state.q)
+                    - self.kd_joint * np.asarray(state.qd))
+
         # -- the trips -----------------------------------------------------
         # THE RESIDUAL TRIP COUNTS ONLY FOUR-FOOT SWEEPS IN A TROT.  A pair of
         # diagonal feet has no moment about its own support line, so on two
@@ -556,7 +607,8 @@ class BalanceLaw:
                     "(roll %+.1f, pitch %+.1f; setpoint %+.1f / %+.1f)"
                     % (tilt, self.tilt_stop_deg,
                        np.degrees(state.roll), np.degrees(state.pitch),
-                       np.degrees(self.sp_roll), np.degrees(self.sp_pitch)))
+                       np.degrees(self.sp_roll + self.att_offset[0]),
+                       np.degrees(self.sp_pitch + self.att_offset[1])))
         error = np.abs(state.q - q_ref)
         if (self.track_stop_deg > 0.0
                 and np.any(error > np.deg2rad(self.track_stop_deg))):

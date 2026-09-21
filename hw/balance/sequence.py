@@ -345,7 +345,7 @@ class StandSequence:
     def __init__(self, gate: SAFE.SafetyGate, *, law: str = "srb",
                  balance: BLAW.BalanceLaw | None = None,
                  crouch: POSE.CrouchPose = POSE.NOMINAL, gait=None,
-                 step_to=None, step_gait=None):
+                 step_to=None, step_gait=None, trot_swings: int = 0):
         if law not in LAWS:
             raise ValueError("law must be one of %s, got %r" % (LAWS, law))
         # THE PER-LEG BASELINE IS ONLY A BASELINE AT THE NOMINAL CROUCH.
@@ -407,6 +407,14 @@ class StandSequence:
         self.trot_runs = 0
         #: The same instrument as the hold's, read against the trot.
         self.trot = HoldWatch()
+        #: Swings a T run takes before it latches its own exit; 0 trots until
+        #: T again.  1 is `--half-gait`: one diagonal lifts and lands, HOLD.
+        self.trot_swings = int(trot_swings)
+        self._swings_done = 0
+        self._swinging = np.zeros(C.N_LEGS, dtype=bool)
+        #: `--half-gait`: each T is the NEXT half cycle, so the diagonal
+        #: alternates press by press -- the operator is the clock.
+        self._half_next = False
         #: W: where the hold steps the feet to, (4, 2) HIP frame, or None for
         #: an entry point that does not step.  W again, or ENTER to park,
         #: steps them back to the crouch's `foot_xy` first -- the park is a
@@ -447,6 +455,9 @@ class StandSequence:
         return self._start_step(now, target, park_after=False)
 
     def _start_step(self, now: float, target, park_after: bool) -> str:
+        # The feet are moving: the old joint target is a stance they are
+        # leaving.  Re-latched when the step lands, at the new one.
+        self.balance.release_joints()
         self.balance.begin_step(target)
         self.step_gait.reset(now)
         self.stepping = True
@@ -479,16 +490,40 @@ class StandSequence:
             return "T ignored: the trot starts from HOLD, not %s" % self.phase_name
         if self.law != "srb":
             return "T ignored: only the SRB law can trot"
-        self.gait.reset(now)
+        self.gait.reset(now, half=bool(self.trot_swings) and self._half_next)
+        if self.trot_swings:
+            self._half_next = not self._half_next
         self.trotting = True
         self.trot_exit = False
         self.t_trot = float(now)
         self.t_phase = float(now)
         self.trot_runs += 1
         self.trot.start(now)
+        self._swings_done = 0
+        self._swinging[:] = False
+        if self.trot_swings:
+            lead = "FL/RR" if not self._half_next else "FR/RL"
+            return ("HALF GAIT: %s swings, then HOLD by itself; T again swings "
+                    "the other diagonal.  The feet lift in %.2f s.  X is an "
+                    "E-STOP." % (lead, self.gait.entry_s))
         return ("TROT: %s.  The first foot lifts in %.2f s.  T again returns "
                 "to HOLD at a four-foot window; X is an E-STOP."
                 % (self.gait, self.gait.entry_s))
+
+    def _count_swings(self) -> None:
+        """Count diagonal touchdowns; latch the exit after `trot_swings`."""
+        if not self.trot_swings or self.out is None or self.out.swing_s is None:
+            return
+        swinging = np.asarray(self.out.swing_s) > 0.0
+        landed = self._swinging & ~swinging
+        if landed.any():
+            self._swings_done += 1       # a diagonal's two feet land together
+        self._swinging = swinging
+        if self._swings_done >= self.trot_swings and not self.trot_exit:
+            self.trot_exit = True
+            self.notice = ("%d swing%s landed -- HOLD at the next four-foot "
+                           "window" % (self._swings_done,
+                                       "" if self._swings_done == 1 else "s"))
 
     def take_notice(self) -> str | None:
         """Hand the runner anything waiting to be said, once."""
@@ -539,6 +574,8 @@ class StandSequence:
         # wherever the compliance law settled, not Q_CROUCH.
         self.q_ref0 = C.unflat(q).copy()
         name = self.phase_name
+        if name == "park":
+            self.balance.release_joints()
         if name == "settle":
             self.max_dps = np.full(C.N_JOINTS, SETTLE_MOTOR_DPS)
         elif name in ("crouch", "park"):
@@ -619,6 +656,10 @@ class StandSequence:
             self.t_phase = now
             self.q_ref0 = C.unflat(q).copy()
             self.hold.start(now)
+            # THE JOINT TARGET IS FIXED HERE, ONCE: the angles on the sweep
+            # the robot reaches HOLD.  Kept through the hold and every trot
+            # -- not re-taken at T, which would carry any drift forward.
+            self.balance.hold_joints(q)
             name = self.phase_name
             elapsed = 0.0
             self.notice = (
@@ -632,16 +673,24 @@ class StandSequence:
             self.t_phase = now
             self.hold.start(now)
             name = self.phase_name
-            self.notice = ("back in HOLD after %d gait cycles -- all four feet "
-                           "down.  ENTER %s, T trots again."
-                           % (self.gait.cycles(now),
-                              "parks" if self.feet_home
-                              else "steps the feet back and parks"))
+            if self.trot_swings:
+                self.notice = ("back in HOLD -- all four feet down.  T swings "
+                               "the %s diagonal, ENTER %s."
+                               % ("FL/RR" if self._half_next else "FR/RL",
+                                  "parks" if self.feet_home
+                                  else "steps the feet back and parks"))
+            else:
+                self.notice = ("back in HOLD after %d gait cycles -- all four "
+                               "feet down.  ENTER %s, T trots again."
+                               % (self.gait.cycles(now),
+                                  "parks" if self.feet_home
+                                  else "steps the feet back and parks"))
 
         if (name == "step" and self.balance.step_landed
                 and self.step_gait.full_support(now)):
             self.stepping = False
             self.balance.end_step()
+            self.balance.hold_joints(q)
             self.t_phase = now
             self.hold.start(now)
             name = self.phase_name
@@ -669,6 +718,7 @@ class StandSequence:
                 self.hold.add(now, body, self.balance, self.out)
             elif name == "trot":
                 self.trot.add(now, self.out.state, self.balance, self.out)
+                self._count_swings()
             return result
 
         self.tau = np.zeros(C.N_JOINTS)

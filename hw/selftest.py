@@ -42,6 +42,7 @@ THE DIRECTION ROUND-TRIP IS THE CHECK WORTH HAVING
 from __future__ import annotations
 
 import contextlib
+import math
 import sys
 import time
 
@@ -61,6 +62,7 @@ from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
 from . import kinematics as K        # noqa: E402
 from . import safety as SAFE         # noqa: E402
+from . import velocity_estimator as VE   # noqa: E402
 from .hardware_map import MapIncomplete   # noqa: E402
 
 _FAILURES: list[str] = []
@@ -440,6 +442,71 @@ def main() -> int:
     check("wrap_deg lands on (-180, 180]",
           IMU.wrap_deg(180.0) == 180.0 and IMU.wrap_deg(-180.0) == 180.0
           and IMU.wrap_deg(190.0) == -170.0)
+
+    # -- 5b. the accelerometer velocity integrator ---------------------------
+    print("\nhw.velocity_estimator (no device)")
+    close("gravity_in_trunk at level is (0, 0, -g)",
+          VE.gravity_in_trunk(0.0, 0.0), (0.0, 0.0, -VE.G), 1e-12, " m/s^2")
+    close("...and nose-down pitch puts gravity forward in the trunk",
+          np.sign(VE.gravity_in_trunk(0.0, 0.2)[0]), 1.0, 0.0)
+    roll0, pitch0 = math.radians(5.0), math.radians(-3.0)
+    b_f, b_w = np.array([0.02, -0.03, 0.05]), np.array([0.001, -0.002, 0.0015])
+
+    def _still(n, t0=0.0, roll=roll0, pitch=pitch0):
+        return [VE.ImuSample(-VE.gravity_in_trunk(roll, pitch) + b_f, b_w,
+                             roll, pitch, t0 + k * 0.005) for k in range(n)]
+
+    est = VE.AccelVelocityEstimator()
+    est.collect(_still(VE.N_INIT_SAMPLES))
+    close("static init recovers the accelerometer bias at a tilt",
+          est.b_f, b_f, 1e-12, " m/s^2")
+    est.update(_still(2000, t0=1.0))
+    close("...and ten still seconds integrate to zero velocity",
+          est.v_w, np.zeros(3), 1e-9, " m/s")
+    close("...and to zero position and zero gyro heading",
+          np.r_[est.r_o, est.yaw], np.zeros(4), 1e-9, " m / rad")
+    est.zero()
+    g_b = VE.gravity_in_trunk(roll0, pitch0)
+    a_w = np.array([0.5, 0.0, 0.0])
+    R = VE.IMU.trunk_rotation(roll0, pitch0, 0.0)
+    est.update([VE.ImuSample(R.T @ a_w - g_b + b_f, b_w, roll0, pitch0,
+                             est.t_last + k * 0.005) for k in range(1, 201)])
+    close("0.5 m/s^2 forward for 1 s reads 0.5 m/s forward, tilt removed",
+          est.v_w, (0.5, 0.0, 0.0), 1e-9, " m/s")
+    close("...and has moved at^2/2 = 0.25 m forward (DOG5 eq. 30)",
+          est.r_o, (0.25, 0.0, 0.0), 1e-9, " m")
+    est.update(_still(1, est.t_last + 0.005, 0.0, 0.0))    # level first
+    est.set_velocity((0.3, 0.0, 0.0))
+    est.set_position()
+    yaw_rate = np.array([0.0, 0.0, 1.0]) + b_w
+    n = int(round((math.pi / 2) / 0.005))
+    est.update([VE.ImuSample(-VE.gravity_in_trunk(0.0, 0.0) + b_f, yaw_rate,
+                             0.0, 0.0, est.t_last + k * 0.005) for k in range(1, n + 1)])
+    close("a 90 deg left turn at constant world velocity: forward becomes right",
+          est.v_w, (0.0, -0.3, 0.0), 1e-3, " m/s")
+    close("...the gyro heading reads +90 deg and the path stayed straight",
+          np.r_[est.r_o, est.yaw], (0.3 * n * 0.005, 0.0, 0.0, n * 0.005),
+          1e-9, " m / rad")
+    # A circle: constant body velocity 0.3 m/s forward, yaw rate 1 rad/s, so
+    # the accelerometer feels the centripetal 0.3 m/s^2 to the left.
+    circ = VE.AccelVelocityEstimator()
+    circ.collect(_still(VE.N_INIT_SAMPLES, 0.0, 0.0, 0.0))
+    circ.set_velocity((0.3, 0.0, 0.0))
+    m, dt_c = 1200, 2.0 * math.pi / 1200
+    circ.update([VE.ImuSample(np.array([0.0, 0.3, VE.G]) + b_f,
+                              np.array([0.0, 0.0, 1.0]) + b_w, 0.0, 0.0,
+                              circ.t_last + k * dt_c) for k in range(1, m + 1)])
+    close("a full 0.3 m circle closes: back at the origin, heading 0",
+          np.r_[circ.r_o, math.sin(circ.yaw)], np.zeros(4), 1e-3, " m / -")
+    v_before = est.v_b.copy()
+    est.update([VE.ImuSample(np.array([1.0, 0.0, VE.G]) + b_f,
+                             b_w, 0.0, 0.0, est.t_last + 1.0)])
+    close("a 1 s packet gap integrates as DT_CLAMP's upper bound, not as 1 s",
+          est.v_b - v_before, (VE.DT_CLAMP[1], 0.0, 0.0), 1e-9, " m/s")
+    flipped = [VE.ImuSample(VE.gravity_in_trunk(roll0, pitch0), b_w,
+                            roll0, pitch0, k * 0.005) for k in range(30)]
+    raises("initialise refuses a flipped z instead of calling 2g a bias",
+           lambda: VE.AccelVelocityEstimator().initialise(flipped), ValueError)
 
     # -- 6. the yardstick the bring-up read directions against -------------
     print("\nhw.kinematics, which is what makes a measured direction readable")

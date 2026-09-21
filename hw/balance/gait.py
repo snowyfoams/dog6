@@ -9,9 +9,11 @@ DOG5's trot_demo clock, in cMPC's arithmetic.  Nothing in here was designed
 for DOG6:
 
     from DOG5 (flown)   the contact-weight ramp inside stance, the four-foot
-                        SETTLE every few cycles, and the alternating lead --
-                        `trot_demo.SettleTrotGait` and `gait.TrotGait`, ported
-                        whole, numbers in `config` tagged [DOG5 FLOWN]
+                        SETTLE every few cycles -- `trot_demo.SettleTrotGait`
+                        and `gait.TrotGait`, numbers in `config` tagged
+                        [DOG5 FLOWN].  NOT its alternating lead: removed on
+                        request 2026-09-21, one fixed trot, the diagonals
+                        strictly taking turns
     from sim.cmpc       the phase itself: the offset is added IN SECONDS,
                         before the modulo.  `sim.cmpc.gait.phase` says why --
                         `mod(t/T + 0.5, 1)` rounds 0.49999999999999994 + 0.5
@@ -80,8 +82,7 @@ class TrotGait:
     def __init__(self, period: float = cfg.GAIT_PERIOD, duty: float = cfg.DUTY,
                  offsets=cfg.PHASE_OFFSET, ramp: float = cfg.CONTACT_RAMP,
                  settle_s: float = cfg.SETTLE_S,
-                 settle_every: int = cfg.SETTLE_EVERY,
-                 alternate_lead: bool = cfg.ALTERNATE_LEAD):
+                 settle_every: int = cfg.SETTLE_EVERY):
         if not period > 0.0:
             raise ValueError("period must be positive, got %r" % period)
         if not 0.5 < duty < 1.0:
@@ -101,7 +102,6 @@ class TrotGait:
         self.ramp = float(ramp)
         self.settle_s = float(settle_s)
         self.settle_every = int(settle_every)
-        self.alternate_lead = bool(alternate_lead)
         #: The freeze point, gait seconds after a cycle starts: the MIDDLE of
         #: the all-four window that follows the cycle's second touchdown.
         self.freeze_s = (self.duty - 0.5) / 2.0 * self.period
@@ -109,7 +109,7 @@ class TrotGait:
         # MEASURED, not assumed (trot_demo's guard): at the freeze point every
         # leg must be planted at FULL weight, or the settle is a lean and the
         # clock's start is a step.
-        w = self._weight_from_phase(self._raw_phase(self.freeze_s, 0.0))
+        w = self._weight_from_phase(self._raw_phase(self.freeze_s))
         if not bool(np.all(w >= 1.0 - 1e-9)):
             raise ValueError(
                 "freeze point %.3f s is not full four-foot support (duty %.2f, "
@@ -117,13 +117,17 @@ class TrotGait:
                 % (self.freeze_s, self.duty, self.ramp, np.round(w, 3)))
 
     # -- the clock ---------------------------------------------------------
-    def reset(self, now: float) -> None:
+    def reset(self, now: float, half: bool = False) -> None:
         """Start the clock so that `now` is the freeze point of cycle 0.
 
         All four feet are at full weight at that instant -- see the module
-        docstring for why this and not DOG5's phase-0 start.
+        docstring for why this and not DOG5's phase-0 start.  The FR/RL
+        diagonal lifts first.  `half` starts half a cycle later instead --
+        the same four-foot instant, but FL/RR lifts first -- which is how
+        `--half-gait` hands the next swing to the other diagonal.
         """
-        self._t0 = float(now) - self.freeze_s
+        self._t0 = (float(now) - self.freeze_s
+                    - (0.5 * self.period if half else 0.0))
 
     @property
     def entry_s(self) -> float:
@@ -134,10 +138,10 @@ class TrotGait:
         distance the freeze point is from the cycle start."""
         return self.freeze_s
 
-    def _raw_phase(self, gait_s: float, lead: float) -> np.ndarray:
+    def _raw_phase(self, gait_s: float) -> np.ndarray:
         """(4,) phase at `gait_s` gait seconds.  THE OFFSET IN SECONDS, before
         the modulo -- `sim.cmpc.gait.phase`."""
-        shifted = float(gait_s) + (self.offsets + lead) * self.period
+        shifted = float(gait_s) + self.offsets * self.period
         return np.mod(shifted, self.period) / self.period
 
     # -- the settle bookkeeping (trot_demo.SettleTrotGait) -----------------
@@ -176,21 +180,10 @@ class TrotGait:
             w = e - settle
         return n * self.period + w
 
-    def _flips(self, elapsed: float) -> int:
-        """Lead flips before `elapsed`: one per cycle, each placed mid-settle
-        (or at the bare freeze point), where both diagonals are mid-stance at
-        full weight and swapping them moves no contact edge."""
-        n = self._cycle_index(elapsed)
-        e = elapsed - self.cycle_start(n)
-        return n + (1 if e >= self.freeze_s + self.settle_of(n) / 2.0 else 0)
-
     # -- what the law reads ------------------------------------------------
     def phase(self, t: float) -> np.ndarray:
         """(4,) in [0, 1).  0 is touchdown, `duty` is liftoff."""
-        elapsed = float(t) - self._t0
-        lead = (0.5 if self.alternate_lead and self._flips(elapsed) % 2
-                else 0.0)
-        return self._raw_phase(self._warp(elapsed), lead)
+        return self._raw_phase(self._warp(float(t) - self._t0))
 
     def contact(self, t: float) -> np.ndarray:
         """(4,) bool.  STRICTLY below duty: the liftoff instant is swing."""
@@ -250,11 +243,10 @@ class TrotGait:
 
     def __repr__(self) -> str:
         return ("TrotGait(period %.2f s, duty %.2f -> swing %.0f ms, ramp "
-                "%.2f, settle %.2f s every %d cycle%s, lead %s)"
+                "%.2f, settle %.2f s every %d cycle%s)"
                 % (self.period, self.duty, 1e3 * self.swing_duration,
                    self.ramp, self.settle_s, self.settle_every,
-                   "" if self.settle_every == 1 else "s",
-                   "alternating" if self.alternate_lead else "fixed"))
+                   "" if self.settle_every == 1 else "s"))
 
 
 if __name__ == "__main__":

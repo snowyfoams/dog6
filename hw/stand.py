@@ -183,6 +183,7 @@ from . import calibration as CAL     # noqa: E402
 from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
 from . import safety as SAFE         # noqa: E402
+from . import velocity_estimator as VEL  # noqa: E402
 from .balance import config as BCFG  # noqa: E402
 from .balance import controller as BCTRL   # noqa: E402
 from .balance import law as BLAW     # noqa: E402
@@ -331,9 +332,54 @@ def _torque_lines(tau_cmd, tau_meas) -> str:
     return "\n".join(rows)
 
 
+class VelocityTap:
+    """`hw.velocity_estimator` on the stand's own IMU, for the status lines.
+
+    The biases are taken in LIMP -- the one phase with no torque anywhere,
+    so the robot is still (DOG5's `quiet_stages`) -- and the integration
+    runs every sweep after that on the sensor's own clock.  Nothing the law
+    does reads it.  No zero-velocity update: it drifts as the integrator
+    does, and the status line shows the seconds since its zero.
+    """
+
+    def __init__(self, imu):
+        self.feed = VEL.ImuRawFeed(imu)
+        self.est = VEL.AccelVelocityEstimator()
+        self.failed: str | None = None
+
+    def update(self, still: bool) -> str | None:
+        """Drain the raw stream; returns a line to print, once, or None."""
+        if self.failed:
+            return None
+        samples = self.feed.drain()
+        if self.est.initialised:
+            self.est.update(samples)
+            return None
+        if not still:
+            return None
+        try:
+            if self.est.collect(samples):
+                return ("velocity estimator initialised in limp: b_f %s "
+                        "m/s^2" % np.round(self.est.b_f, 3))
+        except ValueError as refusal:
+            self.failed = str(refusal)
+            return "velocity estimator OFF: %s" % refusal
+        return None
+
+    def status(self) -> str:
+        if self.failed:
+            return "v OFF"
+        if not self.est.initialised:
+            return "v -- (not initialised: needs limp)"
+        v = self.est.v_w
+        return ("v (%+.3f, %+.3f, %+.3f) m/s  %.0f s since zero"
+                % (v[0], v[1], v[2], self.est.elapsed_s))
+
+
 def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         auto_s: float | None = None, clock=time.perf_counter,
-        imu=None, log: "StandLog | None" = None) -> str | None:
+        imu=None, log: "StandLog | None" = None,
+        velocity: "VelocityTap | None" = None, hook=None) -> str | None:
     """Drive `stand` on an ARMED `mb` until done, X, or a trip.
 
     Returns the stop reason, or None for a clean exit from "done".  Does not
@@ -345,6 +391,9 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     height loop plus gravity split by the geometry.  That is a legitimate
     first run -- it is strictly more than the per-leg law had -- but it is not
     the controller this exists to be.
+
+    `velocity` is a `VelocityTap` or None: print-only, nothing reads it.
+    `hook` is `main`'s: keys, an ENTER veto, and a call every sweep.
     """
     ids = HM.motor_ids()
     n = len(ids)
@@ -391,6 +440,10 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
             # measurement must use the same c^b the reference does.
             body = BSTATE.read(q, qd_ctrl, orientation, srb=stand.crouch.srb)
             stand.body = body
+            if velocity is not None:
+                said = velocity.update(stand.phase_name == "limp")
+                if said:
+                    print("\n   " + said, flush=True)
             if body.imu_stale and not imu_warned and imu is not None:
                 imu_warned = True
                 print("\n   IMU stale (%.0f ms): the attitude half of the law "
@@ -405,6 +458,10 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 print("\n   " + stand.toggle_trot(now), flush=True)
             if pressed in ("w", "W"):
                 print("\n   " + stand.toggle_step(now), flush=True)
+            if hook is not None and pressed is not None:
+                said = hook.key(pressed, now, stand)
+                if said:
+                    print("\n   " + said, flush=True)
             wants_next = pressed in ("\r", "\n")
             # --auto: `auto_s` after the phase's ramp has ARRIVED.  Asking
             # ramp_remaining about `auto_s` ago is exactly that test.  With a
@@ -431,6 +488,11 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                     and stand.phase_name != "step"
                     and stand.ramp_remaining(now - auto_s) <= 0.0):
                 wants_next = True
+            if wants_next and hook is not None:
+                veto = hook.blocks_advance(stand)
+                if veto:
+                    print("\n   ENTER ignored: " + veto, flush=True)
+                    wants_next = False
             if wants_next:
                 if stand.finished:
                     return None
@@ -439,6 +501,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                     print("\n   ENTER ignored: " + refused, flush=True)
 
             # -- the law ----------------------------------------------------
+            if hook is not None:
+                hook.sweep(now, stand)
             mode, values, trip = stand.update(now, body)
             # THE BANNER FOLLOWS THE PHASE, NOT THE KEYSTROKE.  RISE ends on
             # its own clock, so a banner printed only where ENTER is handled
@@ -547,6 +611,10 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                           % (stand.phase_name, now - stand.t_phase,
                              1e3 * BSTATE.origin_to_height(stand.h_cmd),
                              body.status(), tail), flush=True)
+                if velocity is not None:
+                    print("          " + velocity.status(), flush=True)
+                if hook is not None and stand.phase_name == "hold":
+                    print("          " + hook.status(now, stand), flush=True)
                 if stand.phase_name in ("rise", "hold", "trot", "step"):
                     print(_torque_lines(stand.tau, tau_meas), flush=True)
             sweep += 1
@@ -590,7 +658,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          track_stop: float = None, gait=None, tau_cap: float = None,
          tau_ceiling: float = None, tau_slew: float = None,
          overspeed_trip: bool = True, step_to=None,
-         step_period: float = None, swing: str = "cartesian") -> int:
+         step_period: float = None, swing: str = "cartesian",
+         velocity: bool = False, hook=None) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -603,6 +672,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     steps the feet there, and steps them back before the park, on its own
     gait clock of `step_period` seconds (None: the trot's).
     `swing` is `law.BalanceLaw.swing`: "joint" is the fold's z-only joint PD.
+    `hook` is an extra operator layer (`hw.sway.Sway`): its keys, a veto on
+    ENTER, a call every sweep before the law, and lines for the banner and
+    the status.  It turns the joint-space layer's flags on without a gait.
+    `velocity` True prints `hw.velocity_estimator`'s v under every status
+    line, every phase (needs the IMU; `--no-imu` has nothing to integrate).
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -699,6 +773,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           help="the four-foot re-level; 0 turns it off")
         trot.add_argument("--settle-every", type=int,
                           default=gait.settle_every, metavar="CYCLES")
+        trot.add_argument("--half-gait", action="store_true",
+                          help="T steps the gait by HAND, half a cycle a "
+                               "press: one diagonal lifts and lands, HOLD by "
+                               "itself, and the next T swings the other one")
         if step_to is not None:
             trot.add_argument("--step-period", type=float,
                               default=(gait.period if step_period is None
@@ -706,6 +784,27 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               help="the gait cycle W steps the feet on.  The "
                                    "foot crosses the whole step in one swing, "
                                    "so this sets the joint speeds of the step")
+    if gait is not None or hook is not None:
+        joint = ap.add_argument_group(
+            "the joint-space layer", "DOG5's JointImpedance, from HOLD on")
+        joint.add_argument("--joint-hold", dest="joint_hold",
+                           action="store_true", default=True,
+                           help="MODE: the joint angles on reaching HOLD are "
+                                "the joint-space target -- trunk position and "
+                                "rpy pinned by the legs")
+        joint.add_argument("--no-joint-hold", dest="joint_hold",
+                           action="store_false", default=argparse.SUPPRESS,
+                           help="MODE: the SRB law alone, no joint target -- "
+                                "height and rpy held, the body free to shift "
+                                "under a push")
+        joint.add_argument("--kp-joint", type=float,
+                           default=BCFG.KP_JOINT_HOLD, metavar="NM_PER_RAD",
+                           help="the joint-space layer: every leg held at the "
+                                "joint angles latched on reaching HOLD, through "
+                                "the hold and the trot (a swinging leg gets the "
+                                "damper only).  0 turns the spring off")
+        joint.add_argument("--kd-joint", type=float,
+                           default=BCFG.KD_JOINT_HOLD, metavar="NMS_PER_RAD")
     law.add_argument("--gravity-legs", type=int, default=4, choices=(1, 2, 4),
                      metavar="N", help="leg-gravity terms refreshed per sweep; "
                                        "4 removes the 12 ms cross-leg skew")
@@ -729,7 +828,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                        help="do NOT latch: fly config.SETPOINT_ROLL/PITCH_DEG. "
                             "A run comparing two postures wants this, or the "
                             "two are measured against two different 'level's")
+    if hook is not None:
+        hook.add_arguments(ap)
     args = ap.parse_args(argv)
+    if hook is not None:
+        hook.configure(args)
     if args.latch is None:
         args.latch = (bool(BCFG.SETPOINT_DYNAMIC) if dynamic_setpoint is None
                       else bool(dynamic_setpoint))
@@ -740,13 +843,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             gait = TrotGait(period=args.period, duty=args.duty,
                             offsets=gait.offsets, ramp=gait.ramp,
                             settle_s=args.settle,
-                            settle_every=args.settle_every,
-                            alternate_lead=gait.alternate_lead)
+                            settle_every=args.settle_every)
             step_gait = (None if step_to is None else TrotGait(
                 period=args.step_period, duty=args.duty, offsets=gait.offsets,
                 ramp=gait.ramp, settle_s=args.settle,
-                settle_every=args.settle_every,
-                alternate_lead=gait.alternate_lead))
+                settle_every=args.settle_every))
         except ValueError as refusal:
             ap.error("the gait: %s" % refusal)
     else:
@@ -794,9 +895,15 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               dynamic_setpoint=args.latch,
                               tilt_stop_deg=args.tilt_stop,
                               track_stop_deg=args.track_stop, srb=crouch.srb,
-                              swing=swing)
+                              swing=swing,
+                              **({} if (gait is None and hook is None)
+                                 or not args.joint_hold
+                                 else dict(kp_joint=args.kp_joint,
+                                           kd_joint=args.kd_joint)))
     stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
-                          gait=gait, step_to=step_to, step_gait=step_gait)
+                          gait=gait, step_to=step_to, step_gait=step_gait,
+                          trot_swings=(1 if gait is not None and args.half_gait
+                                       else 0))
     log = StandLog() if args.log else None
     key = KeyPoller()
     if not key.ok and not args.fake:
@@ -813,7 +920,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     print("  lift tau cap %.2f N*m (standing needs ~2.2), slew %.0f N*m/s"
           % (args.tau_cap, slew))
     if gait is not None:
-        print("  TROT on T from HOLD: %s" % gait)
+        print("  TROT on T from HOLD: %s%s"
+              % (gait, "\n       HALF GAIT: each T is one diagonal's swing, alternating "
+                 "press by press -- no clock hands over"
+                 if args.half_gait else ""))
         if swing == "joint":
             print("       swing apex %.0f mm straight up, NO placement; JOINT "
                   "PD, abd held: Kp %s N*m/rad Kd %s N*m*s/rad"
@@ -823,6 +933,14 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             print("       swing apex %.0f mm straight up, NO placement; Kp %s "
                   "N/m Kd %s N s/m" % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING,
                                        BCFG.KD_SWING))
+        if args.joint_hold:
+            print("       MODE joint-hold: every leg held at the angles "
+                  "latched on reaching HOLD, hold and trot, Kp %.1f N*m/rad "
+                  "Kd %.2f N*m*s/rad; swing legs damper only"
+                  % (args.kp_joint, args.kd_joint))
+        else:
+            print("       MODE no-joint-hold: SRB alone -- height and rpy "
+                  "held, the body free to shift")
         print("       residual trip counts four-foot sweeps only while "
               "trotting")
     if not overspeed_trip:
@@ -876,6 +994,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
              BCFG.RESIDUAL_FORCE_N, BCFG.RESIDUAL_MOMENT_NM))
     print("  ENTER steps the phase (RISE ends on its own).  X is an E-STOP "
           "-- from rise or hold it DROPS the robot.")
+    if hook is not None:
+        for line in hook.banner(args):
+            print("  " + line)
     if step_gait is not None:
         print("  W in HOLD steps the feet to hip-frame xy %s mm (W again, or "
               "ENTER, steps them back to the crouch's first), on %s"
@@ -916,6 +1037,16 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   file=sys.stderr)
             return 2
 
+    tap = None
+    if velocity and imu is not None:
+        tap = VelocityTap(imu)
+        if not tap.feed.wait_for_raw(3.0):
+            tap = None
+            print("[stand] no raw 0x40 IMU packet in 3 s: no velocity "
+                  "this run", file=sys.stderr)
+    elif velocity:
+        print("  velocity: none -- no IMU to integrate")
+
     stop = None
     try:
         with mb:
@@ -925,7 +1056,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             # Straight into the loop: arm() streamed until this instant, and
             # nothing may sit between it and the first slot.
             stop = run(mb, stand, rate_hz=args.rate, key=key,
-                       auto_s=args.auto, imu=imu, log=log)
+                       auto_s=args.auto, imu=imu, log=log, velocity=tap,
+                       hook=hook)
     except KeyboardInterrupt:
         stop = "Ctrl-C"
     finally:

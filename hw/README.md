@@ -110,6 +110,7 @@ the table for the length of a `with` block.
 | `hardware_map.py` | — | the two facts. **Twelve measured rows**, 2026-09-15 |
 | `calibration.py` | motor frame no, joint frame yes | the gain, `EncoderUnwrap`, `soft_limits`; plus the joint conversions, which raise if a row goes missing |
 | `imu.py` | **streams** (200 Hz, 0 CRC); signs **verified** | DETA10 → trunk frame; `orientation()` gives R and ω^b in SI. `R_BODY_IMU` is identity **by measurement** — same board, same mounting as DOG5. The adapter stays dumb: "level" is latched by the law at zero torque, not trimmed here — see [balance/README](balance/README.md) |
+| `velocity_estimator.py` | offline gates pass; streams on the robot | trunk velocity and position by integrating the raw 0x40 accel — DOG5's EKF prediction step with the AHRS's roll/pitch for gravity, body-frame state so yaw never enters, sensor-clock dt. Position is in DOG5's odometry frame (heading fixed at init, gyro yaw). Pure integration drifts (bias × t, × t²/2); `zero()` / `set_velocity()` / `set_position()` are for `hw.balance` to re-anchor it |
 | `balance/` | yes | the stand's SRB balance controller + force allocator, **every gain untuned**. [README](balance/README.md) |
 | `fold_stand.py` | no | `hw.stand` from `posture.FOLD` — a hand-captured crouch at h = 60 mm with the feet nowhere near the nominal stance. SRB only, IMU datum fixed. Needs `--tau-cap 3.0` |
 | `safety.py` | yes | ramp, cap, limit block, slew, e-stop trips. Refuses a map with a hole in it, **no override** |

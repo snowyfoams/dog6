@@ -391,12 +391,25 @@ PHASE_OFFSET = np.array([0.0, 0.5, 0.5, 0.0])    # FL+RR, FR+RL   [DOG5 FLOWN]
 CONTACT_RAMP = 0.15
 
 #: trot_demo's re-level: every SETTLE_EVERY full cycles the gait clock freezes
-#: for SETTLE_S with all four feet at full weight, and the lead diagonal
-#: alternates every cycle so an order-dependent drift flips sign instead of
-#: integrating.  DOG5 never solved its trot roll; this is how its demo held.
+#: for SETTLE_S with all four feet at full weight.  DOG5 never solved its
+#: trot roll; this is how its demo held.  Its alternating lead diagonal is
+#: NOT kept: removed on request 2026-09-21, one fixed trot.
 SETTLE_S = 0.2                      # s       [DOG5 FLOWN]
 SETTLE_EVERY = 2                    # cycles  [DOG5 FLOWN]
-ALTERNATE_LEAD = True               #         [DOG5 FLOWN]
+
+#: THE JOINT-SPACE LAYER, 2026-09-21: DOG5 trot_hw's `JointImpedance`,
+#: tau += KP (q_hold - q) - KD qd under EVERY leg, on top of the SRB stance
+#: torque and the swing.  q_hold is the measured joint angles on the sweep
+#: the robot REACHES HOLD, fixed from then on through the hold and every
+#: trot: feet planted, fixed joints are a fixed trunk -- position and rpy.
+#: A W step releases it and re-latches at the new stance.  A SWINGING leg's
+#: target follows the leg, as DOG5's q_ref did ("left at the stance pose the
+#: joint floor fights the swing"), so there it is the damper alone.  DOG5's reason for it: a pure force law is velocity-level, and a
+#: foot off the ground coasts; kp gives the joint a fixed point.  DOG5 put
+#: the value back to 3.0 on 2026-08-28 -- 8.0 was at the delay-phase gate
+#: and 15.0 shook at 9-12 Hz.  `--kp-joint` / `--kd-joint`.  [DOG5 FLOWN]
+KP_JOINT_HOLD = 3.0                 # N*m/rad
+KD_JOINT_HOLD = 0.1                 # N*m*s/rad
 
 #: The swing apex above the resting foot, in the trunk frame.  [DOG5 FLOWN]
 SWING_HEIGHT = 0.040                # m
@@ -480,14 +493,15 @@ def describe() -> str:
         % (RESIDUAL_FORCE_N, RESIDUAL_MOMENT_NM, RESIDUAL_STREAK),
         "  trot in place  [DOG5 FLOWN]",
         "    period %.2f s  duty %.2f  ramp %.2f  settle %.2f s every %d "
-        "cycles, lead %s"
-        % (GAIT_PERIOD, DUTY, CONTACT_RAMP, SETTLE_S, SETTLE_EVERY,
-           "alternating" if ALTERNATE_LEAD else "fixed"),
+        "cycles"
+        % (GAIT_PERIOD, DUTY, CONTACT_RAMP, SETTLE_S, SETTLE_EVERY),
         "    swing apex %.0f mm, no placement   Kp %s N/m  Kd %s N s/m   "
         "slew %.0f N*m/s"
         % (1e3 * SWING_HEIGHT, KP_SWING, KD_SWING, TAU_SLEW_TROT_NM_S),
         "    joint swing (fold)   Kp %s N*m/rad  Kd %s N*m*s/rad   abd held"
         % (KP_SWING_JOINT, KD_SWING_JOINT),
+        "    joint hold layer     Kp %.1f N*m/rad  Kd %.2f N*m*s/rad   every "
+        "leg, q latched on reaching HOLD" % (KP_JOINT_HOLD, KD_JOINT_HOLD),
     ])
 
 

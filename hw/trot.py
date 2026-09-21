@@ -1,4 +1,4 @@
-"""Trot in place from the WIDE crouch, on the SRB balance controller.
+"""Trot in place from the normal crouch, on the SRB balance controller.
 
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V -m hw.trot --fake --auto 1 --no-imu                  the whole path, no robot
@@ -9,9 +9,9 @@
                                    hold --W--> step --> hold   (feet under the hips)
 
 `hw.stand` plus a gait.  Everything that is not the trot is `hw.stand`'s, at
-`hw.stand`'s defaults: the wide crouch (`posture.WIDE`, the nominal feet
-20 mm further out, trunk 40 mm off the floor -- `posture` says why it cannot
-stay down), the attitude setpoint LATCHED in limp, and roll
+`hw.stand`'s defaults: the normal crouch (`posture.NOMINAL`, `CROUCH`; back
+from WIDE on request 2026-09-21 -- no abduction splay), the attitude
+setpoint LATCHED in limp, and roll
 following `--kp-att / --kd-att` (90 / 17) -- except the tilt stop, 45 deg
 (`TILT_STOP_DEG`), and the torque-phase tracking trip, OFF
 (`TRACK_STOP_DEG`).  Every one is still a flag.
@@ -22,6 +22,14 @@ a FASTER clock: 0.8 s a cycle (`PERIOD_S`), not 1.2.
 
     $V -m hw.trot --period 0.6                  faster still
     $V -m hw.trot --settle 0                    no four-foot re-level
+    $V -m hw.trot --kp-joint 3 --kd-joint 0.1   the joint layer (these are
+                                                the defaults)
+    $V -m hw.trot --no-joint-hold               the SRB law alone: body free
+                                                to shift, height and rpy
+                                                held -- the sway demos
+    $V -m hw.trot --half-gait                   the handover by HAND: each
+                                                T is half a gait cycle, the
+                                                diagonals alternating
 
 WHY THIS STANCE, AFTER THE FOLD ONE
     The fold trot tipped in roll on 2026-09-17.  That fold stance (rear legs
@@ -36,8 +44,9 @@ WHY THIS STANCE, AFTER THE FOLD ONE
         I_xx                0.0281             0.0346 kg m^2
         knee, swing peak    7.09 rad/s         7.26 rad/s
 
-    WIDE, 2026-09-17, is the nominal stance at +-85 mm in y: same x, the CoM
-    still on both diagonals by symmetry, I_xx 0.0341 kg m^2.
+    WIDE, 2026-09-17, was the nominal stance at +-85 mm in y (abd splayed
+    out); the trot went back to NOMINAL on 2026-09-21.  `posture.WIDE` is
+    still there for a caller that wants it.
 
     Both diagonals pass exactly through the pinned CoM, so on two feet the
     allocator is asked for nothing it cannot give.  What is NOT better: I_xx
@@ -56,21 +65,47 @@ FEET UNDER THE HIPS: W, on request 2026-09-17
     to the crouch and would drag feet left anywhere else.  Static, at the
     145 mm hold, four feet:
 
-                            WIDE sites         under the hips
+                            WIDE sites (then)  under the hips
         feet, trunk x/y     +-237 / +-85 mm    +-156 / +-60 mm
         |tau| abd/pitch/knee 0.36/0.75/0.34    0.00/0.41/1.05 N*m
         reach used          0.795              0.707
 
-    The knee carries three times as much, and the support rectangle is 81 mm
-    shorter and 25 mm narrower per side.  The SRB model stays WIDE's (c^b z
-    7 mm off, x 0 both) -- `law.BalanceLaw.begin_step` says why.
+    Measured from WIDE, before the trot went back to NOMINAL (+-65 mm in y,
+    so the step now crosses less).  The SRB model stays the crouch's --
+    `law.BalanceLaw.begin_step` says why.
 
+
+THE JOINT-SPACE LAYER, 2026-09-21
+    DOG5 trot_hw's `JointImpedance`, ported: every leg gets tau += Kp
+    (q_hold - q) - Kd qd on top of the SRB stance torque and the swing.
+    q_hold is the joint angles MEASURED ON THE SWEEP THE ROBOT REACHES HOLD,
+    fixed once and kept through the hold and every trot (every --half-gait
+    press too) -- with the feet planted, fixed joints fix the trunk's
+    position and rpy.  T does not re-latch it; W releases it and re-latches
+    at the new stance.  A swinging leg's target follows the leg -- the
+    damper alone, nothing pulling it back down.  DOG5's 3.0 / 0.1
+    (`config.KP_JOINT_HOLD`).
+
+    TWO MODES, BOTH KEPT.  `--joint-hold` (the default) is the above.
+    `--no-joint-hold` is the SRB law as it was before: it holds height and
+    rpy and nothing pins the trunk's xy, so the body can shift over the
+    feet -- the sway demos need exactly that.
+
+VELOCITY, THE WHOLE RUN, 2026-09-21
+    `hw.velocity_estimator` -- the DETA10's accelerometer integrated, biases
+    taken in LIMP -- printed as `v (x, y, z) m/s` under every status line,
+    every phase from limp to park, yaw-free world frame.  Print only: the
+    law reads none of it.  No IMU, no velocity.  `hw.fold_trot` too.
 
 KEYS
     ENTER  the stand's phases, as ever.  REFUSED while trotting or stepping.
     W      from HOLD, step the feet under the hips, or back.
     T      from HOLD, start trotting.  While trotting, latch the exit: the
            switch back to HOLD waits for all four feet at full weight.
+           With --half-gait, T is half a gait cycle, stepped by hand: one
+           diagonal lifts and lands, HOLD by itself, and the next T swings
+           the OTHER diagonal (FR/RL, FL/RR, FR/RL, ...).  The swing is the
+           gait's own; only the handover between diagonals waits for T.
     X      E-STOP.  From rise, hold or trot it DROPS the robot.  Run supported.
 """
 from __future__ import annotations
@@ -89,8 +124,12 @@ from .balance import config as BCFG  # noqa: E402
 from .balance import gait as GAIT    # noqa: E402
 from .balance import posture as POSE  # noqa: E402
 
-__all__ = ["main", "trot_options", "TAU_CAP", "PERIOD_S", "TILT_STOP_DEG",
+__all__ = ["main", "trot_options", "CROUCH", "TAU_CAP", "PERIOD_S", "TILT_STOP_DEG",
            "TRACK_STOP_DEG", "STEP_FOOT_XY", "STEP_PERIOD_S"]
+
+#: The crouch the trot lifts from and parks in: the normal one, abd not
+#: splayed -- back from `posture.WIDE` on request 2026-09-21.
+CROUCH = POSE.NOMINAL
 
 #: The operator's cap for the trot, 2026-09-16: the motors' own limit.
 TAU_CAP = SAFE.TAU_HARD_NM
@@ -147,11 +186,11 @@ def trot_options(period: float = BCFG.GAIT_PERIOD) -> dict:
 
 
 def main(argv=None) -> int:
-    """`hw.stand.main` from `posture.WIDE`, SRB only, plus the trot and W."""
-    return STAND.main(argv, crouch=POSE.WIDE, only_law="srb",
+    """`hw.stand.main` from `CROUCH`, SRB only, plus the trot and W."""
+    return STAND.main(argv, crouch=CROUCH, only_law="srb",
                       tilt_stop=TILT_STOP_DEG, track_stop=TRACK_STOP_DEG,
                       step_to=STEP_FOOT_XY, step_period=STEP_PERIOD_S,
-                      **trot_options(PERIOD_S))
+                      velocity=True, **trot_options(PERIOD_S))
 
 
 if __name__ == "__main__":

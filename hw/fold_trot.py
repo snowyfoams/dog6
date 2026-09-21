@@ -15,7 +15,7 @@ copied.  What is added is T, and the four things T needs:
 
     THE GAIT       `balance.gait.TrotGait`: DOG5 trot_demo's clock -- duty
                    0.80, contact ramp 0.15, a 0.2 s four-foot settle every 2
-                   cycles, alternating lead [DOG5 FLOWN] -- on the fold's OWN
+                   cycles [DOG5 FLOWN], one fixed lead -- on the fold's OWN
                    period, 2.0 s (`PERIOD_S`), not `hw.trot`'s 0.8: a 400 ms
                    swing.  The joint swing below cannot follow a shorter one
                    through the 60 N*m/s slew.  `--period` overrides.
@@ -68,6 +68,10 @@ THE FOLD STANCE AND A DIAGONAL PAIR
     contact about to go.
 
 
+VELOCITY
+    `hw.velocity_estimator`'s v under every status line, as `hw.trot` --
+    that file's docstring says what it is.
+
 KEYS
     ENTER  the stand's phases, as ever.  REFUSED while trotting.
     T      from HOLD, start trotting.  While trotting, latch the exit: the
@@ -99,7 +103,8 @@ def main(argv=None) -> int:
     return STAND.main(argv, crouch=POSE.FOLD, dynamic_setpoint=False,
                       only_law="srb", tilt_stop=FS.TILT_STOP_DEG,
                       roll_gains=FS.ROLL_GAINS, track_stop=FS.TRACK_STOP_DEG,
-                      swing="joint", **trot_options(PERIOD_S))
+                      swing="joint", velocity=True,
+                      **trot_options(PERIOD_S))
 
 
 if __name__ == "__main__":

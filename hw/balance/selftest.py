@@ -1044,14 +1044,12 @@ def main() -> int:
     check("every settle is four feet at full weight",
           settle.any() and bool(np.all(weight[settle] >= 1.0 - 1e-9)),
           "%.2f s of settle in %.1f s" % (settle.mean() * t_end, t_end))
-    leads = []
-    for n in range(3 * gait.settle_every):
-        span = (ts >= gait.cycle_start(n)) & (ts < gait.cycle_start(n + 1))
-        off = [np.flatnonzero(~contact[span, leg]) for leg in (fl, fr)]
-        leads.append(fl if off[0][0] < off[1][0] else fr)
-    check("the lead diagonal alternates cycle by cycle (DOG5 trot_demo)",
-          all(a != b for a, b in zip(leads, leads[1:])),
-          " ".join("FL/RR" if leg == fl else "FR/RL" for leg in leads))
+    lifts = [leg for _, leg in sorted(
+        (i, leg) for leg in (fl, fr)
+        for i in np.flatnonzero(contact[:-1, leg] & ~contact[1:, leg]))]
+    check("one gait: the diagonals strictly take turns, no lead flip",
+          len(lifts) >= 4 and all(a != b for a, b in zip(lifts, lifts[1:])),
+          " ".join("FL/RR" if leg == fl else "FR/RL" for leg in lifts))
     try:
         GAIT.TrotGait(duty=0.5)
         refused = False
@@ -1304,6 +1302,83 @@ def main() -> int:
     check("...it is taken at the next four-foot window, back to HOLD",
           seq.phase_name == "hold" and seq.gait.full_support(t),
           "%.2f s after the latch" % (t - t_latch))
+    half = SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                             balance=LAW.BalanceLaw(
+                                 foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                                 srb=fold.srb, track_stop_deg=0.0),
+                             gait=GAIT.TrotGait(), trot_swings=1)
+    half.phase = SEQ.PHASES.index("hold")
+    half.body = at_fold
+    half.gate.start(0.0, q=at_fold.q)
+    half.balance.arm(0.0, at_fold)
+    presses, t = [], 1.0
+    for _ in range(3):
+        t0 = t
+        half.toggle_trot(t0)
+        lifted, lift_wt = set(), 1.0
+        while half.trotting and t < t0 + 2.0 * half.gait.period:
+            t += 0.004
+            half.update(t, at_fold)
+            if half.trotting and half.out.swing_s is not None:
+                lifted |= set(np.flatnonzero(half.out.swing_s > 0.0).tolist())
+        presses.append((tuple(sorted(C.LEGS[i] for i in lifted)),
+                        half.phase_name == "hold" and half.gait.full_support(t)
+                        and t - t0 < half.gait.period, t - t0))
+        t += 0.5                                         # the operator waits
+    check("--half-gait: each T is ONE diagonal's swing, then HOLD by itself",
+          all(ok for _, ok, _ in presses),
+          "; ".join("%s %.2f s" % ("/".join(legs), dt)
+                    for legs, _, dt in presses))
+    check("...and the diagonal alternates press by press",
+          [legs for legs, _, _ in presses]
+          == [("FR", "RL"), ("FL", "RR"), ("FR", "RL")],
+          " -> ".join("/".join(legs) for legs, _, _ in presses))
+    # The sequence: latched ON REACHING HOLD, kept through T and the exit.
+    js = SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                           balance=LAW.BalanceLaw(
+                               foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                               srb=fold.srb, track_stop_deg=0.0),
+                           gait=GAIT.TrotGait(), trot_swings=1)
+    js.phase = SEQ.PHASES.index("rise")
+    js.body = at_fold
+    js.gate.start(0.0, q=at_fold.q)
+    js.balance.arm(0.0, at_fold)
+    js.t_phase = -10.0                               # the rise has arrived
+    none_before = js.balance.q_hold is None
+    js.update(0.0, at_fold)
+    latched = js.balance.q_hold
+    check("the joint target is latched on the sweep the robot reaches HOLD",
+          none_before and js.phase_name == "hold" and latched is not None
+          and np.array_equal(latched, at_fold.q))
+    js.toggle_trot(0.1)
+    t = 0.1
+    while js.trotting and t < 3.0:
+        t += 0.004
+        js.update(t, at_fold)
+    check("...and T neither re-latches nor releases it: the same angles "
+          "after the trot", js.phase_name == "hold"
+          and js.balance.q_hold is latched)
+    jl = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                        srb=fold.srb, track_stop_deg=0.0,
+                        kp_joint=cfg.KP_JOINT_HOLD,
+                        kd_joint=cfg.KD_JOINT_HOLD)
+    jl.arm(0.0, at_fold)
+    jg = GAIT.TrotGait()
+    jg.reset(0.0)
+    t_two = next(t for t in np.arange(0.0, jg.period, 0.002)
+                 if jg.sample(t).contact.sum() == 2)
+    swing_now = ~jg.sample(t_two).contact
+    base = jl.update(t_two, at_fold, gait=jg).tau
+    dq = np.full(C.N_JOINTS, 0.05)
+    jl.hold_joints(at_fold.q - dq)            # the hold was 0.05 rad lower
+    with_layer = jl.update(t_two, at_fold, gait=jg).tau
+    expect = C.unflat(-jl.kp_joint * dq).copy()
+    expect[swing_now] = 0.0
+    close("joint layer: stance legs get Kp (q_hold - q), swing legs no spring",
+          with_layer - base, C.flat(expect), 1e-9, " N*m")
+    jl.release_joints()
+    close("...and released, the law is exactly the one without it",
+          jl.update(t_two, at_fold, gait=jg).tau, base, 1e-12, " N*m")
     try:
         SAFE.SafetyGate(FT.TAU_CAP)
         default_refuses = False
@@ -1332,7 +1407,7 @@ def main() -> int:
 
     # -- the hold's foot step (hw.trot's W) --------------------------------
     from .. import trot as TR
-    wide = POSE.WIDE
+    wide = TR.CROUCH                     # the trot's crouch
     home_rest = SWING.rest_feet_b(cfg.H_LIFT, wide.foot_xy)
     hip_rest = SWING.rest_feet_b(cfg.H_LIFT, TR.STEP_FOOT_XY)
     step_gait = GAIT.TrotGait(period=TR.STEP_PERIOD_S)
@@ -1398,15 +1473,15 @@ def main() -> int:
           C.flat(q_in), C.flat(LAW.ik_reference(cfg.H_LIFT, q_in,
                                                 TR.STEP_FOOT_XY)),
           1e-6, " rad")
-    check("posture WIDE itself is untouched by the step",
-          np.allclose(wide.foot_xy, POSE.CrouchPose.from_hip_sites(
-              "w", POSE._wide_sites()).foot_xy))
+    check("the trot's crouch posture itself is untouched by the step",
+          np.allclose(wide.foot_xy, POSE.POSTURES[wide.name].foot_xy)
+          and step_law.foot_xy is not wide.foot_xy)
     step_law.end_step()
     step_law.begin_step(wide.foot_xy)
     step_gait.reset(t_in + 0.5)
     t_back, _, trips, taus, _ = _tracked_step(step_law, step_gait,
                                               t_in + 0.5, q_in)
-    check("...and back to the WIDE sites the same way, no trip",
+    check("...and back to the crouch's sites the same way, no trip",
           step_law.step_landed and not trips
           and np.allclose(step_law.foot_xy, wide.foot_xy),
           "peak %.2f N*m" % np.abs(taus).max())
