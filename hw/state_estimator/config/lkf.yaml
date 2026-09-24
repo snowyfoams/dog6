@@ -1,0 +1,26 @@
+# LinearKFPosVelEstimator parameters.
+#
+# The keys are exactly LKFParams' fields -- tests/test_layers.py fails if the
+# two sets differ -- and today the values are its defaults: MIT's Mini Cheetah
+# numbers.  Nothing in estimator/ reads this file.  The caller does:
+#
+#     LKFParams(**yaml.safe_load(path.read_text()))
+#
+# Write every number with a decimal point: PyYAML reads `1e-3` as a STRING.
+
+# process noise Q, variance scales -- estimator/matrices.py, build_Q
+lam_p: 0.02          # trunk position       MIT imu_process_noise_position
+lam_v: 0.02          # trunk velocity       MIT imu_process_noise_velocity
+lam_f: 0.002         # each foot            MIT foot_process_noise_position
+
+# measurement noise R, variances -- build_R
+rho_p: 0.001         # p - foot_i           MIT foot_sensor_noise_position
+rho_v: 0.1           # v, from one leg      MIT foot_sensor_noise_velocity
+rho_h: 0.001         # foot_i,z = 0         MIT foot_height_sensor_noise
+
+# contact trust -- estimator/measurement.py, trapezoid_trust
+trust_window: 0.2    # ramp at each end of a stance, in phase; (0, 0.5]
+suspect_gain: 100.0  # s = 1 + suspect_gain * (1 - trust)
+
+P0: 100.0            # covariance after reset(): P = P0 * I
+g: 9.81              # m/s^2
