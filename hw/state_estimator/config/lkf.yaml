@@ -23,4 +23,9 @@ trust_window: 0.2    # ramp at each end of a stance, in phase; (0, 0.5]
 suspect_gain: 100.0  # s = 1 + suspect_gain * (1 - trust)
 
 P0: 100.0            # covariance after reset(): P = P0 * I
-g: 9.81              # m/s^2
+
+# NOT 9.81: what DOG6's own accelerometer reads level and at rest, measured
+# 2026-09-24 over 5 s at 100 Hz (mean |a| 9.7639, per-axis sigma 0.009).  It
+# lives in hw.imu.G_AT_REST and tests/test_layers.py gates the three copies --
+# this file, LKFParams.g and that constant -- against each other.
+g: 9.764             # m/s^2

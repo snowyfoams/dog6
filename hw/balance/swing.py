@@ -74,7 +74,8 @@ from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
 
 __all__ = ["rest_feet_b", "swing_reference", "swing_torque",
-           "joint_swing_reference", "joint_swing_torque", "SWING_MODES"]
+           "joint_swing_reference", "joint_swing_torque", "swing_demand",
+           "SWING_MODES"]
 
 #: `law.BalanceLaw.swing`: the Cartesian impedance, or the fold's joint PD.
 SWING_MODES = ("cartesian", "joint")
@@ -144,6 +145,45 @@ def joint_swing_reference(leg: int, rest_b, progress: float, duration: float,
     qd = np.zeros(3)
     qd[1:] = np.linalg.lstsq(jac[:, 1:], v, rcond=None)[0]
     return q, qd
+
+
+#: kg m^2 about the pitch and knee axes, AN ESTIMATE FOR THE BANNER ONLY:
+#: the reflected rotor (`params.ARMATURE`, 0.0085, which is most of it) plus
+#: the links -- thigh and shin about the pitch axis, shin about the knee -- at
+#: their lift-pose lever arms.  No torque is computed from these; they turn
+#: the arc's joint acceleration into the N*m the SWING WOULD NEED so the
+#: operator can hold that against the cap and the slew before pressing T.
+JOINT_INERTIA_EST = np.array([0.0, P.ARMATURE + 0.013, P.ARMATURE + 0.005])
+
+
+def swing_demand(leg: int, rest_b, duration: float, height: float,
+                 q_seed, n: int = 200) -> dict:
+    """What one swing ASKS of the pitch and knee motors, from the arc alone.
+
+    The z-only arc through the IK (`joint_swing_reference`), sampled and
+    differentiated: peak joint speed, peak inertial torque on
+    `JOINT_INERTIA_EST`, and the torque rate the gate's slew limiter must
+    allow for the torque to reach its peak inside a quarter of the swing --
+    ``tau_peak / (duration / 4)``.  THAT LAST NUMBER IS THE ONE THAT DECIDES
+    WHETHER THE FOOT LEAVES THE FLOOR.  A swing whose demand outruns the slew
+    is a PD winding up behind a limiter: MuJoCo, 2026-09-17 (`hw.fold_trot`),
+    160, 240 and 260 ms swings at 40 mm all diverged with the knee
+    overshooting ~90 deg, 300 ms tracked to 2.9 mm.  Measured on the robot,
+    2026-09-24: at 80 ms of swing the foot simply did not lift, and the trunk
+    read steady because it was still standing on four feet.
+
+    Returns ``{"qd": (3,), "tau": (3,), "slew": float}`` -- peak |qd| rad/s,
+    peak |tau| N*m per joint, and the slew in N*m/s.
+    """
+    s = np.linspace(0.0, 1.0, n + 1)
+    q = np.array([joint_swing_reference(leg, rest_b, float(x), duration,
+                                        q_seed, height=height)[0] for x in s])
+    dt = duration / n
+    qd = np.gradient(q, dt, axis=0)
+    qdd = np.gradient(qd, dt, axis=0)
+    tau = np.abs(qdd) * JOINT_INERTIA_EST
+    return dict(qd=np.abs(qd).max(axis=0), tau=tau.max(axis=0),
+                slew=float(tau.max() / (duration / 4.0)))
 
 
 def joint_swing_torque(state, leg: int, q_ref, qd_ref, kp=None,

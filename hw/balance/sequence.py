@@ -103,6 +103,21 @@ LIMP IS NOT A PHASE THAT DOES NOTHING
     loop is enforcing.  So limp is no longer a phase an operator may skip
     past, and a robot being handled through it delays the latch rather than
     corrupting it -- `latch_setpoint` refuses a stale sample and latches once.
+
+WHERE "FORWARD" IS DEFINED, AND IT IS NOT LIMP
+    The heading half of the same convention is latched one handover later, on
+    the sweep the CROUCH ends and RISE begins: `law.BalanceLaw.arm` takes the
+    magnetometer's reading there, `yaw_offset` becomes that number, and
+    `state.rezero_yaw` turns the world frame onto it for every sweep after.
+    Yaw then reads 0 at the handover and is heading DRIFT from there on.
+
+    THE TWO HALVES DIFFER BECAUSE THE REFERENCES DIFFER.  Level is a fact
+    about the world and has to be read where nothing is enforcing it, which is
+    limp.  Forward is not a fact about the world -- it is whichever way the
+    robot happens to be pointing when it starts pushing -- so it is read where
+    the pushing starts, and taking it there is also what makes the yaw error
+    exactly zero on the sweep it is taken.  DOG5 split them at the same two
+    instants for the same two reasons.
 """
 from __future__ import annotations
 
@@ -437,6 +452,24 @@ class StandSequence:
         return "trot" if self.trotting else PHASES[self.phase]
 
     @property
+    def yaw_offset(self) -> float:
+        """rad, the heading this run's world frame is pinned to.
+
+        0.0 until the handover at the end of the CROUCH latches it -- see
+        `law.BalanceLaw.arm` and `state.rezero_yaw`.  Every `BodyState` this
+        object touches is put in that frame on the way in, on both the
+        `advance` and the `update` path, so nothing downstream ever sees the
+        magnetometer's own world once torque is live.
+        """
+        return self.balance.yaw_offset
+
+    def _measured(self, body):
+        """`body` in this run's world frame.  A no-op before the handover, and
+        a no-op on a body that is already in it -- `state.rezero_yaw`."""
+        return body if body is None else BSTATE.rezero_yaw(body,
+                                                           self.yaw_offset)
+
+    @property
     def feet_home(self) -> bool:
         """The feet are on the crouch's own sites -- PARK may run."""
         xy = self.balance.foot_xy
@@ -542,6 +575,10 @@ class StandSequence:
 
     def advance(self, now: float, q) -> str | None:
         """Enter the next phase.  Returns why it refused, or None."""
+        # The runner assigns `self.body` straight from `state.read`, which is
+        # the magnetometer's world.  Put it in the run's before anything here
+        # reads a heading off it.
+        self.body = self._measured(self.body)
         if self.finished:
             return None
         if self.trotting:
@@ -589,8 +626,22 @@ class StandSequence:
                                      for i in range(C.N_LEGS)])
             if self.law == "srb":
                 # h0 and the heading are latched HERE, from what is measured
-                # at the handover -- see `balance.law.BalanceLaw.arm`.
+                # at the handover -- see `balance.law.BalanceLaw.arm`.  The
+                # crouch has just arrived, so this is the last sweep with the
+                # trunk on the floor and the first with torque behind it.
                 self.balance.arm(now, self.body)
+                # AND THE WORLD TURNS WITH IT, ON THIS SWEEP.  `arm` has just
+                # taken the heading; re-taking the body against it now is
+                # what makes the yaw error zero on the sweep it was latched
+                # rather than one sweep later.  Latch and frame have to move
+                # together or the arming sweep sees the whole heading as an
+                # attitude error -- the step `arm` exists to avoid.
+                self.body = self._measured(self.body)
+                self.notice = (
+                    "heading zeroed at the handover: %+.1f deg was the "
+                    "magnetometer's reading and is now 0 -- world x is where "
+                    "the trunk points, and yaw from here is drift off it"
+                    % np.degrees(self.yaw_offset))
         elif name == "done":
             self.max_dps = np.full(C.N_JOINTS, SETTLE_MOTOR_DPS)
         return None
@@ -605,7 +656,7 @@ class StandSequence:
         stop, or None.
         """
         self._sweep += 1
-        self.body = body
+        self.body = body = self._measured(body)
         q, qd = body.q, body.qd
         name = self.phase_name
         elapsed = now - self.t_phase

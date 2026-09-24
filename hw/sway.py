@@ -30,9 +30,10 @@ HOW THE TRUNK IS MOVED
       2  y      the joint layer is what moves the trunk.
       n  nod    R about y.  The SRB law's pitch setpoint moves with it, so
                 the attitude loop drives the nod instead of fighting it.
-      y  shake  R about z.  The yaw setpoint moves too, but the SRB yaw
-                spring is off (KP_YAW 0, the damper only) -- the joint layer
-                is what turns the trunk.
+      y  shake  R about z.  The yaw setpoint moves with it, and since
+                2026-09-24 the SRB yaw spring is ON (KP_YAW 25) -- so the
+                attitude loop drives the shake as it does the nod, with the
+                joint layer beside it.
 
     The law's height loop is untouched throughout.  The tilt stop reads the
     MOVED setpoint while nodding.

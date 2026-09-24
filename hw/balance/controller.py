@@ -142,12 +142,14 @@ def level_attitude(yaw: float) -> np.ndarray:
     """R_des for a stand: TRUE level, facing `yaw`.  Rz(psi_0), nothing else.
 
     LATCH psi_0 WHEN TORQUE ARMS, do not track it.  Absolute yaw is the
-    magnetometer's and `hw.imu` labels it untrusted -- but with
-    `config.KP_YAW` at zero the yaw column of the error is multiplied by zero,
-    so what psi_0 actually does here is keep R_d a proper rotation near R and
-    keep the log map away from its large-angle branch.  Set KP_YAW non-zero
-    and this number starts to matter; that is the moment to check the
-    magnetometer under power first.
+    magnetometer's and `hw.imu` labels it untrusted, so psi_0 is read once and
+    never tracked -- and SINCE 2026-09-24 IT IS A NUMBER THAT MATTERS, because
+    `config.KP_YAW` is no longer zero.  The yaw column of the error is now
+    multiplied by a real gain, so psi_0 is the datum the heading is held
+    against for the rest of the run; `config.KP_YAW` says why a difference off
+    a latched heading is a fair thing to close a loop on where an absolute one
+    was not.  It also still does what it did at zero gain: keeps R_d a proper
+    rotation near R and the log map away from its large-angle branch.
 
     This is `latched_attitude` at a zero setpoint, and it is what flies with
     `config.SETPOINT_DYNAMIC` off.

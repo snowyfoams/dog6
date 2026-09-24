@@ -8,7 +8,7 @@
                  mutable default; every signature takes arrays, floats and
                  LKFParams and returns arrays or a dataclass.
     adapters/    rpy_zyx_to_R is the controller's rotation; run_once is
-                 update() with four feet down.
+                 update() with four feet down, on the floor datum.
     config/      lkf.yaml has exactly LKFParams' keys.
 """
 from __future__ import annotations
@@ -215,7 +215,10 @@ def test_run_once_is_update_with_four_feet_down():
     via_adapter.reset(R_wb, r)
     direct.reset(R_wb, r)
     for _ in range(20):
-        a = run_once(imu, legs, via_adapter, 0.002)
+        # foot_radius 0.0: this is the call-order test, and a shifted
+        # datum would hide a swapped step.  `test_height_datum.py`
+        # owns the shift.
+        a = run_once(imu, legs, via_adapter, 0.002, 0.0)
         b = direct.update(R_wb, omega_b, acc_b, r, rd, np.full(4, 0.5), 0.002)
         for field in dataclasses.fields(LKFOutput):
             np.testing.assert_array_equal(getattr(a, field.name), getattr(b, field.name))
@@ -229,6 +232,23 @@ def test_sources_cannot_be_constructed_without_a_driver():
 
 
 # -- config/ ------------------------------------------------------------------
+def test_g_is_what_dog6s_own_accelerometer_reads():
+    """Three copies of one measurement, gated against each other.
+
+    `lkf.py` subtracts g from the accelerometer every sweep, so a g that is
+    not this board's reading is a standing world-z acceleration -- 9.81 would
+    be 0.046 m/s^2 of it, which is 0.046 m/s of velocity error per second and
+    nothing in the innovation that looks wrong.
+    """
+    from hw import imu as IMU
+
+    yaml = pytest.importorskip("yaml")
+    cfg = yaml.safe_load((PKG / "config" / "lkf.yaml").read_text(encoding="utf-8"))
+    assert LKFParams().g == IMU.G_AT_REST
+    assert cfg["g"] == IMU.G_AT_REST
+    assert 9.7 < IMU.G_AT_REST < 9.9, "that is not a gravity"
+
+
 def test_lkf_yaml_has_exactly_the_LKFParams_keys():
     yaml = pytest.importorskip("yaml")
     cfg = yaml.safe_load((PKG / "config" / "lkf.yaml").read_text(encoding="utf-8"))

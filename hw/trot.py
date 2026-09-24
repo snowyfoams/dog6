@@ -11,7 +11,8 @@
 `hw.stand` plus a gait.  Everything that is not the trot is `hw.stand`'s, at
 `hw.stand`'s defaults: the normal crouch (`posture.NOMINAL`, `CROUCH`; back
 from WIDE on request 2026-09-21 -- no abduction splay), the attitude
-setpoint LATCHED in limp, and roll
+setpoint LATCHED in limp, the HEADING latched at the end of the crouch
+(below), and roll
 following `--kp-att / --kd-att` (90 / 17) -- except the tilt stop, 45 deg
 (`TILT_STOP_DEG`), and the torque-phase tracking trip, OFF
 (`TRACK_STOP_DEG`).  Every one is still a flag.
@@ -91,6 +92,53 @@ THE JOINT-SPACE LAYER, 2026-09-21
     rpy and nothing pins the trunk's xy, so the body can shift over the
     feet -- the sway demos need exactly that.
 
+THE HEADING IS ZEROED AT THE END OF THE CROUCH, 2026-09-24
+    On the handover sweep -- the crouch has arrived, torque is about to be
+    live -- the magnetometer's yaw is read once, becomes the world frame's x
+    axis, and the reported yaw goes to ZERO.  Everything after that is drift
+    off it.  `balance.state.rezero_yaw` has the arithmetic; `balance.law.arm`
+    and `balance.sequence` have the timing.
+
+    WHAT IT FIXES, AND IT IS A TROT BUG.  The heading used to stay inside R
+    while the setpoint carried a copy of it.  `log(R_des R^T)` does not
+    separate, so the heading did not come out of the log map on the yaw axis
+    alone: it TURNED the roll and pitch error into each other.  At 37 deg of
+    heading a 4.0 deg roll error reads as 3.2 deg of roll and 2.4 deg of
+    PITCH -- the trunk pushed back on the wrong axis, on two feet, which is
+    where the trot has the least to push against.  `config.KP_YAW = 0` could
+    not switch it off: it zeroes the yaw ROW of the gain, not the yaw inside
+    the log.  With the frame turned instead, the same 4.0 deg reads 4.0 deg
+    of roll and 0.0 of pitch.
+
+    DOG5'S CONVENTION, REACHED FROM THE OTHER SIDE.  DOG5 built its
+    world-from-body rotation out of roll and pitch alone (`C_from_rp`) and
+    let the heading in as a scalar beside it, so "the frame does not start
+    rotating with the heading".  DOG6 gets the whole ZYX triple from the
+    DETA10 in one matrix, so it turns the frame by the latched heading
+    instead.  Same world, same instant, same reason.
+
+AND THE YAW SPRING IS ON BECAUSE OF IT, 2026-09-24
+    `config.KP_YAW` was zero because an absolute heading loop holds the robot
+    against whatever twelve motors are doing to the magnetometer's field.
+    With the heading zeroed at the handover that is no longer what the gain
+    multiplies: it multiplies the DRIFT off a datum measured on this run, a
+    difference in which the mount offset and the room cancel.  So the spring
+    is on, at 25 against roll and pitch's 90 -- 0.80 Hz, critically damped,
+    the slowest loop on the robot, asking 0.099 N*m/deg against the 3.5 N*m
+    of yaw a trot's diagonal can make out of friction.  `config.KP_YAW` has
+    the whole sizing; `--kp-yaw 0` is the trot as it ran before today.
+
+    WHAT IT IS FOR: the trot's own heading drift.  Two feet, 40 mm of swing
+    and a touchdown that slips leave degrees of yaw per run, and the drift
+    used to be a one-way walk -- nothing pulled it back.  Now it comes back
+    with a 0.2 s time constant, five times inside one 1.2 s cycle.  What no
+    gain here reaches is the slip itself.
+
+    AND IT IS WHY `hw.trot_esti` PRINTS THE YAW ACROSS EVERY TROT.  That
+    read-out is the spring's report card, and it was the reason for turning
+    it on: the filter's xy is leg odometry, so a trunk that turns takes the
+    whole stance with it and the xy stops being a claim about the filter.
+
 VELOCITY, THE WHOLE RUN, 2026-09-21
     `hw.velocity_estimator` -- the DETA10's accelerometer integrated, biases
     taken in LIMP -- printed as `v (x, y, z) m/s` under every status line,
@@ -145,6 +193,17 @@ TAU_CAP = SAFE.TAU_HARD_NM
 #:     0.5 s    100 ms   60 ms          16.9 rad/s   73 N*m/s   past the slew
 #:
 #: The 60 N*m/s trot slew follows 0.6 s; at 0.5 s it lags every handover.
+#:
+#: THAT TABLE IS THE HANDOVER'S.  THE SWING HAS ITS OWN SLEW BILL, AND IT IS
+#: THE LARGER ONE (2026-09-24).  The arc's knee torque has to reach its peak
+#: inside a quarter of the swing, so the slew it needs is ~tau_peak / (swing
+#: / 4) -- `balance.swing.swing_demand`, printed in the banner against
+#: `--tau-slew`.  At 40 mm of apex: 160 ms of swing (this 0.8 s) needs ~200
+#: N*m/s, DOG5's 240 ms ~60, and 80 ms (a 0.4 s period at duty 0.80) ~1600
+#: with ~31 N*m at the knee -- past the 9 N*m cap, so that foot does not lift
+#: at any gain, and the trunk reads steady because it is still on four feet.
+#: The apex scales all of it linearly (`--swing-height`); the swing duration
+#: is (1 - duty) x period, so a short period needs a LOW duty to keep it.
 PERIOD_S = 0.8
 
 #: Raised from `hw.stand`'s 12 deg on request 2026-09-17, to `hw.fold_trot`'s.

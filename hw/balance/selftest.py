@@ -359,9 +359,27 @@ def main() -> int:
           gains.kp_pos[0] == 0.0 and gains.kp_pos[1] == 0.0
           and gains.kd_pos[0] == 0.0 and gains.kd_pos[1] == 0.0,
           "nothing on DOG6 measures p_c,x or p_c,y")
-    check("the yaw SPRING is off and the yaw DAMPER is not",
-          gains.kp_att[2] == 0.0 and gains.kd_att[2] > 0.0,
-          "magnetometer untrusted; gyro omega_z is fine")
+    # THE YAW SPRING IS ON SINCE 2026-09-24 and this is the arithmetic that
+    # says it is allowed to be: what it asks at a few degrees of drift has to
+    # fit inside the tangential budget of TWO feet, because a trot is where
+    # the heading actually moves.  `config.KP_YAW` has the decision.
+    yaw_nm_per_deg = np.radians(1.0) * cfg.INERTIA_BODY[2, 2] * gains.kp_att[2]
+    diagonal_nm = 0.5 * cfg.MU * cfg.WEIGHT * cfg.FOOT_RADIUS_XY
+    check("the yaw spring holds the LATCHED heading, and the damper is on",
+          gains.kp_att[2] > 0.0 and gains.kd_att[2] > 0.0,
+          "%.3f N*m/deg, zeta %.2f" % (yaw_nm_per_deg,
+                                       gains.kd_att[2]
+                                       / (2 * np.sqrt(gains.kp_att[2]))))
+    check("...and 7 deg of drift stays inside a DIAGONAL's yaw capacity",
+          7.0 * yaw_nm_per_deg < diagonal_nm,
+          "%.2f N*m asked against %.2f available on two feet"
+          % (7.0 * yaw_nm_per_deg, diagonal_nm))
+    check("...and it is the SLOWEST attitude axis, the one measurement that "
+          "can lie",
+          gains.kp_att[2] < gains.kp_att[0] and gains.kp_att[2] < gains.kp_att[1],
+          "yaw %.2f Hz against roll/pitch %.2f"
+          % (np.sqrt(gains.kp_att[2]) / (2 * np.pi),
+             np.sqrt(gains.kp_att[0]) / (2 * np.pi)))
 
     ablated = CTRL.BalanceGains().ablate_attitude()
     w_ab = CTRL.balance_wrench(rolled, cmd, np.eye(3), ablated)
@@ -614,6 +632,121 @@ def main() -> int:
               "the config statics are then the whole story, as DOG5 ran")
     finally:
         cfg.SETPOINT_DYNAMIC = _dynamic
+
+    # =====================================================================
+    print("\n9b. the heading: DOG5's yaw lock, as a turn of the world frame")
+    # =====================================================================
+    psi = np.deg2rad(37.0)
+    heading = state_at(cfg.H_CROUCH, R=C.rot_zyx(np.deg2rad(3.0), 0.0, psi),
+                       omega_b=[0.11, -0.07, 0.23])
+    zeroed = STATE.rezero_yaw(heading, psi)
+    check("rezero_yaw puts the latched heading at exactly zero",
+          abs(zeroed.yaw) < 1e-12 and abs(zeroed.yaw_offset - psi) < 1e-12,
+          "%+.1f deg in, %+.3g deg out" % (np.degrees(heading.yaw),
+                                           np.degrees(zeroed.yaw)))
+    close("...and world x IS the trunk's nose: R's first column",
+          zeroed.R @ np.array([1.0, 0.0, 0.0]),
+          C.rot_zyx(np.deg2rad(3.0), 0.0, 0.0) @ np.array([1.0, 0.0, 0.0]),
+          1e-12)
+    close("...roll and pitch are untouched -- Rz changes neither",
+          [zeroed.roll, zeroed.pitch], [heading.roll, heading.pitch], 1e-15,
+          " rad")
+    close("...and so is the whole height chain: (Rz v)_z == v_z",
+          [zeroed.h, zeroed.p_cz, zeroed.zdot_origin, zeroed.p_cz_dot],
+          [heading.h, heading.p_cz, heading.zdot_origin, heading.p_cz_dot],
+          0.0, " m")
+    close("the two world-frame vectors turn WITH the frame, exactly",
+          np.vstack([zeroed.omega_w, zeroed.r_w]),
+          np.vstack([C.rot_z(-psi) @ heading.omega_w,
+                     heading.r_w @ C.rot_z(-psi).T]), 1e-15)
+    check("a second rezero to the same heading is a no-op",
+          STATE.rezero_yaw(zeroed, psi) is zeroed,
+          "the state carries the frame it is in, so advance and update may "
+          "both call it")
+
+    # THE BUG THIS REPLACES, WRITTEN OUT.  log(R_des R^T) does not separate:
+    # a heading left inside R does not come out of the log map on the yaw
+    # axis alone, so it is NOT something KP_YAW = 0 can switch off.
+    roll_err = np.deg2rad(4.0)
+    R_off = C.rot_zyx(roll_err, 0.0, psi)          # 4 deg of roll, 37 of yaw
+    leak = C.log_so3(C.rot_zyx(0.0, 0.0, psi) @ R_off.T)
+    check("a heading inside R leaks roll into PITCH through the log map",
+          abs(leak[1]) > 0.1 * abs(leak[0]) and abs(leak[0]) < 0.99 * roll_err,
+          "4 deg roll at %.0f deg heading -> %+.2f roll, %+.2f PITCH deg"
+          % (np.degrees(psi), *np.degrees(leak[:2])))
+    clean = C.log_so3(np.eye(3) @ STATE.rezero_yaw(
+        state_at(cfg.H_CROUCH, R=R_off), psi).R.T)
+    check("...and with the frame turned instead, the leak is GONE",
+          abs(clean[1]) < 1e-12 and abs(abs(clean[0]) - roll_err) < 1e-12,
+          "the same 4 deg reads %+.2f roll, %+.2g pitch deg"
+          % (np.degrees(clean[0]), np.degrees(clean[1])))
+
+    # arm: the latch and the turn are one instant.
+    armed_yaw = LAW.BalanceLaw()
+    armed_yaw.latch_setpoint(heading)
+    armed_yaw.arm(0.0, heading)
+    check("arm latches the heading and sets sp_yaw to EXACTLY zero",
+          abs(armed_yaw.yaw_offset - psi) < 1e-12 and armed_yaw.sp_yaw == 0.0,
+          "yaw_offset %+.1f deg" % np.degrees(armed_yaw.yaw_offset))
+    at_arm = STATE.rezero_yaw(heading, armed_yaw.yaw_offset)
+    close("...so e_R is exactly zero on the arming sweep, at ANY heading",
+          C.log_so3(armed_yaw.R_des @ at_arm.R.T), np.zeros(3), 1e-12, " rad")
+    # The same at rest, where the rate term is not also in the answer: the
+    # ARM cannot step the wrench, which is the property the latch exists for.
+    still = state_at(cfg.H_CROUCH, R=C.rot_zyx(np.deg2rad(3.0), 0.0, psi))
+    still_law = LAW.BalanceLaw()
+    still_law.latch_setpoint(still)
+    still_law.arm(0.0, still)
+    still = STATE.rezero_yaw(still, still_law.yaw_offset)
+    close("...and the attitude half of the wrench with it",
+          CTRL.balance_wrench(still, REF.com_command(
+              still_law.ramp.at(0.0), still.R), still_law.R_des,
+              still_law.gains).b_d[3:], np.zeros(3), 1e-9, " N*m")
+    check("yaw error then reads DRIFT off the latch, not the magnetometer",
+          abs(armed_yaw.attitude_error_deg(
+              STATE.rezero_yaw(
+                  state_at(cfg.H_CROUCH,
+                           R=C.rot_zyx(0.0, 0.0, psi + np.deg2rad(6.0))),
+                  armed_yaw.yaw_offset))[2] - 6.0) < 1e-9,
+          "6 deg off the latched heading reads +6.0 deg")
+    # arm reads the RAW heading, so it lands on the same offset whether the
+    # state it is handed has been through rezero_yaw already or not.
+    rearmed = LAW.BalanceLaw()
+    rearmed.arm(0.0, at_arm)
+    close("arm recovers the raw heading from an already-turned state",
+          rearmed.yaw_offset, armed_yaw.yaw_offset, 1e-12, " rad")
+
+    # -- and through the phase machine, which is where it actually fires ---
+    faced = state_at(cfg.H_CROUCH, R=C.rot_zyx(0.0, 0.0, psi))
+    seq_y = SEQ.StandSequence(SAFE.SafetyGate(3.0), law="srb")
+    t_y = 0.0
+    seq_y.update(t_y, faced)                     # limp
+    check("through LIMP, SETTLE and CROUCH the world is the magnetometer's",
+          seq_y.yaw_offset == 0.0 and abs(seq_y.body.yaw - psi) < 1e-12,
+          "nothing is being held yet, so there is nothing to pin it to")
+    for wait_s in (0.0, ST.RAMP_POSITION + 1.0, 0.0):
+        assert seq_y.advance(t_y, faced.q) is None
+        seq_y.update(t_y, faced)
+        t_y += wait_s
+        seq_y.update(t_y, faced)
+    assert seq_y.phase_name == "rise", seq_y.phase_name
+    check("the CROUCH -> RISE handover latches it and zeroes the yaw",
+          abs(seq_y.yaw_offset - psi) < 1e-12
+          and abs(seq_y.body.yaw) < 1e-12,
+          "offset %+.1f deg, yaw now %+.3g deg"
+          % (np.degrees(seq_y.yaw_offset), np.degrees(seq_y.body.yaw)))
+    check("...on the ARMING sweep, not the one after",
+          abs(seq_y.balance.attitude_error_deg(seq_y.body)[2]) < 1e-12,
+          "the yaw error is zero the instant the heading is taken")
+    check("...and the operator is told, with the reading that was taken",
+          "%+.1f" % np.degrees(psi) in (seq_y.notice or ""),
+          (seq_y.notice or "").splitlines()[0])
+    seq_y.update(t_y, state_at(cfg.H_CROUCH,
+                               R=C.rot_zyx(0.0, 0.0, psi + np.deg2rad(6.0))))
+    check("a later sweep off the magnetometer's world is turned too",
+          abs(np.degrees(seq_y.body.yaw) - 6.0) < 1e-9,
+          "6 deg of heading drift reads +6.0 deg, not %+.0f"
+          % np.degrees(psi + np.deg2rad(6.0)))
 
     # =====================================================================
     print("\n10. RISE and HOLD: the phase the controller is WATCHED in")

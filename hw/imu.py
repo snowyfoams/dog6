@@ -42,11 +42,15 @@ SIGN CONVENTIONS IN THE TRUNK (FLU) FRAME
         yaw_body   = -heading_sensor
         rates      = (wx, -wy, -wz)_sensor
 
-YAW IS EXPOSED AND UNTRUSTED.  It is magnetometer-based and the magnetometer
-    sits next to twelve motors and a steel frame.  Fine for display; do NOT
-    close a loop on it until it has been watched under power.  `yaw_rate` is
-    different -- it is the gyro's wz, inertial, and fine for short-horizon
-    relative heading.
+YAW IS EXPOSED AND UNTRUSTED AS AN ABSOLUTE HEADING.  It is magnetometer-based
+    and the magnetometer sits next to twelve motors and a steel frame.  Where
+    it is now closed on, 2026-09-24, it is closed on a DIFFERENCE: `hw.balance`
+    latches this yaw once at the crouch handover, `balance.state.rezero_yaw`
+    turns the world frame onto it, and `config.KP_YAW` acts on the drift off
+    that datum -- minutes, not norths, and the mount offset and the room's
+    field cancel out of it.  Nothing here should be fed to a loop as an
+    absolute heading.  `yaw_rate` is different again -- it is the gyro's wz,
+    inertial, and fine for short-horizon relative heading.
 
 THE SIGNS ARE VERIFIED.  DOG6 mounts the same DETA10 the same way as DOG5,
     so DOG5's frame work describes DOG6.  What was done, from
@@ -73,7 +77,7 @@ import json
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -105,6 +109,7 @@ DEFAULT_PORT = "/dev/fdilink_imu"
 DEFAULT_CALIB_PATH = Path(__file__).resolve().parent / "imu_calib.json"
 
 __all__ = ["ImuDog", "TrunkAttitude", "TrunkOrientation", "SENSOR_TO_FLU",
+           "G_AT_REST",
            "SENSOR_TO_TRUNK", "sensor_to_trunk", "trunk_rotation", "wrap_deg",
            "MAX_AGE_S", "DEFAULT_PORT", "DEFAULT_CALIB_PATH", "describe"]
 
@@ -118,6 +123,19 @@ MAX_AGE_S = 0.05
 #: Rx(180 deg).  A property of the sensor, not of the mounting -- see the
 #: module docstring.  Its own inverse.
 SENSOR_TO_FLU = np.diag([1.0, -1.0, -1.0])
+
+#: m/s^2, what THIS board's accelerometer reads with the trunk level and
+#: still -- the magnitude of the specific force, measured on 2026-09-24 over
+#: 5 s at 100 Hz: mean |a| = 9.7639, per-axis sigma 0.009.  Local g in
+#: Singapore is 9.7807, so the board reads 0.017 low; the rest of the gap to
+#: 9.81 is latitude, not the sensor.
+#:
+#: IT IS THE NUMBER `hw.state_estimator`'s `LKFParams.g` HAS TO CARRY, because
+#: the filter forms a_w = R acc_b + (0, 0, -g): any difference between this
+#: reading and that constant is a standing world-z acceleration, and a
+#: standing acceleration is a drifting velocity.  `tests/test_layers.py` gates
+#: the two against each other.
+G_AT_REST = 9.764
 
 #: R_{trunk <- sensor}: the two composed.  `coordinates.R_BODY_IMU` is the
 #: mounting rotation and is the identity BY MEASUREMENT -- the board is
@@ -212,8 +230,18 @@ class TrunkOrientation:
     omega_b: np.ndarray      # (3,)    rad/s in the TRUNK frame -- the gyro's
     roll: float              # rad, trimmed.  For the tilt trip and the log,
     pitch: float             # rad, trimmed.  NOT for the control law.
-    yaw: float               # rad, magnetometer -- UNTRUSTED, display only
+    yaw: float               # rad, magnetometer -- UNTRUSTED as an absolute
+    #                          heading; held against the latched one (KP_YAW)
     age_s: float             # host seconds since the packet arrived
+    #: (3,) m/s^2, SPECIFIC FORCE in the TRUNK frame -- (0, 0, +G_AT_REST)
+    #: level and still, gravity NOT separated.  It comes off the DETA10's
+    #: 0x40 stream, a different packet from the attitude above, so it has its
+    #: own age.  NaN until a 0x40 packet has arrived, on purpose: this is
+    #: `sp_yaw`'s rule, that saying "no reading" beats reporting a zero, and
+    #: `state_estimator.adapters.robot_io` asks its `ImuSource` to reject a
+    #: non-finite sample rather than let one reach the filter.
+    acc_b: np.ndarray = field(default_factory=lambda: np.full(3, np.nan))
+    acc_age_s: float = float("inf")    # host seconds since the 0x40 packet
 
     @property
     def omega_w(self) -> np.ndarray:
@@ -235,8 +263,15 @@ class TrunkOrientation:
         FOR OFFLINE TESTS AND FOR THE NO-IMU PATH ONLY.  `age_s` is zero, so
         `is_stale` says fresh: anything that accepts this is asserting it does
         not need an IMU, and `hw.stand --no-imu` is the only caller that does.
+
+        A LEVEL, MOTIONLESS TRUNK READS (0, 0, +g), NOT ZERO.  The
+        accelerometer measures specific force, so the one reading that means
+        "not accelerating" is the one that looks like gravity; handing back
+        zeros here would tell a filter the robot is in free fall.
         """
-        return TrunkOrientation(np.eye(3), np.zeros(3), 0.0, 0.0, 0.0, 0.0)
+        return TrunkOrientation(np.eye(3), np.zeros(3), 0.0, 0.0, 0.0, 0.0,
+                                acc_b=np.array([0.0, 0.0, G_AT_REST]),
+                                acc_age_s=0.0)
 
 
 class ImuDog:
@@ -259,7 +294,15 @@ class ImuDog:
         self.pitch_offset_deg = 0.0
         self._last_ahrs = None
         self._last_rx_mono: float = 0.0
+        # The 0x40 (inertial) and 0x41 (fused attitude) streams are separate
+        # packets on separate callbacks, each ~100 Hz.  They are stored apart
+        # and aged apart: one arrival is not evidence the other arrived, and a
+        # shared timestamp would hide a dead accelerometer behind a live AHRS.
+        self._last_imu_pkt = None
+        self._last_imu_rx_mono: float = 0.0
+        self._imu_listeners: list = []
         self._imu.on_ahrs(self._on_ahrs)
+        self._imu.on_imu(self._on_imu)
         self.load_calib()
 
     # -- lifecycle ---------------------------------------------------------
@@ -294,6 +337,12 @@ class ImuDog:
             return float("inf")
         return time.monotonic() - self._last_rx_mono
 
+    def acc_age_s(self) -> float:
+        """Host time since the last 0x40 packet (inf before the first one)."""
+        if self._last_imu_rx_mono == 0.0:
+            return float("inf")
+        return time.monotonic() - self._last_imu_rx_mono
+
     def is_stale(self, max_age_s: float = 0.05) -> bool:
         return self.age_s() > max_age_s
 
@@ -301,6 +350,40 @@ class ImuDog:
     def _on_ahrs(self, a) -> None:
         self._last_ahrs = a
         self._last_rx_mono = time.monotonic()
+
+    def _on_imu(self, d) -> None:
+        """The 0x40 packet: gyro, accelerometer, magnetometer, in NED.
+
+        Only the accelerometer is taken.  The gyro here and the AHRS packet's
+        `angular_rates` agree to 0.004 rad/s (measured 2026-09-24, 504 pairs),
+        so the rate the law already runs on is left exactly where it was
+        rather than made to depend on which of two streams arrived last.
+
+        The packet is stored BEFORE the listeners run: a listener that raises
+        must not also cost this sweep its accelerometer.
+        """
+        self._last_imu_pkt = d
+        self._last_imu_rx_mono = time.monotonic()
+        for cb in self._imu_listeners:
+            cb(d)
+
+    def add_imu_listener(self, cb) -> None:
+        """Also call `cb(IMUData)` on every 0x40 packet, on the reader thread.
+
+        THE VENDOR SDK HOLDS ONE CALLBACK PER STREAM.  `DETA10.on_imu`
+        ASSIGNS -- `self._imu_cb = cb` -- so a second subscriber that
+        registers itself with the device does not join the first, it REPLACES
+        it, silently, with no error and no dropped packets to notice.
+        `ImuDog` owns that one slot and fans out here instead.
+
+        `hw.velocity_estimator.ImuRawFeed` is the other subscriber, and it is
+        built AFTER this object, so before this method existed it won: the
+        raw feed got its samples, `orientation().acc_b` stayed NaN for the
+        whole run, and the two failures cancelled out of every status line.
+        `hw.stand` builds both on the same `ImuDog` whenever `--velocity` and
+        the estimator run together, which is the run they are for.
+        """
+        self._imu_listeners.append(cb)
 
     def sample(self) -> Optional[TrunkAttitude]:
         a = self._last_ahrs
@@ -339,6 +422,9 @@ class ImuDog:
         roll = math.radians(attitude.roll_deg)
         pitch = math.radians(attitude.pitch_deg)
         yaw = math.radians(attitude.yaw_deg)
+        d = self._last_imu_pkt
+        acc_b = (SENSOR_TO_TRUNK @ np.asarray(d.accel, dtype=float)
+                 if d is not None else np.full(3, np.nan))
         return TrunkOrientation(
             R=trunk_rotation(roll, pitch, yaw),
             omega_b=np.deg2rad([attitude.roll_rate_dps,
@@ -346,6 +432,8 @@ class ImuDog:
                                 attitude.yaw_rate_dps]),
             roll=roll, pitch=pitch, yaw=yaw,
             age_s=attitude.age_s,
+            acc_b=acc_b,
+            acc_age_s=self.acc_age_s(),
         )
 
     # -- the mounting TRIM (not the mounting rotation) ---------------------
@@ -428,6 +516,10 @@ def describe() -> str:
         "  SENSOR_TO_TRUNK %s" % np.array2string(SENSOR_TO_TRUNK,
                                                  precision=3).replace("\n", "\n"
                                                                       + " " * 18),
+        "  accelerometer   0x40 stream, SPECIFIC force; SENSOR_TO_TRUNK puts "
+        "it at",
+        "                  (0, 0, +%.3f) level at rest -- G_AT_REST, measured"
+        % G_AT_REST,
         "  trim file       %s" % (DEFAULT_CALIB_PATH if trim else
                                   "%s (absent -- no trim captured)"
                                   % DEFAULT_CALIB_PATH.name),

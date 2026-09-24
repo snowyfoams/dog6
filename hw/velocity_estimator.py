@@ -324,7 +324,11 @@ class ImuRawFeed:
         self._buf: collections.deque = collections.deque(maxlen=maxlen)
         self._lock = threading.Lock()
         self._last: Optional[ImuSample] = None
-        self.imu._imu.on_imu(self._on_imu)
+        # THROUGH `ImuDog`, NOT THROUGH THE DEVICE.  `DETA10.on_imu`
+        # assigns its one callback slot, so registering here directly would
+        # replace `ImuDog`'s own 0x40 handler and leave `orientation().acc_b`
+        # NaN for the run.  `add_imu_listener` fans out instead.
+        self.imu.add_imu_listener(self._on_imu)
 
     def _on_imu(self, d) -> None:
         a = self.imu._last_ahrs        # the AHRS this packet arrived under

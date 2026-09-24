@@ -23,6 +23,21 @@ THE THREE CROSSINGS, AND TWO OF THEM ARE HERE
     convention exists to prevent is a body-frame vector reaching a world-frame
     equation and being absorbed as a small calibration error.
 
+WHICH WORLD, THOUGH -- THE HEADING IS PINNED, NOT TRACKED
+    `read` builds R from the DETA10's full ZYX triple, so the world it hands
+    back is the MAGNETOMETER'S: x points wherever the magnetometer calls
+    north.  That frame is not a frame to control in.  The magnetometer sits
+    next to twelve motors and `hw.imu` labels its yaw untrusted, so a world
+    pinned to it turns whenever the motors load up.
+
+    `rezero_yaw` pins it instead.  `sequence` calls it with the heading
+    measured at the handover -- the sweep after the crouch, the first sweep
+    torque is live -- and from there on world x is where the trunk was
+    pointing and the reported yaw is the heading error, zero on the sweep it
+    was taken.  `BodyState.yaw_offset` says which world a given measurement
+    is in.  DOG5's `C_from_rp` convention; `rezero_yaw` has the arithmetic
+    and the reason.
+
 THE HEIGHT, AND WHY IT IS THREE NUMBERS
     The kinematics give the TRUNK ORIGIN; the operator reads the TRUNK BOTTOM;
     the PD needs the CoM.  One chain, and only the last step is not a constant:
@@ -84,8 +99,13 @@ from sim import params as P          # noqa: E402
 from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
 
-__all__ = ["BodyState", "read", "on_stance", "height_to_origin",
+__all__ = ["BodyState", "read", "on_stance", "rezero_yaw", "height_to_origin",
            "origin_to_height"]
+
+
+def _wrap_pi(a: float) -> float:
+    """Wrap to (-pi, pi]."""
+    return float(np.remainder(a + np.pi, 2.0 * np.pi) - np.pi)
 
 
 def origin_to_height(z_origin: float) -> float:
@@ -127,6 +147,14 @@ class BodyState:
     p_cz: float              # m, CoM height, WORLD.  What the PD regulates
     zdot_origin: float       # m/s
     p_cz_dot: float          # m/s
+
+    #: rad, the magnetometer heading the world frame's x axis is pinned to --
+    #: `rezero_yaw`.  0.0 means "the world is the magnetometer's own", which
+    #: is what every sweep before the handover reports.  It is carried on the
+    #: state rather than held beside it so that a second rezero to the same
+    #: heading is a no-op: which world frame this measurement is in is a
+    #: property of the measurement.
+    yaw_offset: float = 0.0
 
     @property
     def tilt_deg(self) -> float:
@@ -245,3 +273,48 @@ def on_stance(state: BodyState, stance, srb=None) -> BodyState:
                    p_cz=z_origin + float(com_w[2]), zdot_origin=zdot_origin,
                    p_cz_dot=zdot_origin + float(w[0] * com_w[1]
                                                 - w[1] * com_w[0]))
+
+
+def rezero_yaw(state: BodyState, yaw_offset: float) -> BodyState:
+    """`state` in the world frame whose x axis is the heading `yaw_offset`.
+
+    DOG5'S "WORLD := BODY HERE", PORTED.  DOG5's estimator built its
+    world-from-body rotation from roll and pitch alone (`C_from_rp`) and let
+    the heading enter the wrench as a SCALAR beside it, so that -- its words
+    -- "the frame does not start rotating with the heading".  DOG6 gets the
+    full ZYX triple from the DETA10 in one matrix, so the same convention is
+    reached from the other side: turn the world frame by the heading that was
+    measured at the handover, and from that sweep on the reported yaw IS the
+    heading error and the world's x axis IS where the trunk was pointing.
+
+    THIS IS WHY IT MATTERS, AND IT IS NOT COSMETIC.  `controller` forms the
+    attitude error as ``log(R_des R^T)``, and the log map does not separate.
+    With a heading error of psi still inside R, a pure roll error r does not
+    come out as ``(r, 0, -psi)``: the roll correction is scaled by
+    ``(psi/2)/tan(psi/2)`` and a term ``r*psi/2`` is delivered about the world
+    Y AXIS instead -- a phantom PITCH moment made out of a magnetometer
+    reading.  At psi = 90 deg that is 21 % of the roll correction lost and
+    39 % of it misdirected.  Zeroing `config.KP_YAW` does not help: it zeroes
+    the yaw ROW of the gain, not the yaw inside the log.
+
+    IT IS EXACT, AND IT TOUCHES FOUR FIELDS.  Rz commutes with everything the
+    height chain reads -- ``(Rz v)_z = v_z``, and ``Rz(a x b) = Rz a x Rz b``
+    -- so z_origin, h, p_cz and both rates come through untouched and are not
+    recomputed.  The attitude pair is untouched for the same reason: a
+    rotation about world z changes no roll and no pitch.  What moves is R,
+    the two world-frame vectors built from it, and the yaw scalar.
+
+    A SECOND CALL AT THE SAME HEADING IS A NO-OP, because the state carries
+    the frame it is already in.  That is what lets `sequence` rezero on both
+    the `advance` and the `update` path without subtracting the offset twice.
+    """
+    psi = float(yaw_offset) - float(state.yaw_offset)
+    if psi == 0.0:
+        return state
+    Rz = C.rot_z(-psi)
+    return replace(state,
+                   R=Rz @ state.R,
+                   yaw=_wrap_pi(state.yaw - psi),
+                   omega_w=Rz @ state.omega_w,
+                   r_w=state.r_w @ Rz.T,
+                   yaw_offset=float(yaw_offset))

@@ -210,6 +210,11 @@ class BalanceLaw:
     #: impedance the nominal and wide trots flew; "joint" is the fold's: the
     #: same z-only arc through the IK, abd held, joint PD.  See swing.py.
     swing: str = "cartesian"
+    #: m, the swing apex above the resting foot.  `config.SWING_HEIGHT` (40 mm,
+    #: DOG5's) unless the entry point says otherwise -- `--swing-height`.  It
+    #: is the one number that scales the whole swing demand (speed, torque,
+    #: slew) linearly, so it is the first thing to lower for a short swing.
+    swing_height: float = cfg.SWING_HEIGHT
     #: The joint-space layer, `config.KP_JOINT_HOLD`: live only while
     #: `hold_joints` has latched a pose.  OFF (0 / 0) unless the entry point
     #: passes gains -- the trot entry points do, the plain stand does not.
@@ -254,8 +259,18 @@ class BalanceLaw:
         self.sp_pitch = float(np.radians(cfg.SETPOINT_PITCH_DEG))
         #: The heading half, latched by `arm`.  NaN until then -- there is no
         #: yaw reference before torque is live and saying so beats reporting
-        #: an error against zero.
+        #: an error against zero.  `arm` sets it to EXACTLY ZERO, because by
+        #: then the world frame has been turned onto the measured heading:
+        #: see `yaw_offset`.
         self.sp_yaw = float("nan")
+        #: rad, the magnetometer heading the world frame is pinned to -- what
+        #: `state.rezero_yaw` is called with for the rest of the run.  `arm`
+        #: latches it from the reading at the handover; 0.0 until then means
+        #: "the magnetometer's own world", which is what LIMP through CROUCH
+        #: report.  This is DOG5's yaw lock: the number is the same one
+        #: `yaw_ref` held, and zeroing the frame by it is DOG5's "world :=
+        #: body here".
+        self.yaw_offset = 0.0
         #: (3,) rad, roll/pitch/yaw ADDED to the setpoint -- `offset_attitude`.
         #: Zero except while `hw.sway` nods or shakes the trunk.
         self.att_offset = np.zeros(3)
@@ -360,11 +375,27 @@ class BalanceLaw:
         Roll and pitch were latched earlier, at LIMP, because by the time this
         runs the crouch has already put the trunk on the floor and its lean is
         not what "level" should mean.
+
+        AND THE LATCH TURNS THE WORLD, IT DOES NOT JUST RECORD A NUMBER.  The
+        heading read here becomes `yaw_offset`, `state.rezero_yaw` turns the
+        world frame onto it for every sweep after this one, and `sp_yaw` is
+        then zero rather than a magnetometer reading.  Carrying it as a
+        nonzero setpoint instead -- which is what this did before -- left the
+        measured heading inside R, and `state.rezero_yaw` sets out what the
+        SO(3) log map then does with it: the roll correction is attenuated
+        and part of it comes out as pitch.  Latching the same number at the
+        same instant and turning the frame by it costs one 3x3 product a
+        sweep and leaves nothing for the log map to mix.
+
+        `state` is read in whatever world frame it arrived in, so the raw
+        heading is its yaw plus its own offset.  At the handover that offset
+        is zero; the sum is written out so a re-arm cannot double-count.
         """
         self.t0 = float(now)
         self.h0 = float(state.h)
         self.ramp = REF.Quintic.ramp(self.h0, self.h_lift, self.rise_s)
-        self.sp_yaw = float(state.yaw)
+        self.yaw_offset = float(state.yaw) + float(state.yaw_offset)
+        self.sp_yaw = 0.0
         self.R_des = CTRL.latched_attitude(self.sp_roll, self.sp_pitch,
                                            self.sp_yaw)
         self.gravity = TRQ.all_leg_gravity_torque(state.q, state.R)
@@ -526,6 +557,7 @@ class BalanceLaw:
                 for i in np.flatnonzero(swinging):
                     p, v = SWING.swing_reference(rest[i], float(swing_s[i]),
                                                  gait.swing_duration,
+                                                 height=self.swing_height,
                                                  land_b=land[i])
                     p_swing[i] = p
                     if self.swing == "joint":
@@ -544,10 +576,12 @@ class BalanceLaw:
                             self._lift_q[i] = q4[i]
                         qj, qdj = SWING.joint_swing_reference(
                             i, self._lift_x[i], float(swing_s[i]),
-                            gait.swing_duration, self._lift_q[i])
+                            gait.swing_duration, self._lift_q[i],
+                            height=self.swing_height)
                         p_swing[i] = SWING.swing_reference(
                             self._lift_x[i], float(swing_s[i]),
-                            gait.swing_duration)[0]
+                            gait.swing_duration,
+                            height=self.swing_height)[0]
                         tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
                             state, i, qj, qdj)
                     else:
@@ -635,4 +669,8 @@ class BalanceLaw:
             % (np.degrees(self.sp_roll), np.degrees(self.sp_pitch),
                "latched at limp" if self.setpoint_latched
                else "config statics -- NOT latched"),
+            "  heading         %s"
+            % ("%+.1f deg at the handover, then world x -- yaw since is "
+               "drift off it" % np.degrees(self.yaw_offset) if self.armed
+               else "never latched -- the run did not reach the rise"),
         ])

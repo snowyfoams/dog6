@@ -105,6 +105,14 @@ T_RISE = float(ST.RAMP_LIFT)                                    # 3.0 s
 #: conditioning is constant too.  [CAD, via sim.stand]
 FOOT_XY = np.array(ST.FOOT_XY, dtype=float)
 
+#: m, THE STANCE'S YAW LEVER: |foot xy| from the trunk origin, all four equal
+#: at 246 mm.  A yaw moment has no normal-force component to be made out of --
+#: fz is straight down and its moment about z is zero -- so it is tangential
+#: friction across this arm and nothing else, which is what bounds `KP_YAW`.
+#: [DERIVED from FOOT_XY + HIP_OFFSET]
+FOOT_RADIUS_XY = float(np.linalg.norm(
+    np.asarray(P.HIP_OFFSET)[:, :2] + FOOT_XY, axis=1).mean())
+
 
 # ===========================================================================
 # the single-rigid-body model -- FIXED, see the module docstring
@@ -214,13 +222,40 @@ KD_Z = 25.0             # 1/s     -> zeta 0.99
 KP_ATT = 90.0           # 1/s^2   -> 1.51 Hz
 KD_ATT = 17.0           # 1/s     -> zeta 0.90
 
-#: Yaw.  THE SPRING IS OFF AND THAT IS A DECISION, NOT A PLACEHOLDER.
-#: Absolute yaw comes from the magnetometer, which sits beside twelve motors
-#: and a steel frame; `hw.imu` labels it untrusted, and closing a loop on it
-#: would hold the robot against whatever the frame is doing to the field.  The
-#: yaw RATE is the gyro's omega_z -- inertial, fine -- so the DAMPER stays on.
-KP_YAW = 0.0            # 1/s^2
-KD_YAW = 10.0           # 1/s
+#: Yaw.  THE SPRING IS ON AS OF 2026-09-24, AND WHAT TURNED IT ON IS THE
+#: HEADING REZERO, NOT A NEW MAGNETOMETER.  It was off because an absolute
+#: heading loop holds the robot against whatever twelve motors and a steel
+#: frame are doing to the field.  `law.BalanceLaw.arm` now latches the heading
+#: at the crouch -> rise handover and `state.rezero_yaw` turns the world frame
+#: onto it, so what multiplies this gain is DRIFT OFF A DATUM MEASURED ON THIS
+#: RUN, minutes old -- a difference, in which the mount's own offset and the
+#: room's field cancel.  That is the quantity a magnetometer beside motors is
+#: least bad at, and it is the quantity the trot moves: `hw.trot_esti` prints
+#: the yaw a trot puts in, and it is degrees, not tenths.
+#:
+#: IT CANNOT ACT BEFORE THE LATCH.  `R_des` is built in `arm` and no moment
+#: is asked for until then, so there is no sweep on which this gain is applied
+#: to a raw magnetometer reading.
+#:
+#: SIZED AGAINST THE YAW CAPACITY A DIAGONAL HAS, NOT THE ONE FOUR FEET HAVE.
+#: Yaw moment is tangential friction across `FOOT_RADIUS_XY`: mu * W * r =
+#: 7.1 N*m on four feet, 3.5 on the two of a trot.  Izz * kp = 5.70 N*m/rad =
+#: 0.099 N*m/deg, so the drift a trot actually leaves -- degrees, not tens of
+#: them -- asks 0.7 N*m at 7 deg, a fifth of the diagonal's budget, and the
+#: cone clamps rather than the gain winning only past about 36 deg.  KP_ATT
+#: (90) would ask 2.5 N*m at the same 7 deg and spend 71 % of that budget
+#: competing with the roll and pitch moments for it, on two feet, which is
+#: where the trot has the least to push against.
+#:
+#: 0.80 Hz AGAINST ROLL/PITCH'S 1.51 IS DELIBERATE: the heading is the
+#: SLOWEST loop on the robot, because it is the one attitude axis whose
+#: measurement can lie.  zeta 1.00 goes with that -- a critically damped yaw
+#: loop cannot ring on a magnetometer glitch, and the accumulated drift still
+#: comes back with a 0.2 s time constant, five times inside one trot cycle.
+#: What is left over is slip at touchdown, which no gain here reaches.
+#: [UNTUNED -- `--kp-yaw` sweeps it, `--kp-yaw 0` is the old behaviour]
+KP_YAW = 25.0           # 1/s^2   -> 0.80 Hz
+KD_YAW = 10.0           # 1/s     -> zeta 1.00, the gyro's omega_z
 
 #: Horizontal CoM.  BOTH OFF, AND THIS IS NOT A TUNING EITHER.  p_c,x and
 #: p_c,y are WORLD coordinates and nothing on DOG6 measures them -- there is
@@ -465,8 +500,15 @@ def describe() -> str:
         "    roll/pitch  kp %6.1f  kd %5.1f   -> %.2f Hz, zeta %.2f"
         % (KP_ATT, KD_ATT, np.sqrt(KP_ATT) / (2 * np.pi),
            KD_ATT / (2 * np.sqrt(KP_ATT))),
-        "    yaw         kp %6.1f  kd %5.1f   -- spring OFF: magnetometer"
-        % (KP_YAW, KD_YAW),
+        "    yaw         kp %6.1f  kd %5.1f   -> %s"
+        % (KP_YAW, KD_YAW,
+           "spring OFF: the damper only" if not KP_YAW else
+           "%.2f Hz, zeta %.2f -- DRIFT off the latched heading"
+           % (np.sqrt(KP_YAW) / (2 * np.pi), KD_YAW / (2 * np.sqrt(KP_YAW)))),
+        "                asks %.3f N*m/deg against %.1f N*m of yaw capacity "
+        "on four feet, %.1f on a trot's diagonal"
+        % (np.radians(1.0) * INERTIA_BODY[2, 2] * KP_YAW,
+           MU * WEIGHT * FOOT_RADIUS_XY, 0.5 * MU * WEIGHT * FOOT_RADIUS_XY),
         "    CoM x,y     kp %6.1f  kd %5.1f   -- OFF: nothing measures them"
         % (KP_XY, KD_XY),
         "  saturation: kp_att on this inertia is %.2f N*m/rad in roll and"

@@ -14,7 +14,8 @@ The six noise defaults are MIT's Mini Cheetah numbers under shorter names.
     suspect_gain   an untrusted leg's noise is scaled by
                    s = 1 + suspect_gain * (1 - trust)
     P0             the covariance `reset` starts from, P = P0 * I
-    g              m/s^2, what a level accelerometer at rest reads
+    g              m/s^2, what a level accelerometer at rest reads --
+                   DOG6's OWN BOARD, not 9.81; see the field below
 
 All six noise terms are variance scales; `matrices` is where each one lands.
 """
@@ -40,7 +41,15 @@ class LKFParams:
     trust_window: float = 0.2
     suspect_gain: float = 100.0
     P0: float = 100.0
-    g: float = 9.81
+    #: m/s^2.  NOT 9.81 and not a constant of nature: it is what THIS
+    #: accelerometer reads level and at rest, 9.764, measured 2026-09-24 and
+    #: kept in `hw.imu.G_AT_REST`, which `tests/test_layers.py` gates this
+    #: against.  `lkf.py` forms a_w = R acc_b + (0, 0, -g), so g and the
+    #: sensor are subtracted from each other every sweep: the gap between
+    #: them is not noise that averages away, it is a standing world-z
+    #: acceleration, and a standing acceleration is a drifting velocity.
+    #: 9.81 here would have been 0.046 m/s^2 of it.
+    g: float = 9.764
 
 
 @dataclass(frozen=True)
@@ -51,7 +60,9 @@ class LKFOutput:
     is under the trunk origin at the moment of reset, and z = 0 is the mean
     height of the planted feet's `r` points.  So p_w[2] is the height of the
     trunk ORIGIN above THOSE POINTS, not above the floor -- if `r` is a foot
-    ball's centre, the floor is one ball radius lower.
+    ball's centre, the floor is one ball radius lower.  `adapters.to_floor`
+    is where that radius is added, and an output from `adapters.run_once` has
+    already had it; a raw `update` has not.
     """
 
     p_w: np.ndarray      # (3,)   trunk origin, WORLD, m.  x/y drift: odometry

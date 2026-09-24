@@ -11,8 +11,18 @@
                                                      --kp-att / --kd-att
     $V -m hw.stand --kp-att 120 --kp-roll 290        pitch 120, roll 290; roll
                                                      kd follows --kd-att (17)
+    $V -m hw.stand --kp-yaw 25 --kd-yaw 10          the HEADING spring, on
+                                                     since 2026-09-24
+    $V -m hw.stand --kp-yaw 0                        the damper-only yaw this
+                                                     ran with before that
     --kp-roll and --kd-roll are independent: pass one and the other follows
     --kp-att / --kd-att.  The banner prints what each axis actually got.
+
+    THE YAW SPRING HOLDS A DRIFT, NOT A NORTH.  It acts on the heading error
+    off the yaw latched at the crouch -> rise handover, which is what makes a
+    magnetometer beside twelve motors a fair thing to close on at all --
+    `balance.config.KP_YAW` has the sizing and `hw.trot_esti` prints what a
+    trot does to the heading.
 
 Seven phases.  ENTER steps them -- except RISE, which ends on its own clock.
 X is an E-STOP at any point:
@@ -112,6 +122,11 @@ THE TIMING, MEASURED RATHER THAN ASSUMED
     across the legs.  The exit report prints the law's real p50/p95/max every
     run; if the Pi disagrees with the numbers above, believe the Pi.
 
+    ANYTHING ELSE THAT COSTS REAL TIME GETS ITS OWN SLOT.  The eleven slots
+    that are not slot 0 send one frame and then wait, so there is 300-odd us of
+    each going spare.  `ESTIMATOR_SLOT` spends one of them on an `estimator`
+    tap -- 290 us of Kalman filter that slot 0 has no room for.
+
 
 THE 50 MS INPUT-LOST PROTECTION IS WHAT SHAPES THE LOOP
     Every driver latches error 0x80 and goes limp if it hears nothing for
@@ -189,6 +204,7 @@ from .balance import controller as BCTRL   # noqa: E402
 from .balance import law as BLAW     # noqa: E402
 from .balance import posture as POSE  # noqa: E402
 from .balance import state as BSTATE  # noqa: E402
+from .balance import swing as BSWING  # noqa: E402
 from .balance.sequence import (      # noqa: E402
     LAWS, PHASES, StandSequence, phase_blurb)
 
@@ -206,6 +222,22 @@ GAP_ESTOP_S = 0.5 * SAFE.INPUT_LOST_S
 
 #: A 0x9A replaces one control frame every this many sweeps, rotating.
 STATUS_EVERY_SWEEPS = 2
+
+#: Which slot an `estimator` tap runs in.  NOT SLOT 0, AND THAT IS MEASURED.
+#: Slot 0 belongs to the control law, and on the Pi (2026-09-24) the law alone
+#: is p50 470 us in `balance.selftest` and p50 560 us inside this loop -- the
+#: slot is 333 us, so it is over budget before anything is added to it.
+#: `hw.state_estimator`'s filter is another 290 us, and run at slot 0 it pushed
+#: EVERY sweep past the 1 ms re-anchor line (2000 overruns in a run against 59)
+#: and widened the worst CAN gap from 6.2 to 6.5 ms.  Every other slot sends one
+#: frame and then waits, so one of them has the time to spare.
+#:
+#: THE TAP STILL SEES THE SWEEP'S OWN MEASUREMENT: `body` and `orientation` are
+#: latched at slot 0 and handed over here unchanged, so only the arithmetic
+#: happens 2 ms later, not the reading.  That is a luxury a tap can have and a
+#: controller cannot -- the law needs the estimate before it acts, which is
+#: exactly why `state_estimator.adapters.run_once` documents the order it does.
+ESTIMATOR_SLOT = 6
 
 #: Low-pass on the finite-differenced encoder, the velocity the law damps
 #: with.  The driver's own speed field is kept as the safety gate's witness
@@ -379,7 +411,8 @@ class VelocityTap:
 def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         auto_s: float | None = None, clock=time.perf_counter,
         imu=None, log: "StandLog | None" = None,
-        velocity: "VelocityTap | None" = None, hook=None) -> str | None:
+        velocity: "VelocityTap | None" = None, estimator=None,
+        hook=None, terse: bool = False) -> str | None:
     """Drive `stand` on an ARMED `mb` until done, X, or a trip.
 
     Returns the stop reason, or None for a clean exit from "done".  Does not
@@ -393,7 +426,23 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     the controller this exists to be.
 
     `velocity` is a `VelocityTap` or None: print-only, nothing reads it.
+    `estimator` is another print-only tap, duck-typed the same way --
+    `update(now, stand, body, orientation) -> str | None` every sweep, and
+    `status() -> str`, which may hand back several lines, under every status
+    line.  `hw.trot_esti.EstimatorTap` is one, over `hw.state_estimator`'s
+    filter; it costs as much as the law does, so it is stepped in
+    `ESTIMATOR_SLOT` on the sweep's own latched measurement.  NOTHING HERE
+    READS WHAT EITHER TAP RETURNS: the law is fed by `stand.update(now, body)`
+    alone, and the day a tap does enter the loop it stops being a tap and this
+    argument is the wrong door.
     `hook` is `main`'s: keys, an ENTER veto, and a call every sweep.
+
+    `terse` cuts the 2 Hz stream down to the phase's OWN line -- rpy, its
+    error and the height -- plus whatever a tap prints.  The weight, moment,
+    torque, |tau|, gap and overrun lines are what an operator watching the
+    LAW needs; a run whose subject is a tap's numbers wants those numbers
+    unbroken instead, and `hw.trot_esti` asks for this.  It changes printing
+    and nothing else: every trip still runs, and the exit reports are whole.
     """
     ids = HM.motor_ids()
     n = len(ids)
@@ -403,6 +452,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     slot = mb.slot(rate_hz)
     alpha_qd = 1.0 - np.exp(-2.0 * np.pi * QD_FILTER_HZ * n * slot)
     level = IMU.TrunkOrientation.level()
+    est_slot = ESTIMATOR_SLOT % n
+    est_sweep = None                  # (now, stand, body, orientation), latched
 
     sweep = 0
     mode, values = "keepalive", None
@@ -444,6 +495,15 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 said = velocity.update(stand.phase_name == "limp")
                 if said:
                     print("\n   " + said, flush=True)
+            if estimator is not None:
+                # LATCHED HERE, RUN AT `ESTIMATOR_SLOT`.  `body` is rebound
+                # further down, to the state the law acted on, so the tap's
+                # copy is taken before anything can move it.  `stand` is the
+                # live object, so by the time the tap reads its phase and its
+                # yaw offset, THIS sweep's advance and rezero are already in
+                # it -- which is what puts the read-out in the right phase and
+                # the right world frame on the sweep the handover happens.
+                est_sweep = (now, stand, body, orientation)
             if body.imu_stale and not imu_warned and imu is not None:
                 imu_warned = True
                 print("\n   IMU stale (%.0f ms): the attitude half of the law "
@@ -570,7 +630,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
 
             if now - last_status >= STATUS_PERIOD_S:
                 last_status = now
-                tail = ("  |tau|=%.2f/%.2f  gap=%.1f ms  overrun=%d%s"
+                tail = "" if terse else (
+                        "  |tau|=%.2f/%.2f  gap=%.1f ms  overrun=%d%s"
                         % (float(np.abs(stand.tau).max()), stand.tau_peak,
                            1e3 * worst_gap.max(), overruns,
                            "" if stand.out is None else
@@ -593,7 +654,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                     # has less latency margin than the freeze threshold, so
                     # the age is now the number that says whether a roll
                     # oscillation is the gain or the stream.
-                    if stand.trotting:
+                    if stand.trotting and not terse:
                         print("          cycle %d  weight %s%s%s"
                               % (stand.gait.cycles(now),
                                  np.array2string(stand.gait.contact_weight(now),
@@ -601,21 +662,27 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                                  "  SETTLE" if stand.gait.settling(now) else "",
                                  "  exit latched" if stand.trot_exit else ""),
                               flush=True)
-                    print("          %s  imu %3.0f ms%s%s"
-                          % (watch.moment_status(),
-                             1e3 * body.imu_age_s,
-                             " STALE" if body.imu_stale else "", tail),
-                          flush=True)
+                    if not terse:
+                        print("          %s  imu %3.0f ms%s%s"
+                              % (watch.moment_status(),
+                                 1e3 * body.imu_age_s,
+                                 " STALE" if body.imu_stale else "", tail),
+                              flush=True)
                 else:
                     print("   %-6s t=%5.1f  h_cmd=%6.1f  %s%s"
                           % (stand.phase_name, now - stand.t_phase,
                              1e3 * BSTATE.origin_to_height(stand.h_cmd),
                              body.status(), tail), flush=True)
-                if velocity is not None:
+                if velocity is not None and not terse:
                     print("          " + velocity.status(), flush=True)
-                if hook is not None and stand.phase_name == "hold":
+                if estimator is not None:
+                    for line in estimator.status().splitlines():
+                        print("          " + line, flush=True)
+                if (hook is not None and stand.phase_name == "hold"
+                        and not terse):
                     print("          " + hook.status(now, stand), flush=True)
-                if stand.phase_name in ("rise", "hold", "trot", "step"):
+                if (stand.phase_name in ("rise", "hold", "trot", "step")
+                        and not terse):
                     print(_torque_lines(stand.tau, tau_meas), flush=True)
             sweep += 1
 
@@ -642,6 +709,14 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         else:
             mb.keepalive(mid)
 
+        # A tap that costs real time runs HERE, in a slot of its own and
+        # AFTER that slot's frame is already out -- see `ESTIMATOR_SLOT`.
+        if k == est_slot and est_sweep is not None:
+            said = estimator.update(*est_sweep)
+            est_sweep = None
+            if said:
+                print("\n   " + said, flush=True)
+
         k = (k + 1) % n
         overrun = mb.pace(deadline)
         deadline += slot
@@ -659,7 +734,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          tau_ceiling: float = None, tau_slew: float = None,
          overspeed_trip: bool = True, step_to=None,
          step_period: float = None, swing: str = "cartesian",
-         velocity: bool = False, hook=None) -> int:
+         velocity: bool = False, estimator=None, hook=None,
+         terse: bool = False) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -677,6 +753,12 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     the status.  It turns the joint-space layer's flags on without a gait.
     `velocity` True prints `hw.velocity_estimator`'s v under every status
     line, every phase (needs the IMU; `--no-imu` has nothing to integrate).
+    `estimator` is a CALLABLE taking the live `ImuDog` (or None on the
+    `--no-imu` path) and returning a tap (see `run`), or None.  A factory
+    rather than an object because the IMU is opened in here, after the caller
+    is done: `hw.trot_esti` passes a class.
+    `terse` is `run`'s: the 2 Hz stream carries the phase's rpy line and the
+    taps, and nothing else.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -690,6 +772,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                     default=SAFE.TAU_START_MAX if tau_cap is None else tau_cap,
                     help="lift-phase torque cap, N*m (SafetyGate allows up to "
                          "%.1f)" % ceiling)
+    ap.add_argument("--tau-slew", type=float, default=slew, metavar="NM_PER_S",
+                    help="SafetyGate's |dtau/dt| limit on every joint.  The "
+                         "stand's 5 and the trot's 60 are DOG5's; it bounds "
+                         "how fast a swing torque can rise, so the trot "
+                         "banner prints what the swing needs against it")
     ap.add_argument("--rate", type=float, default=RATE_HZ,
                     help="per-motor command rate, Hz")
     ap.add_argument("--bitrate", type=int, default=1_000_000)
@@ -725,6 +812,13 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     law.add_argument("--kd-z", type=float, default=BCFG.KD_Z)
     law.add_argument("--kp-att", type=float, default=BCFG.KP_ATT)
     law.add_argument("--kd-att", type=float, default=BCFG.KD_ATT)
+    law.add_argument("--kp-yaw", type=float, default=BCFG.KP_YAW,
+                     help="HEADING spring, same units as --kp-att.  It holds "
+                          "the drift off the heading latched at the handover; "
+                          "0 is the damper-only yaw of before 2026-09-24")
+    law.add_argument("--kd-yaw", type=float, default=BCFG.KD_YAW,
+                     help="heading damper, same units as --kd-att -- the "
+                          "gyro's omega_z, inertial, on even at --kp-yaw 0")
     law.add_argument("--kp-roll", type=float,
                      default=None if roll_gains is None else roll_gains[0],
                      help="roll only, same units as --kp-att; default follows "
@@ -768,11 +862,31 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                "1/period")
         trot.add_argument("--duty", type=float, default=gait.duty,
                           help="stance fraction, in (0.5, 1)")
+        trot.add_argument("--contact-ramp", type=float, default=gait.ramp,
+                          metavar="FRACTION",
+                          help="fraction of STANCE a foot's share of the load "
+                               "smoothsteps over at touchdown and at liftoff.  "
+                               "It has to fit inside the four-foot window, so "
+                               "the ceiling is (duty - 0.5) / (2 duty) = 0.19 "
+                               "at duty 0.80; past it the clock refuses and "
+                               "says so")
         trot.add_argument("--settle", type=float, default=gait.settle_s,
                           metavar="SECONDS",
                           help="the four-foot re-level; 0 turns it off")
         trot.add_argument("--settle-every", type=int,
                           default=gait.settle_every, metavar="CYCLES")
+        trot.add_argument("--swing", choices=BSWING.SWING_MODES, default=swing,
+                          help="the swing leg's controller: 'cartesian' is "
+                               "the foot impedance the nominal trot flew "
+                               "(~1 Hz at the foot -- it cannot follow a "
+                               "short swing); 'joint' is the fold's z-only "
+                               "arc through the IK with a joint PD, abd held")
+        trot.add_argument("--swing-height", type=float,
+                          default=1e3 * BCFG.SWING_HEIGHT, metavar="MM",
+                          help="the swing apex above the resting foot.  Speed, "
+                               "torque and slew demand all scale with it, so "
+                               "it is the first thing to lower for a fast "
+                               "gait; the banner prints the demand")
         trot.add_argument("--half-gait", action="store_true",
                           help="T steps the gait by HAND, half a cycle a "
                                "press: one diagonal lifts and lands, HOLD by "
@@ -841,7 +955,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         from .balance.gait import TrotGait
         try:
             gait = TrotGait(period=args.period, duty=args.duty,
-                            offsets=gait.offsets, ramp=gait.ramp,
+                            offsets=gait.offsets, ramp=args.contact_ramp,
                             settle_s=args.settle,
                             settle_every=args.settle_every)
             step_gait = (None if step_to is None else TrotGait(
@@ -867,6 +981,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
 
     # Everything that can refuse, refuses BEFORE the bus opens.
     ids = HM.motor_ids()
+    slew = float(args.tau_slew)
+    if gait is not None:
+        swing = args.swing
     try:
         gate = SAFE.SafetyGate(args.tau_cap, unconfirmed_reason=reason,
                                ceiling=ceiling, tau_slew=slew,
@@ -886,6 +1003,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         gains.kp_att[0] = args.kp_roll
     if args.kd_roll is not None:
         gains.kd_att[0] = args.kd_roll
+    gains.kp_att[2], gains.kd_att[2] = args.kp_yaw, args.kd_yaw
     if args.ablate_attitude:
         gains.ablate_attitude()
     balance = BLAW.BalanceLaw(gains=gains, rise_s=args.rise,
@@ -896,6 +1014,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               tilt_stop_deg=args.tilt_stop,
                               track_stop_deg=args.track_stop, srb=crouch.srb,
                               swing=swing,
+                              swing_height=(1e-3 * args.swing_height
+                                            if gait is not None
+                                            else BCFG.SWING_HEIGHT),
                               **({} if (gait is None and hook is None)
                                  or not args.joint_hold
                                  else dict(kp_joint=args.kp_joint,
@@ -927,12 +1048,36 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         if swing == "joint":
             print("       swing apex %.0f mm straight up, NO placement; JOINT "
                   "PD, abd held: Kp %s N*m/rad Kd %s N*m*s/rad"
-                  % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING_JOINT,
+                  % (args.swing_height, BCFG.KP_SWING_JOINT,
                      BCFG.KD_SWING_JOINT))
         else:
             print("       swing apex %.0f mm straight up, NO placement; Kp %s "
-                  "N/m Kd %s N s/m" % (1e3 * BCFG.SWING_HEIGHT, BCFG.KP_SWING,
+                  "N/m Kd %s N s/m" % (args.swing_height, BCFG.KP_SWING,
                                        BCFG.KD_SWING))
+        # WHAT THE SWING ASKS, AGAINST WHAT THE GATE ALLOWS.  The one line
+        # that says in advance whether the foot will leave the floor: a
+        # swing whose torque cannot rise inside the slew is a PD winding up
+        # behind a limiter, and on the robot (2026-09-24, 80 ms of swing) it
+        # is a foot that stays down under a trunk that reads steady because
+        # it is still on four feet.
+        demand = BSWING.swing_demand(
+            0, BSWING.rest_feet_b(1e-3 * args.height, crouch.foot_xy)[0],
+            gait.swing_duration, 1e-3 * args.swing_height,
+            C.unflat(crouch.q)[0])
+        print("       swing %.0f ms: knee ~%.1f rad/s, ~%.1f N*m (rotor+link "
+              "estimate); needs ~%.0f N*m/s of slew against %.0f%s"
+              % (1e3 * gait.swing_duration, demand["qd"][2], demand["tau"].max(),
+                 demand["slew"], slew,
+                 "" if demand["slew"] <= slew else
+                 "\n       WARNING: THE SWING OUTRUNS THE SLEW.  The PD winds "
+                 "up behind the limiter (fold_trot's MuJoCo run: 160/240/260 "
+                 "ms all diverged, knee ~90 deg over).  Lower --swing-height, "
+                 "lower --duty or lengthen --period until this fits, or raise "
+                 "--tau-slew knowing what it is."))
+        if demand["tau"].max() > args.tau_cap:
+            print("       WARNING: the swing's ~%.1f N*m is over the %.1f N*m "
+                  "cap -- the arc cannot be followed at any gain"
+                  % (demand["tau"].max(), args.tau_cap))
         if args.joint_hold:
             print("       MODE joint-hold: every leg held at the angles "
                   "latched on reaching HOLD, hold and trot, Kp %.1f N*m/rad "
@@ -1047,6 +1192,18 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     elif velocity:
         print("  velocity: none -- no IMU to integrate")
 
+    est_tap = None
+    if estimator is not None:
+        # BUILT EVEN WITH NO IMU.  The tap reads `orientation`, and on the
+        # `--no-imu` path that is `TrunkOrientation.level()`, which carries a
+        # level trunk's specific force.  What comes out is the level-trunk
+        # ablation, not a measurement -- but the whole path runs, which is
+        # what `--fake --no-imu` is for.
+        est_tap = estimator(imu)
+        if imu is None:
+            print("  estimator: on TrunkOrientation.level() -- the ablation, "
+                  "not a sensor")
+
     stop = None
     try:
         with mb:
@@ -1057,7 +1214,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             # nothing may sit between it and the first slot.
             stop = run(mb, stand, rate_hz=args.rate, key=key,
                        auto_s=args.auto, imu=imu, log=log, velocity=tap,
-                       hook=hook)
+                       estimator=est_tap, hook=hook, terse=terse)
     except KeyboardInterrupt:
         stop = "Ctrl-C"
     finally:
