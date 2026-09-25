@@ -360,7 +360,8 @@ class StandSequence:
     def __init__(self, gate: SAFE.SafetyGate, *, law: str = "srb",
                  balance: BLAW.BalanceLaw | None = None,
                  crouch: POSE.CrouchPose = POSE.NOMINAL, gait=None,
-                 step_to=None, step_gait=None, trot_swings: int = 0):
+                 step_to=None, step_gait=None, trot_swings: int = 0,
+                 position_trips: bool = True):
         if law not in LAWS:
             raise ValueError("law must be one of %s, got %r" % (LAWS, law))
         # THE PER-LEG BASELINE IS ONLY A BASELINE AT THE NOMINAL CROUCH.
@@ -444,6 +445,14 @@ class StandSequence:
         self.park_after_step = False
         self.step_runs = 0
         self._sweep = 0
+        #: `_four_foot_window`'s memory: the previous sweep's smallest contact
+        #: weight while all four were down, or None.
+        self._exit_min_w = None
+        #: The position-mode tracking trips, SETTLE_TRACK_ESTOP and
+        #: TRACK_ESTOP.  False turns both OFF -- `hw.stand --no-limits`: a
+        #: leg that cannot follow the ramp is then pushed by the driver's own
+        #: position loop and nothing here stops it.
+        self.position_trips = bool(position_trips)
 
     @property
     def phase_name(self) -> str:
@@ -542,6 +551,31 @@ class StandSequence:
         return ("TROT: %s.  The first foot lifts in %.2f s.  T again returns "
                 "to HOLD at a four-foot window; X is an E-STOP."
                 % (self.gait, self.gait.entry_s))
+
+    def _four_foot_window(self, gait, now: float) -> bool:
+        """Where a trot or a step may be left: all four feet at FULL weight --
+        or, when there is no such sweep, the sweep past the window's middle.
+
+        `full_support` wants every weight at 1.  The contact ramp is a
+        fraction of STANCE and the four-foot window is (duty - 0.5)/2 of a
+        cycle, so at duty 0.80 full weight lasts 60 ms of a 0.5 s cycle and
+        this returns True on the first of 15 sweeps; at duty 0.72 the ramp
+        fills the window and full weight lasts ONE 4 ms sweep a cycle, which
+        a 250 Hz loop mostly misses -- the exit latched by T then rode on for
+        cycles (2026-09-25).  So past the peak is the fallback: while all four
+        are down the smallest weight rises to the window's middle and falls
+        after it, and the first sweep on the way down is the closest thing
+        to full support that duty has.  Same instant `full_support` would
+        have picked if it existed; one sweep later than it when it does.
+        """
+        sample = gait.sample(now)
+        if sample.full_support or not sample.contact.all():
+            self._exit_min_w = None
+            return bool(sample.full_support)
+        w = float(sample.weight.min())
+        past_peak = self._exit_min_w is not None and w < self._exit_min_w - 1e-9
+        self._exit_min_w = w
+        return past_peak
 
     def _count_swings(self) -> None:
         """Count diagonal touchdowns; latch the exit after `trot_swings`."""
@@ -718,7 +752,7 @@ class StandSequence:
                 "come back to the setpoint, and `hold` on the status line is "
                 "what it did.  ENTER parks.")
 
-        if name == "trot" and self.trot_exit and self.gait.full_support(now):
+        if name == "trot" and self.trot_exit and self._four_foot_window(self.gait, now):
             self.trotting = False
             self.trot_exit = False
             self.t_phase = now
@@ -738,7 +772,7 @@ class StandSequence:
                                   else "steps the feet back and parks"))
 
         if (name == "step" and self.balance.step_landed
-                and self.step_gait.full_support(now)):
+                and self._four_foot_window(self.step_gait, now)):
             self.stepping = False
             self.balance.end_step()
             self.balance.hold_joints(q)
@@ -788,7 +822,7 @@ class StandSequence:
         self.q_des = C.flat(target)
 
         error = np.abs(q - self.q_des)
-        if np.any(error > limit):
+        if self.position_trips and np.any(error > limit):
             index = int(np.argmax(error))
             trip = ("%s: %s is %.1f deg from its position target (limit %.0f)"
                     % (name, HM.JOINT_LABELS[index], np.rad2deg(error[index]),

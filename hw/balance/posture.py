@@ -1,7 +1,7 @@
 """The crouch a lift STARTS FROM, as an object rather than a constant.
 
     posture.NOMINAL     `sim.stand.Q_CROUCH` -- trunk on the floor, h = 0
-    posture.FOLD        the 2026-09-16 hand-captured fold, rear as front, h = 60 mm
+    posture.FOLD        the 2026-09-16 hand-captured fold, rear parallel, h = 60 mm
     posture.WIDE        NOMINAL's feet 20 mm further out, h = 40 mm
 
 WHY THIS EXISTS.  `hw.stand` used to name `sim.stand.Q_CROUCH` in four places
@@ -46,10 +46,13 @@ A HAND-CAPTURED POSE IS NOT A POSE UNTIL IT HAS BEEN REGULARISED
     So the raw capture is recorded below as PROVENANCE and the flown pose is
     DERIVED from it here: x and |y| averaged within each axle, mirrored, and
     one z for all four.  Then the rear axle is REPLACED by the front one
-    mirrored fore-aft (2026-09-17): the rear legs fold the front's way, knee
-    motor toward the CoM, so the stance is symmetric front to back as well.
-    The captured rear fold is kept only in `FOLD_CAPTURED_Q`.  `selftest`
-    gates the symmetry and the equal height.
+    carried PARALLEL (2026-09-25): every leg folds the same way, knee behind
+    its hip -- the front knees tucked under the abd motors, the rear ones out
+    behind the rear hips -- and the rear thigh and shin are exactly the
+    front's.  NOT symmetric front to back: the rear feet sit 61 mm nearer the
+    trunk origin than the front ones.  The captured rear fold is kept only in
+    `FOLD_CAPTURED_Q`.  `selftest` gates the symmetry, the equal height and
+    the parallel legs.
 """
 from __future__ import annotations
 
@@ -202,38 +205,52 @@ NOMINAL = CrouchPose(
     note="sim.stand.Q_CROUCH -- shins vertical, trunk resting on the floor")
 
 def _fold_sites() -> np.ndarray:
-    """The capture's FRONT axle, regularised, mirrored fore-aft onto the rear.
+    """The capture's FRONT axle, regularised, carried PARALLEL onto the rear.
 
-    2026-09-17, the operator's decision: the rear legs fold like the front
-    ones -- knee motor INBOARD, toward the CoM, and the foot outboard of the
-    hip -- instead of the capture's rear fold, knee out behind the hip and
-    the foot tucked 13.6 mm FORWARD of it.  In each leg's own hip frame that
-    is x negated; y and z are the front's.
+    2026-09-25, the operator's decision: front and rear legs PARALLEL, every
+    knee behind its hip -- the front fold, the knee tucked under the abd
+    motor, and the rear leg the same shape: the same thigh, the same shin,
+    hung from the rear pitch hinge.  The rear knee then sits out behind the
+    rear hip, and the rear foot almost under the rear abd hinge, 2.3 mm
+    ahead of it.
+
+    THE REAR FOOT IS NOT THE FRONT'S HIP-FRAME SITE.  The pitch hinge is L1
+    along the abduction axis from the abd hinge -- AHEAD of it on a front
+    leg, BEHIND it on a rear one -- so the same thigh and shin land 2 L1
+    (56.4 mm) further back in the hip frame.  y and z are the front's.
+
+    (2026-09-17 to 09-25 the rear was the front MIRRORED fore-aft instead,
+    knee toward the CoM.  The capture's own rear was parallel by hand only:
+    its thigh 6 deg steeper than the front's, and regularised, its foot
+    11 mm further forward.)
     """
     hip = regularise(FOLD_CAPTURED_Q)
-    hip[2:] = hip[:2] * np.array([-1.0, 1.0, 1.0])
+    hip[2:] = hip[:2] - P.HIP_TO_PITCH[:2] + P.HIP_TO_PITCH[2:]
     return hip
 
 
 def _fold_seed() -> np.ndarray:
-    """The front legs' captured joints, mirrored fore-aft onto the rear.
+    """The front legs' captured joints, carried parallel onto the rear.
 
-    Picks the IK branch whose knee points the front's way.  Seeded from the
-    captured rear instead, the IK lands on a different elbow (knee straight
-    out behind, pitch ~ -1 deg) -- the same foot, the wrong leg.
+    abd and knee the front's; pitch half a turn round, because the rear
+    chain lies along -x at the zero, so the same thigh direction is the
+    front's pitch -+ pi.  Picks the IK branch whose knee points the front's
+    way, back.  The same foot has a second elbow, pitch ~ -179 deg, knee
+    forward at the trunk's own height -- inside the trunk.
     """
     q = C.unflat(FOLD_CAPTURED_Q).copy()
-    q[2:] = q[:2] * np.array([1.0, -1.0, -1.0])
+    q[2:] = q[:2]
+    q[2:, 1] -= np.pi * np.sign(q[:2, 1])
     return q
 
 
-#: The hand-folded crouch, regularised, rear folded like the front.  DERIVED
+#: The hand-folded crouch, regularised, rear parallel to the front.  DERIVED
 #: from `FOLD_CAPTURED_Q` at import, so the capture and the pose cannot drift
 #: apart.
 FOLD = CrouchPose.from_hip_sites(
     "fold", _fold_sites(), q_seed=_fold_seed(),
     note="hand-posed 2026-09-16, regularised: mirror symmetric, one foot "
-         "height; rear folded as the front, 2026-09-17.  The trunk does NOT "
+         "height; rear parallel to the front, 2026-09-25.  The trunk does NOT "
          "start on the floor.")
 
 #: THE WIDE CROUCH, 2026-09-17: the feet splayed out, for the trot.
@@ -277,7 +294,8 @@ if __name__ == "__main__":
         print(pose.describe())
         print()
     raw = C.unflat(FOLD_CAPTURED_Q)
-    print("what regularising the capture moved (rear: also refolded as the front):")
+    print("what regularising the capture moved (rear: also refolded parallel "
+          "to the front):")
     print("  joints, per leg (deg):  %s"
           % np.array2string(np.degrees(np.abs(FOLD.q - raw)).max(axis=1),
                             precision=2))

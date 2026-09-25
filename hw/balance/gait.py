@@ -219,7 +219,14 @@ class TrotGait:
                           full_support=bool(np.all(weight >= 1.0 - 1e-9)))
 
     def full_support(self, t: float) -> bool:
-        """All four feet down at full weight -- where the trot may be left."""
+        """All four feet down at full weight -- where the trot may be left.
+
+        NOT EVERY DUTY HAS SUCH A SWEEP.  Full weight lasts the four-foot
+        window minus the ramp: (duty - 0.5)/2 - ramp * duty of a cycle, 60 ms
+        at duty 0.80 and 4 ms at 0.72 on a 0.5 s period.  A caller waiting
+        for it at 250 Hz should fall back to the window's middle --
+        `sequence.StandSequence._four_foot_window` does.
+        """
         return bool(np.all(self.contact_weight(t) >= 1.0 - 1e-9))
 
     def settling(self, t: float) -> bool:

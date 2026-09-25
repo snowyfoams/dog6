@@ -9,9 +9,10 @@
 
 `hw.fold_stand` plus a gait -- `hw.trot.trot_options`, shared with the
 nominal-crouch trot `hw.trot`.  Same crouch (`posture.FOLD`), same fixed IMU
-datum, same SRB-only law, same 45 deg tilt stop, same tracking trip OFF, same
-roll gains (`fold_stand.ROLL_GAINS`, 290 / 23) -- all imported from it, none
-copied.  What is added is T, and the four things T needs:
+datum, same SRB-only law, same LIMITS OFF (`fold_stand.LIMITS`, since
+2026-09-25; with `--limits`, the 45 deg tilt stop and the tracking trip OFF),
+same roll gains (`fold_stand.ROLL_GAINS`, 290 / 23) -- all imported from it,
+none copied.  What is added is T, and the four things T needs:
 
     THE GAIT       `balance.gait.TrotGait`: DOG5 trot_demo's clock -- duty
                    0.80, contact ramp 0.15, a 0.2 s four-foot settle every 2
@@ -56,16 +57,21 @@ copied.  What is added is T, and the four things T needs:
 
 
 THE FOLD STANCE AND A DIAGONAL PAIR
-    Since 2026-09-17 the rear legs fold like the front ones (`posture.FOLD`):
-    knee motor toward the CoM, feet at +-215 mm x, +-71 mm y.  The stance is
-    symmetric front to back, c^b x = 0.0, and both diagonal support lines
-    pass through the CoM -- the old rear-tucked fold put it 17.2 mm behind
-    them, ~0.97 N*m no diagonal pair could make, and the robot fell backward
-    every swing.
+    Since 2026-09-25 the legs are PARALLEL front to back (`posture.FOLD`):
+    every knee behind its hip -- the front knees tucked under the abd
+    motors, the rear ones out behind the rear hips -- and the feet at +215 /
+    -154 mm x, +-71 mm y.  NOT symmetric front to back: c^b x is -10.7 mm,
+    and the CoM sits 14.8 mm behind BOTH diagonal support lines, W d = 0.85
+    N*m about each diagonal that no diagonal pair can make.  Its roll part,
+    0.80, changes sign with the diagonal; its pitch part, 0.31 nose-up, is
+    the same for both.  The rear-tucked capture of 2026-09-16 had 17.2 mm,
+    ~0.97 N*m, and the robot fell backward every swing; from 2026-09-17 to
+    09-25 the rear was mirrored as the front, and both diagonals passed
+    through the CoM.
 
     THE RESIDUAL TRIP still only counts four-foot sweeps while trotting (see
     `law.BalanceLaw.update`): on two feet a residual is geometry, not a
-    contact about to go.
+    contact about to go -- in this stance, 0.84 N*m of it (`selftest` 12).
 
 
 VELOCITY
@@ -103,7 +109,7 @@ def main(argv=None) -> int:
     return STAND.main(argv, crouch=POSE.FOLD, dynamic_setpoint=False,
                       only_law="srb", tilt_stop=FS.TILT_STOP_DEG,
                       roll_gains=FS.ROLL_GAINS, track_stop=FS.TRACK_STOP_DEG,
-                      swing="joint", velocity=True,
+                      swing="joint", velocity=True, limits=FS.LIMITS,
                       **trot_options(PERIOD_S))
 
 

@@ -192,6 +192,7 @@ if __package__ in (None, ""):        # allow `python hw/stand.py` too
     __package__ = "hw"
 
 from sim import coordinates as C     # noqa: E402
+from sim import params as P          # noqa: E402
 
 from . import CONFIRMED_ON_DOG6      # noqa: E402
 from . import calibration as CAL     # noqa: E402
@@ -219,6 +220,13 @@ RATE_HZ = 250.0
 
 #: Stop while the drivers are still listening: half their input-lost window.
 GAP_ESTOP_S = 0.5 * SAFE.INPUT_LOST_S
+
+#: What `--no-limits` leaves ON.  None of it limits where the robot goes:
+#: the operator's key, the drivers' health, and the gate's torque shaping.
+NO_LIMITS_KEPT = ("X, CAN input-lost / missed replies / sweep gap, "
+                  "over-temperature, motor faults, torque readback, non-finite "
+                  "state; the torque cap, the 9 N*m clip, the slew, the soft "
+                  "start")
 
 #: A 0x9A replaces one control frame every this many sweeps, rotating.
 STATUS_EVERY_SWEEPS = 2
@@ -623,6 +631,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                         q=body.q, qd=body.qd, q_ref=stand.q_des,
                         tau_cmd=stand.tau, tau_meas=tau_meas,
                         tau_req=stand.tau_request,
+                        tau_ff=None if out is None else out.tau_ff,
                         contact_w=None if out is None else out.contact,
                         swing_s=None if out is None else out.swing_s,
                         p_swing=None if out is None else out.p_swing,
@@ -735,10 +744,16 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          overspeed_trip: bool = True, step_to=None,
          step_period: float = None, swing: str = "cartesian",
          velocity: bool = False, estimator=None, hook=None,
-         terse: bool = False) -> int:
+         terse: bool = False, limits: bool = True) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
+
+    `limits` False is `--no-limits` by default: every limit on WHERE the
+    robot goes is off -- the soft joint limits (the gate's torque block and
+    its e-stop), the position-mode tracking trips, the torque-phase tracking
+    trip, the tilt stop, the residual trip and the overspeed trip.  What stays
+    on is `NO_LIMITS_KEPT`.
 
     `gait` (a `balance.gait.TrotGait`) enables T; `tau_cap`, `tau_ceiling`
     and `tau_slew` are the gate's default cap, the ceiling it will accept and
@@ -851,6 +866,18 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           "this changes no N*m the drivers get.  It is what "
                           "notices a leg that has gone wrong while the "
                           "attitude still reads fine")
+    lim = ap.add_argument_group(
+        "limits", "every limit on where the robot goes, as one switch")
+    lim.add_argument("--limits", dest="limits", action="store_true",
+                     default=bool(limits),
+                     help="ON: the soft joint limits (the gate's torque block "
+                          "and e-stop), the position-mode and torque-phase "
+                          "tracking trips, the tilt stop, the residual trip "
+                          "and the overspeed trip -- at the flags above")
+    lim.add_argument("--no-limits", dest="limits", action="store_false",
+                     default=argparse.SUPPRESS,
+                     help="all of those OFF, whatever the flags above say.  "
+                          "Still on: %s" % NO_LIMITS_KEPT)
     if gait is not None:
         trot = ap.add_argument_group(
             "the trot", "the gait clock T starts; the entry point's defaults")
@@ -877,16 +904,46 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           default=gait.settle_every, metavar="CYCLES")
         trot.add_argument("--swing", choices=BSWING.SWING_MODES, default=swing,
                           help="the swing leg's controller: 'cartesian' is "
-                               "the foot impedance the nominal trot flew "
-                               "(~1 Hz at the foot -- it cannot follow a "
-                               "short swing); 'joint' is the fold's z-only "
-                               "arc through the IK with a joint PD, abd held")
+                               "the foot impedance the nominal trot flies -- "
+                               "soft (~1 Hz at the foot), so pair it with "
+                               "--swing-ff; 'joint' is the FOLD's z-only arc "
+                               "through the IK with a joint PD, abd held -- "
+                               "on the nominal trot it failed every run "
+                               "(2026-09-25)")
         trot.add_argument("--swing-height", type=float,
                           default=1e3 * BCFG.SWING_HEIGHT, metavar="MM",
                           help="the swing apex above the resting foot.  Speed, "
                                "torque and slew demand all scale with it, so "
                                "it is the first thing to lower for a fast "
-                               "gait; the banner prints the demand")
+                               "gait; the banner prints the demand.  With "
+                               "--swing-ff the apex is real: 20 mm flew on "
+                               "the nominal trot, 40 mm landed hard enough to "
+                               "bounce the robot (2026-09-25)")
+        trot.add_argument("--swing-ff", action="store_true",
+                          help="add the arc's own inertial torque, M0 J^+ "
+                               "(a_ref - Jdot qd_ref), to each swing leg open "
+                               "loop (both swing modes).  It is ~90 %% of the "
+                               "torque a 15 mm / 140 ms arc asks for, which "
+                               "the PD was making out of tracking error; see "
+                               "swing.py.  Logged as tau_ff")
+        trot.add_argument("--ff-armature", type=float, default=None, metavar="KG_M2",
+                          help="the reflected rotor inertia the feedforward's M0 "
+                               "is built on, joint side.  Default params.ARMATURE "
+                               "%.4f, DOG5's, not measured on DOG6; "
+                               "`hw.swing_bench --analyse` fits it from a log"
+                               % P.ARMATURE)
+        trot.add_argument("--kp-swing", type=float, nargs=3, metavar="N_PER_M",
+                          default=list(BCFG.KP_SWING),
+                          help="the Cartesian swing PD's x y z stiffness.  With "
+                               "--swing-ff, Kp is no longer what lifts the foot "
+                               "and stiffening z drives the foot into x (no "
+                               "Lambda in this PD): leave it")
+        trot.add_argument("--kd-swing", type=float, nargs=3,
+                          metavar="NS_PER_M", default=list(BCFG.KD_SWING),
+                          help="the Cartesian swing PD's x y z damping.  z at "
+                               "15 is zeta 0.28 on the foot's 3.9 kg; 30 is "
+                               "0.57 and tracked the arc a little better in the "
+                               "leg's own dynamics (2026-09-25)")
         trot.add_argument("--half-gait", action="store_true",
                           help="T steps the gait by HAND, half a cycle a "
                                "press: one diagonal lifts and lands, HOLD by "
@@ -984,10 +1041,18 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     slew = float(args.tau_slew)
     if gait is not None:
         swing = args.swing
+    if not args.limits:
+        # --no-limits, `main`'s docstring.  Set before anything is built or
+        # printed, so the banner reports what actually flies.
+        args.tilt_stop, args.track_stop = float("inf"), 0.0
+        overspeed_trip = False
     try:
         gate = SAFE.SafetyGate(args.tau_cap, unconfirmed_reason=reason,
                                ceiling=ceiling, tau_slew=slew,
-                               overspeed_trip=overspeed_trip)
+                               overspeed_trip=overspeed_trip,
+                               limits=(None if args.limits else
+                                       (np.full(C.N_JOINTS, -np.inf),
+                                        np.full(C.N_JOINTS, np.inf))))
     except (RuntimeError, ValueError) as refusal:
         print("[stand] REFUSED before opening the bus:\n  %s" % refusal,
               file=sys.stderr)
@@ -1012,11 +1077,18 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               mu=args.mu, foot_xy=crouch.foot_xy,
                               dynamic_setpoint=args.latch,
                               tilt_stop_deg=args.tilt_stop,
-                              track_stop_deg=args.track_stop, srb=crouch.srb,
+                              track_stop_deg=args.track_stop,
+                              residual_trip=args.limits, srb=crouch.srb,
                               swing=swing,
                               swing_height=(1e-3 * args.swing_height
                                             if gait is not None
                                             else BCFG.SWING_HEIGHT),
+                              swing_ff=bool(gait is not None and args.swing_ff),
+                              ff_inertia=(None if gait is None or args.ff_armature is None
+                                          else BSWING.feedforward_inertia(args.ff_armature)),
+                              **({} if gait is None else dict(
+                                  kp_swing=np.asarray(args.kp_swing, float),
+                                  kd_swing=np.asarray(args.kd_swing, float))),
                               **({} if (gait is None and hook is None)
                                  or not args.joint_hold
                                  else dict(kp_joint=args.kp_joint,
@@ -1024,7 +1096,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
                           gait=gait, step_to=step_to, step_gait=step_gait,
                           trot_swings=(1 if gait is not None and args.half_gait
-                                       else 0))
+                                       else 0),
+                          position_trips=args.limits)
     log = StandLog() if args.log else None
     key = KeyPoller()
     if not key.ok and not args.fake:
@@ -1052,22 +1125,23 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                      BCFG.KD_SWING_JOINT))
         else:
             print("       swing apex %.0f mm straight up, NO placement; Kp %s "
-                  "N/m Kd %s N s/m" % (args.swing_height, BCFG.KP_SWING,
-                                       BCFG.KD_SWING))
+                  "N/m Kd %s N s/m" % (args.swing_height,
+                                       np.asarray(args.kp_swing),
+                                       np.asarray(args.kd_swing)))
         # WHAT THE SWING ASKS, AGAINST WHAT THE GATE ALLOWS.  The one line
-        # that says in advance whether the foot will leave the floor: a
-        # swing whose torque cannot rise inside the slew is a PD winding up
-        # behind a limiter, and on the robot (2026-09-24, 80 ms of swing) it
-        # is a foot that stays down under a trunk that reads steady because
-        # it is still on four feet.
+        # that says in advance whether the foot can FOLLOW the arc.  It lifts
+        # either way -- it did at 80 ms of swing on the robot, 2026-09-25 --
+        # but past this a swing is the PD behind a limiter, late or wound up,
+        # and the log's `x_b` against `p_swing` says which.
         demand = BSWING.swing_demand(
             0, BSWING.rest_feet_b(1e-3 * args.height, crouch.foot_xy)[0],
             gait.swing_duration, 1e-3 * args.swing_height,
             C.unflat(crouch.q)[0])
-        print("       swing %.0f ms: knee ~%.1f rad/s, ~%.1f N*m (rotor+link "
-              "estimate); needs ~%.0f N*m/s of slew against %.0f%s"
+        print("       swing %.0f ms: knee ~%.1f rad/s, ~%.1f N*m (M at the lift "
+              "pose); slew: ~%.0f N*m/s to rise, ~%.0f to LAND SOFTLY, "
+              "against %.0f%s"
               % (1e3 * gait.swing_duration, demand["qd"][2], demand["tau"].max(),
-                 demand["slew"], slew,
+                 demand["slew"], 3.0 * demand["slew"], slew,
                  "" if demand["slew"] <= slew else
                  "\n       WARNING: THE SWING OUTRUNS THE SLEW.  The PD winds "
                  "up behind the limiter (fold_trot's MuJoCo run: 160/240/260 "
@@ -1078,6 +1152,20 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             print("       WARNING: the swing's ~%.1f N*m is over the %.1f N*m "
                   "cap -- the arc cannot be followed at any gain"
                   % (demand["tau"].max(), args.tau_cap))
+        print("       swing feedforward %s"
+              % ("ON: tau += M0 J^+ (a_ref - Jdot qd_ref) per swing leg, open "
+                 "loop, M0 diag %s kg m^2 (armature %s); logged as tau_ff"
+                 % (np.array2string(np.diag(BSWING.feedforward_inertia(args.ff_armature)),
+                                    precision=4),
+                    "%.5f measured" % args.ff_armature if args.ff_armature is not None
+                    else "%.5f INHERITED from DOG5" % P.ARMATURE)
+                 if args.swing_ff else
+                 "OFF (--swing-ff turns it on): the PD alone makes the "
+                 "swing torque, out of tracking error"))
+        if args.swing_ff and args.swing_height > 20.0:
+            print("       NOTE: with the feedforward the apex is REAL.  On the "
+                  "nominal trot 20 mm is what flew (2026-09-25); at 40 mm the "
+                  "foot came down hard enough to bounce the robot.")
         if args.joint_hold:
             print("       MODE joint-hold: every leg held at the angles "
                   "latched on reaching HOLD, hold and trot, Kp %.1f N*m/rad "
@@ -1088,6 +1176,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   "held, the body free to shift")
         print("       residual trip counts four-foot sweeps only while "
               "trotting")
+    if not args.limits:
+        print("  LIMITS OFF (--no-limits): soft joint limits (torque block and "
+              "e-stop), position-mode and torque-phase tracking, tilt stop, "
+              "residual trip, overspeed trip.  --limits puts them back.")
+        print("       still on: %s" % NO_LIMITS_KEPT)
     if not overspeed_trip:
         print("  OVERSPEED TRIP OFF: joint speed is recorded, never stopped "
               "on (the peaks print at exit)")
@@ -1129,14 +1222,20 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
           "drivers' %.0f ms input-lost window"
           % (args.rate, 1e3 / args.rate, 1e3 * GAP_ESTOP_S,
              1e3 * SAFE.INPUT_LOST_S))
-    print("  trips: tilt %.0f deg%s, tracking %s, residual %.1f N / "
-          "%.2f N*m sustained"
-          % (args.tilt_stop,
-             "" if args.tilt_stop == BCFG.TILT_STOP_DEG else
-             "  <-- RAISED from %.0f, the robot can reach an attitude it "
-             "cannot recover from" % BCFG.TILT_STOP_DEG,
-             ("%.0f deg" % args.track_stop) if args.track_stop > 0 else "OFF",
-             BCFG.RESIDUAL_FORCE_N, BCFG.RESIDUAL_MOMENT_NM))
+    if not args.limits:
+        print("  trips: tilt OFF, tracking OFF, residual OFF, position-mode "
+              "tracking OFF, joint limits OFF -- nothing stops on where the "
+              "robot goes")
+    else:
+        print("  trips: tilt %.0f deg%s, tracking %s, residual %.1f N / "
+              "%.2f N*m sustained"
+              % (args.tilt_stop,
+                 "" if args.tilt_stop == BCFG.TILT_STOP_DEG else
+                 "  <-- RAISED from %.0f, the robot can reach an attitude it "
+                 "cannot recover from" % BCFG.TILT_STOP_DEG,
+                 ("%.0f deg" % args.track_stop) if args.track_stop > 0
+                 else "OFF",
+                 BCFG.RESIDUAL_FORCE_N, BCFG.RESIDUAL_MOMENT_NM))
     print("  ENTER steps the phase (RISE ends on its own).  X is an E-STOP "
           "-- from rise or hold it DROPS the robot.")
     if hook is not None:

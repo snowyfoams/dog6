@@ -126,9 +126,16 @@ about nothing:
 | | nominal | fold |
 |---|---|---|
 | `h` at the crouch | 0 mm | **60 mm** — starts in the air |
-| feet, trunk x | ±237 mm | **+215 front / −143 rear** |
-| reach used | 0.358 all round | 0.428 front / 0.350 rear |
-| support centroid | trunk origin | **36 mm ahead** of it |
+| feet, trunk x | ±237 mm | **+215 front / −154 rear** |
+| reach used | 0.358 all round | 0.428 front / 0.346 rear |
+| support centroid | trunk origin | **30.5 mm ahead** of it |
+
+The rear axle is not the capture's own. Since 2026-09-25 it is the front
+carried **parallel**: the same thigh and shin hung from the rear pitch hinge,
+so every knee is behind its hip — the front ones tucked under the abd motors,
+the rear ones out behind the rear hips. The capture's rear was parallel by
+hand only, with its feet at −143. From 2026-09-17 to 09-25 the rear was the
+front mirrored fore-aft instead.
 
 A pose owes the sequence exactly three things: `q` (what CROUCH and PARK drive
 to), `foot_xy` (where `ik_reference` **pins the feet** while the trunk rises,
@@ -172,9 +179,10 @@ at `NOMINAL_POSE`, and holding a folded crouch is a different stance.
 | `c^b` | (0.0, 0.0, −14.8) mm | **(−13.8, 0.0, −27.1) mm** |
 | `I^b` diag | 0.0281 / 0.2238 / 0.2406 | 0.0346 / **0.1587** / 0.1705 |
 
-(That fold column is the original, rear-tucked fold. Since 2026-09-17 the rear
-legs fold like the front ones and `FOLD` derives c^b (0.0, 0.0, −29.9) mm,
-I^b 0.0371 / 0.1399 / 0.1493 — no x offset left.)
+(That fold column is the original, rear-tucked fold. With the rear legs
+parallel to the front, since 2026-09-25, `FOLD` derives c^b (−10.7, 0.0,
+−29.9) mm and I^b 0.0371 / 0.1625 / 0.1719. Mirrored as the front, from
+2026-09-17 to 09-25, it had no x offset.)
 
 The 13.8 mm of `c^b` x was not cosmetic: every moment arm is
 `r_w = R(x_b − c^b)`, so on a 57.7 N robot it is **0.80 N·m of phantom pitch
@@ -325,11 +333,15 @@ Slew 60 N·m/s, DOG5's.
 And one DOG5 did differently: `reset` starts the clock mid the all-four
 window, every weight already 1, so pressing T moves no load.
 
-**The fold stance and a diagonal pair.** The CoM sits **17.2 mm behind both
-diagonal support lines**, so every swing is ~0.97 N·m of pitch moment no pair
-of feet can make, in the same direction for both diagonals. Nothing moves the
-feet or the trunk to fix it; the four-foot windows and the settle re-level, as
-in DOG5's demo. A nose-up that grows cycle by cycle is this.
+**The fold stance and a diagonal pair.** With the legs parallel (since
+2026-09-25) the CoM sits **14.8 mm behind both diagonal support lines**, so
+every swing asks ~0.85 N·m about the diagonal that no pair of feet can make.
+Its roll part, 0.80 N·m, changes sign with the diagonal. Its pitch part, 0.31
+N·m nose-up, is the same for both. The rear-tucked capture had 17.2 mm and
+~0.97 N·m; the rear mirrored as the front, 2026-09-17 to 09-25, had none.
+Nothing moves the feet or the trunk to fix it; the four-foot windows and the
+settle re-level, as in DOG5's demo. A nose-up that grows cycle by cycle is
+this.
 
 Offline, over two settle blocks with the swing tracked perfectly
 (`selftest` §12): no trip, peak 3.30 N·m (rear knee), Fz exactly the weight.

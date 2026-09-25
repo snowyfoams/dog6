@@ -169,6 +169,10 @@ class LawOutput:
     contact: np.ndarray | None = None    # (4,) the weight the allocator got
     swing_s: np.ndarray | None = None    # (4,) swing progress, 0 in stance
     p_swing: np.ndarray | None = None    # (4, 3) swing target, TRUNK; NaN in stance
+    #: (12,) `swing.swing_feedforward`'s share of `tau`: zeros unless the law
+    #: has `swing_ff` and the leg is swinging.  Logged so a run can say what
+    #: the feedforward did, apart from what the PD did.
+    tau_ff: np.ndarray | None = None
 
 
 @dataclass
@@ -202,6 +206,9 @@ class BalanceLaw:
     #: is while the attitude still reads fine.  `q_ref` is still computed and
     #: still logged either way.
     track_stop_deg: float | None = None
+    #: The sustained-residual trip, `allocation.ResidualMonitor`.  False turns
+    #: it OFF -- `hw.stand --no-limits` -- and keeps the peaks for the report.
+    residual_trip: bool = True
     #: The pinned c^b and I^b, `posture.CrouchPose.srb`.  None is the nominal
     #: `config.SRB`.  It reaches BOTH the reference and the measurement from
     #: here, which is what keeps the CoM offset cancelling in the z error.
@@ -215,6 +222,26 @@ class BalanceLaw:
     #: is the one number that scales the whole swing demand (speed, torque,
     #: slew) linearly, so it is the first thing to lower for a short swing.
     swing_height: float = cfg.SWING_HEIGHT
+    #: The swing's INERTIAL feedforward, `swing.swing_feedforward`: tau +=
+    #: M0 J^+ (a_ref - Jdot qd_ref) on each swing leg, open loop, both modes.
+    #: OFF unless the entry point says so (`--swing-ff`).  swing.py, "THE
+    #: INERTIAL TERM IS BACK", has what it is worth: ~90 % of the torque a
+    #: 15 mm / 140 ms arc asks for, which the PD was making out of error.
+    swing_ff: bool = False
+    #: The feedforward's 3x3 M0; None is `swing.JOINT_INERTIA_M0`, the
+    #: inherited armature.  `swing.feedforward_inertia(measured)` builds one
+    #: from a DOG6-measured armature (`--ff-armature`); swing.py says why.
+    ff_inertia: np.ndarray | None = None
+    #: The Cartesian swing PD's (x, y, z) gains, N/m and N s/m; None is
+    #: `config.KP_SWING` / `KD_SWING`, DOG5's 140/140/180 and 8/8/15.  WITH
+    #: THE FEEDFORWARD ON, Kp IS NOT THE LIFT ANY MORE AND STIFFENING IT
+    #: HURTS: a Cartesian PD without Lambda couples a z force into x through
+    #: M^-1 J^T -- one leg in its own dynamics, Kp_z 180 -> 800 took the x
+    #: drift from 2 to 10 mm.  Kd_z 15 -> 30 (zeta 0.28 -> 0.57) is the one
+    #: worth trying: z rms 3.5 -> 2.8 mm for 1 mm of x.  `--kp-swing`,
+    #: `--kd-swing`.
+    kp_swing: np.ndarray | None = None
+    kd_swing: np.ndarray | None = None
     #: The joint-space layer, `config.KP_JOINT_HOLD`: live only while
     #: `hold_joints` has latched a pose.  OFF (0 / 0) unless the entry point
     #: passes gains -- the trot entry points do, the plain stand does not.
@@ -276,7 +303,9 @@ class BalanceLaw:
         self.att_offset = np.zeros(3)
         self.setpoint_latched = False
         self.h0 = float("nan")
-        self.residual = ALLOC.ResidualMonitor()
+        self.residual = (ALLOC.ResidualMonitor() if self.residual_trip else
+                         ALLOC.ResidualMonitor(force_n=np.inf,
+                                               moment_nm=np.inf))
         self.timing = Timing()
         self.gravity = np.zeros((C.N_LEGS, 3))
         self.tau_peak = 0.0
@@ -540,6 +569,7 @@ class BalanceLaw:
         # -- the swing legs ------------------------------------------------
         q_ref = ik_reference(command.h, C.unflat(state.q), self.foot_xy)
         swing_s = p_swing = None
+        tau_ff = np.zeros(C.N_JOINTS)
         if clock_now is not None:
             swinging = ~clock_now.contact
             if self.foot_xy_to is not None:
@@ -555,10 +585,9 @@ class BalanceLaw:
                         else SWING.rest_feet_b(command.h, self.foot_xy_to))
                 q4 = C.unflat(state.q)
                 for i in np.flatnonzero(swinging):
-                    p, v = SWING.swing_reference(rest[i], float(swing_s[i]),
-                                                 gait.swing_duration,
-                                                 height=self.swing_height,
-                                                 land_b=land[i])
+                    p, v, a = SWING.swing_reference_pva(
+                        rest[i], float(swing_s[i]), gait.swing_duration,
+                        height=self.swing_height, land_b=land[i])
                     p_swing[i] = p
                     if self.swing == "joint":
                         # z only, abd held: no step destination to go to.
@@ -578,15 +607,28 @@ class BalanceLaw:
                             i, self._lift_x[i], float(swing_s[i]),
                             gait.swing_duration, self._lift_q[i],
                             height=self.swing_height)
-                        p_swing[i] = SWING.swing_reference(
+                        p_swing[i], v, a = SWING.swing_reference_pva(
                             self._lift_x[i], float(swing_s[i]),
-                            gait.swing_duration,
-                            height=self.swing_height)[0]
+                            gait.swing_duration, height=self.swing_height)
                         tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
                             state, i, qj, qdj)
                     else:
                         tau[3 * i:3 * i + 3] += SWING.swing_torque(
-                            state, i, p, v)
+                            state, i, p, v, kp=self.kp_swing, kd=self.kd_swing)
+                    if self.swing_ff:
+                        # THE ARC'S OWN INERTIAL TORQUE, OPEN LOOP -- swing.py,
+                        # "THE INERTIAL TERM IS BACK".  At the MEASURED q: the
+                        # reference's is a 191 us IK away in the Cartesian
+                        # mode, and the two differ by the tracking error, which
+                        # is what the PD beside it is for.  `v` and `a` are the
+                        # arc this leg is actually on -- the latched one in the
+                        # joint mode -- and Jdot qd_ref inside is what keeps
+                        # the foot on the arc's LINE, not just its height.
+                        ff = SWING.swing_feedforward(i, q4[i], v, a,
+                                                     jac=state.jac[i],
+                                                     inertia=self.ff_inertia)
+                        tau[3 * i:3 * i + 3] += ff
+                        tau_ff[3 * i:3 * i + 3] = ff
                     # THE TRACKING REFERENCE FOLLOWS A SWINGING LEG, as DOG5's
                     # q_ref did: pinned at the stance IK, the trip would read
                     # a 40 mm apex as a leg gone wrong.
@@ -628,7 +670,8 @@ class BalanceLaw:
                          wrench=wrench, allocation=allocation,
                          q_ref=C.flat(q_ref), imu_held=held, trip=trip,
                          state=state,
-                         contact=weight, swing_s=swing_s, p_swing=p_swing)
+                         contact=weight, swing_s=swing_s, p_swing=p_swing,
+                         tau_ff=tau_ff)
 
     def _trip(self, state, allocation, q_ref,
               monitor_residual: bool = True) -> str | None:

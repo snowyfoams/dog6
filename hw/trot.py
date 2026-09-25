@@ -34,7 +34,8 @@ a FASTER clock: 0.8 s a cycle (`PERIOD_S`), not 1.2.
 
 WHY THIS STANCE, AFTER THE FOLD ONE
     The fold trot tipped in roll on 2026-09-17.  That fold stance (rear legs
-    tucked; `posture.FOLD` has since been refolded rear-as-front) put the CoM
+    tucked; `posture.FOLD` was refolded rear-as-front that day, and parallel
+    again on 2026-09-25 -- 14.8 mm, see `hw.fold_trot`) put the CoM
     17.2 mm BEHIND both diagonal support lines, so every swing was ~0.97 N*m of
     moment no diagonal pair can make.  The nominal stance is symmetric:
 
@@ -139,6 +140,51 @@ AND THE YAW SPRING IS ON BECAUSE OF IT, 2026-09-24
     it on: the filter's xy is leg odometry, so a trunk that turns takes the
     whole stance with it and the xy stops being a claim about the filter.
 
+THE SWING FEEDFORWARD, 2026-09-25 (`--swing-ff`, off by default)
+    The operator's diagnosis: the swing law fed forward gravity and nothing
+    else, so the PD was making the arc's inertial torque -- 90 % of what a
+    15 mm / 140 ms arc asks -- out of tracking error.  That is why 15 mm did
+    not lift and 40 mm lifted shaking: the apex was a force gain, not a
+    height.  `balance.swing.swing_feedforward` adds M0 J^+ (a_ref - Jdot
+    qd_ref) per swing leg, open loop, in both swing modes; swing.py has the
+    measurement and the arithmetic.  It is no licence on the slew: it IS the
+    curve the banner holds against `--tau-slew`.  Its share of tau is logged
+    (`tau_ff`).
+
+    FLOWN THE SAME DAY, on the Cartesian swing: the foot lifts.  At 20 mm of
+    apex.  At 40 mm it came down hard enough to bounce the robot -- with the
+    inertial term in, the apex is real and so is the descent.  `--swing
+    joint` failed every run on this posture and stays the fold's.
+
+    AND ON THE BENCH THE FEEDFORWARD OVERSHOT.  Robot hung up, Cartesian
+    swing, 15 mm asked: 26 mm reached on all four legs (16-17 swings each),
+    |x| 15-21 mm, touchdown -0.3 to -0.65 m/s, tau_ff peak 2.0-2.3 N*m with
+    the PD at 0.5 -- and lowering the PD gains changed nothing, because the
+    feedforward is open loop.  The leg answered the model's torque with 1.7x
+    the model's motion: M0 is too big, and 61-96 % of M0 is the reflected
+    rotor, `params.ARMATURE`, DOG5's number, NOT MEASURED ON DOG6.
+    `hw.swing_bench --analyse` fits the armature the leg actually has from a
+    log's q and tau; `--ff-armature` puts it into the feedforward (both entry
+    points).  The x drift goes with it: pitch and knee are over-driven by
+    different factors, so the foot's acceleration tilts off the arc's line.
+
+    WHAT THE BENCH SETTLED ON THE SAME DAY: feedforward OFF, `--kd-swing 20
+    20 40`, tracked the apex well (the operator's reading).  Kd v_ref is a
+    velocity feedforward with no armature in it -- swing.py has the
+    arithmetic -- and it is the swing to carry to the trot first.
+
+    THE EXIT AT DUTY 0.72 RODE ON.  `full_support` -- all four at full
+    weight -- is true for one 4 ms sweep a cycle at that duty, because the
+    contact ramp fills the four-foot window; the T-latched exit mostly missed
+    it.  `sequence._four_foot_window` now falls back to the window's middle.
+
+    AND THE FIRST FORM DRIFTED IN x.  The operator watched the swing foot
+    leave the z line fore-aft and come back on the PD.  That was the Jdot
+    qdot the first cut left out: the chain's own curvature at the arc's
+    joint rates, a horizontal term the PD then had to undo.  One leg in its
+    own dynamics, 20 mm / 140 ms: 4.3 mm of x at touchdown without it, 0.8
+    with it.  It is in now, one Jacobian more.
+
 VELOCITY, THE WHOLE RUN, 2026-09-21
     `hw.velocity_estimator` -- the DETA10's accelerometer integrated, biases
     taken in LIMP -- printed as `v (x, y, z) m/s` under every status line,
@@ -198,10 +244,14 @@ TAU_CAP = SAFE.TAU_HARD_NM
 #: THE LARGER ONE (2026-09-24).  The arc's knee torque has to reach its peak
 #: inside a quarter of the swing, so the slew it needs is ~tau_peak / (swing
 #: / 4) -- `balance.swing.swing_demand`, printed in the banner against
-#: `--tau-slew`.  At 40 mm of apex: 160 ms of swing (this 0.8 s) needs ~200
-#: N*m/s, DOG5's 240 ms ~60, and 80 ms (a 0.4 s period at duty 0.80) ~1600
-#: with ~31 N*m at the knee -- past the 9 N*m cap, so that foot does not lift
-#: at any gain, and the trunk reads steady because it is still on four feet.
+#: `--tau-slew`.  At 40 mm of apex, on the leg's measured mass matrix
+#: (`leg_dynamics.mass_matrix`, 61-96 % of it the reflected rotor): 160 ms of
+#: swing (this 0.8 s) needs ~5 N*m and ~130 N*m/s, DOG5's 240 ms ~2.3 N*m and
+#: ~40, and 80 ms (a 0.4 s period at duty 0.80) ~20 N*m and ~1000 -- past the
+#: 9 N*m cap, which fits ~18 mm in that 40 ms half-swing.  The foot still
+#: lifts there (seen on the robot, 2026-09-25); what it cannot do is follow
+#: the arc, so what it does instead is the PD's behind the limiter, and the
+#: log's `x_b` against `p_swing` says which -- late and short, or wound up.
 #: The apex scales all of it linearly (`--swing-height`); the swing duration
 #: is (1 - duty) x period, so a short period needs a LOW duty to keep it.
 PERIOD_S = 0.8

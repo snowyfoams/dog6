@@ -942,6 +942,14 @@ def main() -> int:
     x_fold = SK.all_foot_positions(POSE.FOLD.q)
     close("...and all four feet are at ONE trunk-frame height",
           x_fold[:, 2], np.full(C.N_LEGS, x_fold[0, 2]), 1e-12, " m")
+
+    # PARALLEL, 2026-09-25: each rear leg is its front leg's shape hung from
+    # the rear pitch hinge -- thigh and shin the same vectors, trunk frame.
+    def _links(leg):
+        foot, anchors, *_ = SK.leg_frames(leg, POSE.FOLD.q[leg])
+        return np.concatenate((anchors[2] - anchors[1], foot - anchors[2]))
+    close("front and rear legs are PARALLEL: the same thigh, the same shin",
+          [*_links(2), *_links(3)], [*_links(0), *_links(1)], 1e-12, " m")
     check("regularising moved the height by under a millimetre",
           abs(POSE.FOLD.z_origin
               - (P.FOOT_RADIUS - SK.all_foot_positions(raw)[:, 2].mean())) < 1e-3,
@@ -999,9 +1007,9 @@ def main() -> int:
     check("...and under TAU_STAGED_MAX, so --tau-cap 3.0 can",
           tau_fold < 3.0, "%.2f N*m against the 3.0 N*m staged ceiling"
           % tau_fold)
-    check("front and rear share the weight: rear folded as the front",
-          abs(fz_fold[2:].sum() - fz_fold[:2].sum()) < 0.02 * fz_fold.sum(),
-          "front %.0f%% / rear %.0f%%, CoM over the support centroid"
+    check("the rear feet carry MORE of the weight, as the polygon says",
+          fz_fold[2:].sum() > fz_fold[:2].sum(),
+          "front %.0f%% / rear %.0f%%, CoM sits behind the support centroid"
           % (100 * fz_fold[:2].sum() / fz_fold.sum(),
              100 * fz_fold[2:].sum() / fz_fold.sum()))
 
@@ -1023,14 +1031,17 @@ def main() -> int:
     check("the arrays cannot be written through",
           not POSE.FOLD.srb.com_body.flags.writeable)
 
-    # The first fold run logged 0.67 N*m of steady pitch moment: the old
-    # rear-tucked fold put c^b 13.8 mm back.  Rear folded as the front
-    # (2026-09-17), the CoM is back over the trunk origin.
+    # The first fold run logged 0.67 N*m of steady pitch moment: the
+    # rear-tucked capture put c^b 13.8 mm back, and the law was pinned at the
+    # NOMINAL c^b.  The parallel fold (2026-09-25) puts it back again, so the
+    # per-posture model is what keeps that moment out of the law.
     dx = float(cfg.COM_BODY[0] - POSE.FOLD.srb.com_body[0])
     phantom = cfg.WEIGHT * abs(dx)
-    check("the refolded rear puts c^b x back on the nominal: no pitch bias",
-          phantom < 0.05,
-          "%.1f mm x %.1f N = %.2f N*m" % (1e3 * abs(dx), cfg.WEIGHT, phantom))
+    check("pinning the NOMINAL c^b in the fold stance is a phantom moment",
+          POSE.FOLD.srb.com_body[0] < 0.0 and 0.5 < phantom < 1.0,
+          "c^b x %+.1f mm: %.1f mm x %.1f N = %.2f N*m"
+          % (1e3 * POSE.FOLD.srb.com_body[0], 1e3 * abs(dx), cfg.WEIGHT,
+             phantom))
 
     # THE CANCELLATION com_command's docstring depends on: the reference and
     # the measurement must convert with the SAME c^b or the z error is biased.
@@ -1381,12 +1392,11 @@ def main() -> int:
               "worst %.3f N*m in 4 ms (%.0f N*m/s)" % (step, step / 0.004))
     # The nominal's residual is not zero only because the fixture trunk is
     # level and the setpoint is the config statics (-0.29 / +0.12 deg): the
-    # law asks for ~0.04 N*m of trim.  The fold's too, since the rear was
-    # refolded as the front (2026-09-17); before, the CoM sat 17.2 mm off.
-    check("both stances' diagonals pass through the CoM",
-          max(runs["nominal"][4], runs["fold"][4]) < 0.2,
-          "worst residual moment on two feet %.3f vs %.3f N*m"
-          % (runs["nominal"][4], runs["fold"][4]))
+    # law asks for ~0.04 N*m of trim.  The parallel fold's is the geometry,
+    # below.
+    check("the nominal's diagonals pass through the CoM",
+          runs["nominal"][4] < 0.2,
+          "worst residual moment on two feet %.3f N*m" % runs["nominal"][4])
 
     # The residual trip: suppressed on two feet, live on four.  A monitor that
     # fires on the first sweep with ANY residual makes the two cases differ
@@ -1399,8 +1409,21 @@ def main() -> int:
     two = next(t for t in ts if gait.sample(t).contact.sum() == 2)
     two_out = res_law.update(two, at_fold, gait=gait)
     check("on two feet the residual trip does not count the geometry",
-          two_out.trip is None and two_out.allocation.residual_moment > 1e-3,
+          two_out.trip is None and two_out.allocation.residual_moment > 0.5,
           "residual %.2f N*m, no trip" % two_out.allocation.residual_moment)
+    # THE GEOMETRY IS THE PARALLEL FOLD'S (2026-09-25): front feet 61 mm
+    # further out than the rear, and c^b 10.7 mm back, put the CoM d behind
+    # BOTH diagonal support lines -- W d of moment no diagonal pair can make,
+    # its pitch part nose-up on both, its roll part changing sign.  The
+    # rear-tucked capture had 17.2 mm; the rear mirrored as the front,
+    # 2026-09-17 to 09-25, had none.
+    on = np.flatnonzero(gait.sample(two).contact)
+    run = at_fold.x_b[on[1], :2] - at_fold.x_b[on[0], :2]
+    arm = fold.srb.com_body[:2] - at_fold.x_b[on[0], :2]
+    d = abs(run[0] * arm[1] - run[1] * arm[0]) / np.linalg.norm(run)
+    close("...and that residual IS W d, the CoM %.1f mm off the diagonal"
+          % (1e3 * d), two_out.allocation.residual_moment, cfg.WEIGHT * d,
+          0.05, " N*m")
     four_out = res_law.update(0.0, at_fold, gait=gait)
     check("...and on four feet the same monitor still trips",
           four_out.trip is not None and "residual" in four_out.trip,

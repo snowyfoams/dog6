@@ -2,12 +2,22 @@
 
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V -m hw.fold_stand --fake --auto 1          the whole path, no robot
-    $V -m hw.fold_stand --tau-cap 3.0 --log fold.npz
+    $V -m hw.fold_stand --log fold.npz           on the robot: LIMITS OFF, 9 N*m
+    $V -m hw.fold_stand --limits --tau-cap 3.0   the limits and the staged cap back
+
+    LIMITS OFF, 2026-09-25, on request, after the parallel fold did not stand
+    up: `--no-limits` is this script's default (`hw.stand.main`'s `limits`).
+    The soft joint limits (the gate's torque block and its e-stop), the
+    position-mode and torque-phase tracking trips, the tilt stop, the
+    residual trip and the overspeed trip are all OFF, and the lift cap is the
+    motors' own 9 N*m (`safety.TAU_HARD_NM`), as `hw.fold_trot`'s.  Still on:
+    `hw.stand.NO_LIMITS_KEPT` -- X, the drivers' health, the torque shaping.
+    `TILT_STOP_DEG` and `TRACK_STOP_DEG` below are what `--limits` flies.
 
     ROLL GAINS.  This script defaults roll to kp 290 / kd 23 (`ROLL_GAINS`);
     pitch stays at --kp-att / --kd-att (90 / 17).  Same units as --kp-att.
-    $V -m hw.fold_stand --tau-cap 3.0 --kp-roll 1000 --kd-roll 100
-    $V -m hw.fold_stand --tau-cap 3.0 --kp-roll 90 --kd-roll 17
+    $V -m hw.fold_stand --kp-roll 1000 --kd-roll 100
+    $V -m hw.fold_stand --kp-roll 90 --kd-roll 17
                                           roll back to the hw.stand default
 
 THE SRB BALANCE CONTROLLER ONLY.  There is no `--law` here and that is not an
@@ -35,11 +45,14 @@ THE EXPERIMENT, AND WHAT IT IS ACTUALLY ASKING
     agrees with the nominal one about nothing:
 
         h at the crouch     60 mm, NOT 0 -- the trunk starts in the air
-        feet, trunk x       +-215, against +-237 nominal; since 2026-09-17
-                            the rear folds as the front (knee motor toward
-                            the CoM), no longer tucked forward to -143
-        reach used          0.43, all four legs
-        knees               folded over the trunk, 111 mm from its origin
+        feet, trunk x       +215 / -154, against +-237 nominal; since
+                            2026-09-25 the rear legs are PARALLEL to the
+                            front (2026-09-17 to 09-25 mirrored as the
+                            front, at -215)
+        reach used          0.43 front, 0.35 rear
+        knees               behind every hip: the front ones tucked under
+                            the abd motors, 111 mm from the trunk origin,
+                            the rear ones out behind the rear hips, 258 mm
 
     The law should not care about any of that, and the question is whether it
     does.  Stage 4 builds the grasp map from the MEASURED foot positions, so
@@ -104,10 +117,20 @@ if __package__ in (None, ""):        # allow `python hw/fold_stand.py` too
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     __package__ = "hw"
 
+from . import safety as SAFE         # noqa: E402
 from . import stand as STAND         # noqa: E402
 from .balance import posture as POSE  # noqa: E402
 
-__all__ = ["main", "TILT_STOP_DEG", "ROLL_GAINS", "TRACK_STOP_DEG"]
+__all__ = ["main", "TILT_STOP_DEG", "ROLL_GAINS", "TRACK_STOP_DEG", "TAU_CAP",
+           "LIMITS"]
+
+#: `hw.stand.main`'s `limits`: OFF, on request 2026-09-25 -- see the module
+#: docstring.  `--limits` on the command line puts them back.
+LIMITS = False
+
+#: The lift cap: the motors' own, as `hw.fold_trot`'s.  `--tau-cap 3.0` is
+#: the staged one this script used to need.
+TAU_CAP = SAFE.TAU_HARD_NM
 
 #: The tilt e-stop for this script, in degrees FROM THE SETPOINT.  Raised from
 #: `config.TILT_STOP_DEG` (12) because the question this run exists to answer
@@ -155,11 +178,13 @@ ROLL_GAINS = (290.0, 23.0)
 
 
 def main(argv=None) -> int:
-    """`hw.stand.main`, from `posture.FOLD`, SRB only, IMU datum FIXED."""
+    """`hw.stand.main`, from `posture.FOLD`, SRB only, IMU datum FIXED,
+    limits OFF, the 9 N*m cap."""
     return STAND.main(argv, crouch=POSE.FOLD, dynamic_setpoint=False,
                       only_law="srb", tilt_stop=TILT_STOP_DEG,
                       roll_gains=ROLL_GAINS,
-                      track_stop=TRACK_STOP_DEG)
+                      track_stop=TRACK_STOP_DEG, tau_cap=TAU_CAP,
+                      tau_ceiling=TAU_CAP, limits=LIMITS)
 
 
 if __name__ == "__main__":
