@@ -943,13 +943,27 @@ def main() -> int:
     close("...and all four feet are at ONE trunk-frame height",
           x_fold[:, 2], np.full(C.N_LEGS, x_fold[0, 2]), 1e-12, " m")
 
-    # PARALLEL, 2026-09-25: each rear leg is its front leg's shape hung from
-    # the rear pitch hinge -- thigh and shin the same vectors, trunk frame.
-    def _links(leg):
+    # PARALLEL, 2026-09-25: each rear foot is where the regularised front
+    # leg's shape, hung from the rear pitch hinge, would put it -- then,
+    # 2026-09-28, the rear FOLD_REAR_FORWARD and the front FOLD_FRONT_FORWARD
+    # further forward in trunk x.  Every knee stays behind its hip.
+    def _frames(leg):
         foot, anchors, *_ = SK.leg_frames(leg, POSE.FOLD.q[leg])
-        return np.concatenate((anchors[2] - anchors[1], foot - anchors[2]))
-    close("front and rear legs are PARALLEL: the same thigh, the same shin",
-          [*_links(2), *_links(3)], [*_links(0), *_links(1)], 1e-12, " m")
+        return foot, anchors[1], anchors[2]      # foot, pitch hinge, knee
+    folded = POSE.regularise(POSE.FOLD_CAPTURED_Q)[:2] - P.HIP_TO_PITCH[:2]
+    for name, legs, ahead in (("front", (0, 1), POSE.FOLD_FRONT_FORWARD),
+                              ("rear", (2, 3), POSE.FOLD_REAR_FORWARD)):
+        close("%s feet: the captured front fold from their own pitch hinge, "
+              "%.0f mm ahead" % (name, 1e3 * ahead),
+              [*(_frames(legs[0])[0] - _frames(legs[0])[1]),
+               *(_frames(legs[1])[0] - _frames(legs[1])[1])],
+              [*(folded[0] + [ahead, 0.0, 0.0]),
+               *(folded[1] + [ahead, 0.0, 0.0])], 1e-12, " m")
+    check("...and every knee is still BEHIND its pitch hinge",
+          all(_frames(leg)[2][0] < _frames(leg)[1][0] for leg in range(4)),
+          "knee x - hinge x %s mm" % np.array2string(
+              1e3 * np.array([_frames(leg)[2][0] - _frames(leg)[1][0]
+                              for leg in range(4)]), precision=1))
     check("regularising moved the height by under a millimetre",
           abs(POSE.FOLD.z_origin
               - (P.FOOT_RADIUS - SK.all_foot_positions(raw)[:, 2].mean())) < 1e-3,
@@ -1033,12 +1047,14 @@ def main() -> int:
 
     # The first fold run logged 0.67 N*m of steady pitch moment: the
     # rear-tucked capture put c^b 13.8 mm back, and the law was pinned at the
-    # NOMINAL c^b.  The parallel fold (2026-09-25) puts it back again, so the
-    # per-posture model is what keeps that moment out of the law.
+    # NOMINAL c^b.  The parallel fold (2026-09-25) puts it back again, 10.7
+    # mm, and the rear feet forward (2026-09-28) 8.5, so the per-posture model
+    # is what keeps that moment out of the law.  The front feet forward too
+    # make it 6.2 mm.
     dx = float(cfg.COM_BODY[0] - POSE.FOLD.srb.com_body[0])
     phantom = cfg.WEIGHT * abs(dx)
     check("pinning the NOMINAL c^b in the fold stance is a phantom moment",
-          POSE.FOLD.srb.com_body[0] < 0.0 and 0.5 < phantom < 1.0,
+          POSE.FOLD.srb.com_body[0] < 0.0 and 0.3 < phantom < 1.0,
           "c^b x %+.1f mm: %.1f mm x %.1f N = %.2f N*m"
           % (1e3 * POSE.FOLD.srb.com_body[0], 1e3 * abs(dx), cfg.WEIGHT,
              phantom))
@@ -1155,6 +1171,7 @@ def main() -> int:
     # =====================================================================
     print("\n12. the trot in place (gait, swing, the trot half of the law)")
     from .. import fold_trot as FT
+    from .. import trot as TROT
     from . import gait as GAIT
     from . import swing as SWING
 
@@ -1262,15 +1279,18 @@ def main() -> int:
           SWING.swing_torque(at_fold, fl, rest[fl], np.zeros(3)),
           np.zeros(3), 1e-12, " N*m")
 
-    # THE FOLD'S JOINT SWING: the same arc through the IK, abd held.
+    # THE JOINT SWING (`--swing joint`): the same arc through the IK, abd
+    # held.  The fold trot's until 2026-09-28; checked here at the 2.0 s
+    # clock it was sized for, which is no longer `hw.fold_trot`'s.
+    joint_period = 2.0
     q_fold = C.unflat(at_fold.q)
     worst_abd = worst_xy = worst_z = worst_qd = 0.0
     for leg in range(C.N_LEGS):
         for s in np.linspace(0.0, 1.0, 41)[:-1]:
             qj, qdj = SWING.joint_swing_reference(
-                leg, rest[leg], s, FT.PERIOD_S * (1.0 - cfg.DUTY), q_fold[leg])
+                leg, rest[leg], s, joint_period * (1.0 - cfg.DUTY), q_fold[leg])
             pj, _ = SWING.swing_reference(rest[leg], s,
-                                          FT.PERIOD_S * (1.0 - cfg.DUTY))
+                                          joint_period * (1.0 - cfg.DUTY))
             xj = HK.foot_position(leg, qj)
             worst_abd = max(worst_abd, abs(qj[0] - q_fold[leg][0]))
             worst_xy = max(worst_xy, float(np.abs(xj[:2] - rest[leg][:2]).max()))
@@ -1302,9 +1322,9 @@ def main() -> int:
     latch_law.arm(0.0, at_fold)
     latch_law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
     off_q = C.unflat(at_fold.q).copy()
-    lat_gait = GAIT.TrotGait(period=FT.PERIOD_S)
+    lat_gait = GAIT.TrotGait(period=joint_period)
     lat_gait.reset(0.0)
-    t_lift = next(t for t in np.arange(0.0, FT.PERIOD_S, 0.004)
+    t_lift = next(t for t in np.arange(0.0, joint_period, 0.004)
                   if not lat_gait.sample(t).contact.all())
     lifter = int(np.flatnonzero(~lat_gait.sample(t_lift).contact)[0])
     hip_off = rest[lifter] - P.HIP_OFFSET[lifter] + [0.004, 0.0, 0.008]
@@ -1323,20 +1343,52 @@ def main() -> int:
           and float(np.abs(kick).max()) < 0.2,
           "PD at liftoff %s N*m (unlatched: 8 mm = ~4 N*m on the knee)"
           % np.array2string(kick, precision=3))
-    check("hw.fold_trot's swing lands >= 300 ms, where MuJoCo says it tracks",
-          FT.PERIOD_S * (1.0 - cfg.DUTY) >= 0.30,
-          "%.0f ms of swing" % (1e3 * FT.PERIOD_S * (1.0 - cfg.DUTY)))
+    # THE SAME LATCH IN THE CARTESIAN SWING, 2026-09-28: the fold trot walked
+    # in x on the resting-site arc, at 2 mm of apex as at 40.  The arc starts
+    # on the foot -- zero PD at liftoff -- and lands where it lifted, not on
+    # the site 8 mm away.
+    cart_law = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                              srb=fold.srb, track_stop_deg=0.0)
+    cart_law.arm(0.0, at_fold)
+    cart_law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
+    cart_out = cart_law.update(t_lift, off_state, gait=lat_gait)
+    on_foot = SWING.swing_reference(off_state.x_b[lifter], s0,
+                                    lat_gait.swing_duration)
+    on_site = SWING.swing_reference(rest[lifter], s0, lat_gait.swing_duration)
+    kick = SWING.swing_torque(off_state, lifter, *on_foot)
+    unlatched = SWING.swing_torque(off_state, lifter, *on_site)
+    p_land, v_land = SWING.swing_reference(off_state.x_b[lifter], 1.0,
+                                           lat_gait.swing_duration)
+    check("Cartesian swing, foot 8 mm off its site: the arc starts ON the "
+          "foot and lands there",
+          np.allclose(cart_law._lift_x[lifter], off_state.x_b[lifter],
+                      atol=1e-12)
+          and np.allclose(cart_out.p_swing[lifter], on_foot[0], atol=1e-12)
+          and np.allclose(p_land, off_state.x_b[lifter], atol=1e-12)
+          and np.allclose(v_land, 0.0, atol=1e-12)
+          and float(np.abs(kick).max()) < 0.2,
+          "PD at liftoff %s N*m; on the site it would be %s"
+          % (np.array2string(kick, precision=3),
+             np.array2string(unlatched, precision=3)))
+    check("hw.fold_trot: hw.trot's cap, the operator's clock and apex "
+          "(2026-09-28)",
+          FT.TAU_CAP == TROT.TAU_CAP and FT.PERIOD_S == 0.5
+          and FT.SWING_HEIGHT == 0.020,
+          "%.1f s, %.0f ms of swing, %.0f mm apex"
+          % (FT.PERIOD_S, 1e3 * FT.PERIOD_S * (1.0 - cfg.DUTY),
+             1e3 * FT.SWING_HEIGHT))
 
     # A tracked trot through two settle blocks: the law in each stance, the
     # swing legs where the arc says, the stance legs at the IK, the trunk
     # level.  The residual moment is what separates the two stances.
-    def _tracked_trot(pose, gains, period=None, **law_kw):
+    def _tracked_trot(pose, gains, period=None,
+                      swing_height=cfg.SWING_HEIGHT, **law_kw):
         at_pose = state_at(cfg.H_LIFT, foot_xy=pose.foot_xy, q_seed=pose.q,
                            srb=pose.srb)
         pose_rest = SWING.rest_feet_b(cfg.H_LIFT, pose.foot_xy)
         law = LAW.BalanceLaw(gains=gains, foot_xy=pose.foot_xy, srb=pose.srb,
                              dynamic_setpoint=False, track_stop_deg=25.0,
-                             **law_kw)
+                             swing_height=swing_height, **law_kw)
         law.arm(0.0, at_pose)
         law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
         clock = GAIT.TrotGait() if period is None else GAIT.TrotGait(
@@ -1350,7 +1402,8 @@ def main() -> int:
             q_t = q_stance.copy()
             for leg in np.flatnonzero(~sample.contact):
                 p_arc, _ = SWING.swing_reference(
-                    pose_rest[leg], sample.swing_s[leg], clock.swing_duration)
+                    pose_rest[leg], sample.swing_s[leg], clock.swing_duration,
+                    swing_height)
                 hip = p_arc.copy()
                 hip[:2] -= P.HIP_OFFSET[leg][:2]
                 q_t[leg] = HK.leg_ik(leg, hip, q_seed=q_stance[leg])
@@ -1369,8 +1422,8 @@ def main() -> int:
     fold_gains.kp_att[0], fold_gains.kd_att[0] = FS.ROLL_GAINS
     runs = {"fold": _tracked_trot(fold, fold_gains,
                                   period=FT.PERIOD_S,
-                                  tilt_stop_deg=FS.TILT_STOP_DEG,
-                                  swing="joint"),
+                                  swing_height=FT.SWING_HEIGHT,
+                                  tilt_stop_deg=FS.TILT_STOP_DEG),
             "nominal": _tracked_trot(POSE.NOMINAL, CTRL.BalanceGains())}
     for name, (trips, taus, fz_sum, heights, moment) in runs.items():
         step = float(np.abs(np.diff(taus, axis=0)).max())
@@ -1411,12 +1464,14 @@ def main() -> int:
     check("on two feet the residual trip does not count the geometry",
           two_out.trip is None and two_out.allocation.residual_moment > 0.5,
           "residual %.2f N*m, no trip" % two_out.allocation.residual_moment)
-    # THE GEOMETRY IS THE PARALLEL FOLD'S (2026-09-25): front feet 61 mm
-    # further out than the rear, and c^b 10.7 mm back, put the CoM d behind
-    # BOTH diagonal support lines -- W d of moment no diagonal pair can make,
-    # its pitch part nose-up on both, its roll part changing sign.  The
-    # rear-tucked capture had 17.2 mm; the rear mirrored as the front,
-    # 2026-09-17 to 09-25, had none.
+    # THE GEOMETRY IS THE PARALLEL FOLD'S (2026-09-25) WITH THE REAR FEET
+    # 20 mm AND THE FRONT 20 mm FORWARD (2026-09-28): front feet 101 mm
+    # further out than the rear, and c^b 6.2 mm back, put the CoM d = 20.4
+    # mm behind BOTH diagonal
+    # support lines -- W d of moment no diagonal pair can make, its pitch
+    # part nose-up on both, its roll part changing sign.  Exactly parallel it
+    # was 14.8 mm; the rear-tucked capture had 17.2; the rear mirrored as the
+    # front, 2026-09-17 to 09-25, had none.
     on = np.flatnonzero(gait.sample(two).contact)
     run = at_fold.x_b[on[1], :2] - at_fold.x_b[on[0], :2]
     arm = fold.srb.com_body[:2] - at_fold.x_b[on[0], :2]

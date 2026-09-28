@@ -17,9 +17,11 @@ following `--kp-att / --kd-att` (90 / 17) -- except the tilt stop, 45 deg
 (`TILT_STOP_DEG`), and the torque-phase tracking trip, OFF
 (`TRACK_STOP_DEG`).  Every one is still a flag.
 
-The trot is `hw.fold_trot`'s, from `trot_options` below -- the same swing,
-cap, slew and overspeed decision; that file's docstring says why each -- with
-a FASTER clock: 0.8 s a cycle (`PERIOD_S`), not 1.2.
+The trot is `trot_options` below -- the cap, slew and overspeed decision
+first made for `hw.fold_trot` -- with the Cartesian swing and a FASTER clock:
+0.8 s a cycle (`PERIOD_S`), not 1.2.  Since 2026-09-28 `hw.fold_trot` flies
+THIS trot from the fold crouch, on its own tested clock and apex (0.5 s,
+20 mm).
 
     $V -m hw.trot --period 0.6                  faster still
     $V -m hw.trot --settle 0                    no four-foot re-level
@@ -34,8 +36,9 @@ a FASTER clock: 0.8 s a cycle (`PERIOD_S`), not 1.2.
 
 WHY THIS STANCE, AFTER THE FOLD ONE
     The fold trot tipped in roll on 2026-09-17.  That fold stance (rear legs
-    tucked; `posture.FOLD` was refolded rear-as-front that day, and parallel
-    again on 2026-09-25 -- 14.8 mm, see `hw.fold_trot`) put the CoM
+    tucked; `posture.FOLD` was refolded rear-as-front that day, parallel
+    again on 2026-09-25 -- 14.8 mm -- and the feet forward, rear 20 mm and
+    front 20, on 2026-09-28 -- 20.4 mm, see `hw.fold_trot`) put the CoM
     17.2 mm BEHIND both diagonal support lines, so every swing was ~0.97 N*m of
     moment no diagonal pair can make.  The nominal stance is symmetric:
 
@@ -185,11 +188,23 @@ THE SWING FEEDFORWARD, 2026-09-25 (`--swing-ff`, off by default)
     own dynamics, 20 mm / 140 ms: 4.3 mm of x at touchdown without it, 0.8
     with it.  It is in now, one Jacobian more.
 
+THE ARC IS LATCHED AT LIFTOFF, 2026-09-28
+    The Cartesian arc now starts where the foot IS on the liftoff sweep and,
+    in place, lands there -- not on the resting site at the commanded
+    height.  The joint swing had that latch since 2026-09-17; the Cartesian
+    one gets it because the fold trot walked in x on it, at 2 mm of apex as
+    at 40, rpy held (the operator's report).  `balance.law.BalanceLaw.update`'s
+    swing block says why a resting site the feet do not stand on is a walk:
+    the joint layer holds the angles latched at HOLD, the arc landed on the
+    site, and two fixed points that disagree move the trunk every swing.  W's
+    step still lands on its destination.  The bench latches the same way.
+
 VELOCITY, THE WHOLE RUN, 2026-09-21
     `hw.velocity_estimator` -- the DETA10's accelerometer integrated, biases
     taken in LIMP -- printed as `v (x, y, z) m/s` under every status line,
     every phase from limp to park, yaw-free world frame.  Print only: the
-    law reads none of it.  No IMU, no velocity.  `hw.fold_trot` too.
+    law reads none of it.  No IMU, no velocity.  (`hw.fold_trot` printed it
+    too until 2026-09-28; it prints `hw.trot_esti`'s Kalman filter now.)
 
 KEYS
     ENTER  the stand's phases, as ever.  REFUSED while trotting or stepping.

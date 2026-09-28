@@ -1,7 +1,8 @@
 """The crouch a lift STARTS FROM, as an object rather than a constant.
 
     posture.NOMINAL     `sim.stand.Q_CROUCH` -- trunk on the floor, h = 0
-    posture.FOLD        the 2026-09-16 hand-captured fold, rear parallel, h = 60 mm
+    posture.FOLD        the 2026-09-16 hand-captured fold, rear parallel;
+                        rear and front feet 20 mm forward, h = 60 mm
     posture.WIDE        NOMINAL's feet 20 mm further out, h = 40 mm
 
 WHY THIS EXISTS.  `hw.stand` used to name `sim.stand.Q_CROUCH` in four places
@@ -49,10 +50,13 @@ A HAND-CAPTURED POSE IS NOT A POSE UNTIL IT HAS BEEN REGULARISED
     carried PARALLEL (2026-09-25): every leg folds the same way, knee behind
     its hip -- the front knees tucked under the abd motors, the rear ones out
     behind the rear hips -- and the rear thigh and shin are exactly the
-    front's.  NOT symmetric front to back: the rear feet sit 61 mm nearer the
-    trunk origin than the front ones.  The captured rear fold is kept only in
-    `FOLD_CAPTURED_Q`.  `selftest` gates the symmetry, the equal height and
-    the parallel legs.
+    front's.  Then (2026-09-28) the rear feet move `FOLD_REAR_FORWARD`, 20
+    mm, further forward and the front feet `FOLD_FRONT_FORWARD`, 20 mm,
+    every knee still behind its hip.  NOT symmetric front to back: the rear
+    feet sit 101 mm nearer the trunk origin than the front ones.  The
+    captured rear fold is kept only in `FOLD_CAPTURED_Q`.  `selftest`
+    gates the symmetry, the equal height, and each foot at the front
+    fold's site plus its shift.
 """
 from __future__ import annotations
 
@@ -204,15 +208,41 @@ NOMINAL = CrouchPose(
     z_origin=float(ST.CROUCH_HEIGHT), srb_pinned=cfg.SRB,
     note="sim.stand.Q_CROUCH -- shins vertical, trunk resting on the floor")
 
+#: m, how far AHEAD of the parallel site the rear feet sit, trunk x.  The
+#: operator's decision, 2026-09-28, after the fold trot: the rear leg's
+#: posture was not good and the foot could be more to the front.  20 mm.
+#: Knee still behind the hip; y and z the front's.  What it costs, from the
+#: kinematics: the rear knee hinge comes down from 27.5 to 11.3 mm above the
+#: floor in the 60 mm crouch, and the CoM goes from 14.8 to 18.5 mm behind
+#: both diagonals.
+FOLD_REAR_FORWARD = 0.020
+
+#: m, the same for the FRONT feet, ahead of the regularised capture.  The
+#: operator's decision, 2026-09-28: the front knee sat too close to the abd.
+#: A front foot moved +x takes its knee +x and down, away from it.  10 mm
+#: first, then 10 more the same day: 20 mm puts the crouch knee at x 130 mm
+#: against 111 (the abd hinge is at 156) and 84 mm below the abd axis
+#: against 67, and its hinge 11.3 mm above the floor against 27.5 -- the
+#: rear's clearance.  At the lift height the front knee is right under the
+#: abd hinge.  Applied AFTER the rear is carried parallel, so it moves the
+#: front feet alone.
+FOLD_FRONT_FORWARD = 0.020
+
+
 def _fold_sites() -> np.ndarray:
-    """The capture's FRONT axle, regularised, carried PARALLEL onto the rear.
+    """The capture's FRONT axle, regularised, carried PARALLEL onto the rear,
+    then the rear feet `FOLD_REAR_FORWARD` ahead and the front feet
+    `FOLD_FRONT_FORWARD` ahead.
 
     2026-09-25, the operator's decision: front and rear legs PARALLEL, every
     knee behind its hip -- the front fold, the knee tucked under the abd
     motor, and the rear leg the same shape: the same thigh, the same shin,
     hung from the rear pitch hinge.  The rear knee then sits out behind the
     rear hip, and the rear foot almost under the rear abd hinge, 2.3 mm
-    ahead of it.
+    ahead of it.  2026-09-28: the rear foot 20 mm further forward than
+    that and the front foot 20 mm, so all four legs are one shape again:
+    the capture's front fold with the foot 20 mm further forward, knee
+    behind the hip.
 
     THE REAR FOOT IS NOT THE FRONT'S HIP-FRAME SITE.  The pitch hinge is L1
     along the abduction axis from the abd hinge -- AHEAD of it on a front
@@ -226,6 +256,8 @@ def _fold_sites() -> np.ndarray:
     """
     hip = regularise(FOLD_CAPTURED_Q)
     hip[2:] = hip[:2] - P.HIP_TO_PITCH[:2] + P.HIP_TO_PITCH[2:]
+    hip[2:, 0] += FOLD_REAR_FORWARD
+    hip[:2, 0] += FOLD_FRONT_FORWARD
     return hip
 
 
@@ -250,8 +282,10 @@ def _fold_seed() -> np.ndarray:
 FOLD = CrouchPose.from_hip_sites(
     "fold", _fold_sites(), q_seed=_fold_seed(),
     note="hand-posed 2026-09-16, regularised: mirror symmetric, one foot "
-         "height; rear parallel to the front, 2026-09-25.  The trunk does NOT "
-         "start on the floor.")
+         "height; rear parallel to the front, 2026-09-25; rear feet %.0f mm "
+         "and front %.0f mm forward of that, 2026-09-28.  The trunk does NOT "
+         "start on the floor."
+         % (1e3 * FOLD_REAR_FORWARD, 1e3 * FOLD_FRONT_FORWARD))
 
 #: THE WIDE CROUCH, 2026-09-17: the feet splayed out, for the trot.
 #:

@@ -15,11 +15,19 @@ cMPC's swing law, eq (1), with two things taken out on the operator's word and
 on a measurement -- and nothing else changed:
 
     NO PLACEMENT (eq 33).  The operator's decision, 2026-09-16.  The arc
-    starts and ends at the same trunk-frame point: the foot's resting site in
-    the posture being held, which is the `foot_xy` the tracking reference
-    already pins and the height the reference is commanding.  This is exactly
-    DOG5's `swing_foot_body` with its step at zero, and it needs no velocity
-    estimate, no world position and no rotation -- DOG6 has none of the three.
+    starts and ends at the same trunk-frame point: WHERE THE FOOT IS ON THE
+    LIFTOFF SWEEP, latched (`law.BalanceLaw._lift_x`) -- the joint swing's
+    way since 2026-09-17, the Cartesian's since 2026-09-28.  Until then the
+    Cartesian arc ran from the foot's RESTING site, `foot_xy` at the
+    commanded height, and on 2026-09-28 the fold trot WALKED in x on it, at
+    2 mm of apex as at 40, rpy held (the operator's report).  A resting site
+    the feet do not stand on is a step every swing, and the joint layer,
+    holding the angles latched at HOLD, moves the trunk after the feet --
+    law.py's swing block has the arithmetic.  Start and end the same point
+    is DOG5's `swing_foot_body` with its step at zero, and it needs no
+    velocity estimate, no world position and no rotation -- DOG6 has none of
+    the three.  What it cannot do is hold the foot still in the WORLD: a
+    trunk that moves during the swing carries the foot with it.
 
     NO FEEDFORWARD (eq 2-3's Lambda and bias).  Measured on this Pi on
     2026-09-16: `sim.cmpc.swing.swing_torque` with feedforward is 2.3 ms PER
@@ -115,6 +123,13 @@ THE JOINT SWING, 2026-09-17: THE FOLD'S OWN, NOT SHARED
     y, no abduction.  Gains in `config.KP_SWING_JOINT`.  The nominal and wide
     trots keep the Cartesian swing they flew.
 
+    AND THE FOLD LEFT IT, 2026-09-28: the fold trot failed on the joint
+    swing -- the operator's report: the swing leg rushed, and the run ended
+    on a CAN missed-reply e-stop the swing leg caused, not the wiring.  No
+    log.  `hw.fold_trot` now flies `hw.trot`'s Cartesian swing, on the
+    clock and apex the operator tested best (0.5 s, 20 mm); `--swing
+    joint` still selects this one.
+
     AND THE NOMINAL TROT KEEPS IT FOR A REASON, 2026-09-25: `--swing joint`
     on that posture failed every run it was tried on.  What lifts the nominal
     trot's foot is the Cartesian PD WITH `--swing-ff` (below), at 20 mm of
@@ -154,7 +169,8 @@ __all__ = ["rest_feet_b", "swing_reference", "swing_reference_pva",
            "joint_swing_reference", "joint_swing_torque", "swing_demand",
            "SWING_MODES"]
 
-#: `law.BalanceLaw.swing`: the Cartesian impedance, or the fold's joint PD.
+#: `law.BalanceLaw.swing`: the Cartesian impedance, or the joint PD (`--swing
+#: joint`, the fold trot's until 2026-09-28).
 SWING_MODES = ("cartesian", "joint")
 
 
@@ -164,6 +180,11 @@ def rest_feet_b(h: float, foot_xy=None) -> np.ndarray:
 
     `foot_xy` is HIP-frame, as everywhere in this package; None is the
     nominal `sim.stand.FOOT_XY`.
+
+    NOT WHERE THE ARC STARTS, since 2026-09-28 in either mode: the law
+    latches the measured foot at liftoff for that (the module docstring, NO
+    PLACEMENT).  This site is the tracking reference's, the stance xy
+    spring's, a foot step's landing site, and the banner's swing demand.
     """
     foot_xy = ST.FOOT_XY if foot_xy is None else foot_xy
     height = float(h) + cfg.TRUNK_BOTTOM_OFFSET
@@ -178,9 +199,11 @@ def swing_reference_pva(rest_b, progress: float, duration: float,
                         height: float = cfg.SWING_HEIGHT, land_b=None):
     """``(p, v, a)`` for one foot, trunk frame, at swing `progress` in [0, 1].
 
-    `land_b` None lands on `rest_b`, the in-place trot.  Given, the arc
-    lands THERE instead -- the hold's foot step (`law.BalanceLaw.begin_step`),
-    not placement: a fixed trunk-frame point, no velocity term.  `a` is what
+    `rest_b` is the arc's START: the law passes the foot it latched at
+    liftoff, the selftest and the banner the resting site.  `land_b` None
+    lands back on `rest_b`, the in-place trot.  Given, the arc lands THERE
+    instead -- the hold's foot step (`law.BalanceLaw.begin_step`), not
+    placement: a fixed trunk-frame point, no velocity term.  `a` is what
     `swing_feedforward` turns into torque.
     """
     land_b = rest_b if land_b is None else land_b
@@ -213,9 +236,10 @@ def joint_swing_reference(leg: int, rest_b, progress: float, duration: float,
                           q_seed, height: float = cfg.SWING_HEIGHT):
     """``(q, qd)`` for one leg: the z-only arc through the IK, abd HELD.
 
-    `rest_b` is the TRUNK-frame resting site (`rest_feet_b`); `q_seed` picks
-    the IK branch -- pass the leg's measured joints.  Abd is fixed at the
-    resting site's IK angle for the whole swing, and pitch and knee alone
+    `rest_b` is the arc's start, TRUNK frame (the law passes the foot it
+    latched at liftoff); `q_seed` picks the IK branch -- pass the leg's
+    measured joints.  Abd is fixed at the start's IK angle for the whole
+    swing, and pitch and knee alone
     make the lift: their rates are the least-squares solve of the arc's z
     velocity through the Jacobian's pitch and knee columns.
     """

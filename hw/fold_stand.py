@@ -45,14 +45,17 @@ THE EXPERIMENT, AND WHAT IT IS ACTUALLY ASKING
     agrees with the nominal one about nothing:
 
         h at the crouch     60 mm, NOT 0 -- the trunk starts in the air
-        feet, trunk x       +215 / -154, against +-237 nominal; since
-                            2026-09-25 the rear legs are PARALLEL to the
-                            front (2026-09-17 to 09-25 mirrored as the
-                            front, at -215)
-        reach used          0.43 front, 0.35 rear
-        knees               behind every hip: the front ones tucked under
-                            the abd motors, 111 mm from the trunk origin,
-                            the rear ones out behind the rear hips, 258 mm
+        feet, trunk x       +235 / -134, against +-237 nominal; since
+                            2026-09-25 the rear legs fold PARALLEL to the
+                            front, and since 2026-09-28 the rear feet sit
+                            20 mm and the front 20 mm ahead of that
+                            (+215 / -154 before; 2026-09-17 to 09-25 the
+                            rear mirrored as the front, at -215)
+        reach used          0.48 front, 0.36 rear
+        knees               behind every hip: the front ones under the
+                            abd motors, 130 mm from the trunk origin, the
+                            rear ones out behind the rear hips, 239 mm;
+                            every knee hinge 11 mm above the floor
 
     The law should not care about any of that, and the question is whether it
     does.  Stage 4 builds the grasp map from the MEASURED foot positions, so

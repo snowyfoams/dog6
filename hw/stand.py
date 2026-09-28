@@ -743,6 +743,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          tau_ceiling: float = None, tau_slew: float = None,
          overspeed_trip: bool = True, step_to=None,
          step_period: float = None, swing: str = "cartesian",
+         swing_height: float = None,
          velocity: bool = False, estimator=None, hook=None,
          terse: bool = False, limits: bool = True) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
@@ -762,7 +763,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     `step_to` ((4, 2) hip-frame foot xy, needs `gait`) enables W: the hold
     steps the feet there, and steps them back before the park, on its own
     gait clock of `step_period` seconds (None: the trot's).
-    `swing` is `law.BalanceLaw.swing`: "joint" is the fold's z-only joint PD.
+    `swing_height` (m) is `--swing-height`'s default; None is
+    `config.SWING_HEIGHT`.
+    `swing` is `law.BalanceLaw.swing`: "joint" is the z-only joint PD the
+    fold trot flew until 2026-09-28; every trot entry point now takes the
+    default "cartesian".
     `hook` is an extra operator layer (`hw.sway.Sway`): its keys, a veto on
     ENTER, a call every sweep before the law, and lines for the banner and
     the status.  It turns the joint-space layer's flags on without a gait.
@@ -906,13 +911,15 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           help="the swing leg's controller: 'cartesian' is "
                                "the foot impedance the nominal trot flies -- "
                                "soft (~1 Hz at the foot), so pair it with "
-                               "--swing-ff; 'joint' is the FOLD's z-only arc "
+                               "--swing-ff; 'joint' is the z-only arc "
                                "through the IK with a joint PD, abd held -- "
                                "on the nominal trot it failed every run "
-                               "(2026-09-25)")
+                               "(2026-09-25), and the fold trot on it had "
+                               "the swing leg rush (2026-09-28)")
         trot.add_argument("--swing-height", type=float,
-                          default=1e3 * BCFG.SWING_HEIGHT, metavar="MM",
-                          help="the swing apex above the resting foot.  Speed, "
+                          default=1e3 * (BCFG.SWING_HEIGHT if swing_height is None
+                                         else swing_height), metavar="MM",
+                          help="the swing apex above the foot's liftoff point.  Speed, "
                                "torque and slew demand all scale with it, so "
                                "it is the first thing to lower for a fast "
                                "gait; the banner prints the demand.  With "
@@ -976,6 +983,14 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                 "damper only).  0 turns the spring off")
         joint.add_argument("--kd-joint", type=float,
                            default=BCFG.KD_JOINT_HOLD, metavar="NMS_PER_RAD")
+    law.add_argument("--kp-stance-xy", type=float, default=0.0, metavar="N_PER_M",
+                     help="a Cartesian spring on every PLANTED foot toward its "
+                          "trunk-frame site, x and y only, per leg -- trunk xy "
+                          "stiffness relative to the feet without the z the joint "
+                          "layer adds.  0 is off.  400 on four feet is 1600 N/m "
+                          "on the trunk, 2.6 Hz")
+    law.add_argument("--kd-stance-xy", type=float, default=0.0, metavar="NS_PER_M",
+                     help="its damping, per leg; ~25 is zeta 0.5 at 400 N/m")
     law.add_argument("--gravity-legs", type=int, default=4, choices=(1, 2, 4),
                      metavar="N", help="leg-gravity terms refreshed per sweep; "
                                        "4 removes the 12 ms cross-leg skew")
@@ -1084,6 +1099,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                             if gait is not None
                                             else BCFG.SWING_HEIGHT),
                               swing_ff=bool(gait is not None and args.swing_ff),
+                              kp_stance_xy=args.kp_stance_xy,
+                              kd_stance_xy=args.kd_stance_xy,
                               ff_inertia=(None if gait is None or args.ff_armature is None
                                           else BSWING.feedforward_inertia(args.ff_armature)),
                               **({} if gait is None else dict(
@@ -1197,6 +1214,12 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
              % (BCFG.SETPOINT_ROLL_DEG, BCFG.SETPOINT_PITCH_DEG)))
     if args.law == "srb":
         print("  LAW: SRB balance controller.  %s" % gains)
+        if args.kp_stance_xy > 0.0 or args.kd_stance_xy > 0.0:
+            print("       STANCE XY SPRING: every planted foot pulled to its trunk-frame "
+                  "site, x/y only, %.0f N/m %.0f N s/m per leg -- %.0f N/m on the trunk "
+                  "on four feet (%.1f Hz on %.1f kg), half that on a diagonal"
+                  % (args.kp_stance_xy, args.kd_stance_xy, 4 * args.kp_stance_xy,
+                     np.sqrt(4 * args.kp_stance_xy / BCFG.MASS) / (2 * np.pi), BCFG.MASS))
         print("       mu %.2f, leg gravity %d leg%s/sweep"
               % (args.mu, args.gravity_legs,
                  "" if args.gravity_legs == 1 else "s"))

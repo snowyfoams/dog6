@@ -214,13 +214,15 @@ class BalanceLaw:
     #: here, which is what keeps the CoM offset cancelling in the z error.
     srb: "cfg.SrbModel | None" = None
     #: The swing leg's controller, `swing.SWING_MODES`.  "cartesian" is the
-    #: impedance the nominal and wide trots flew; "joint" is the fold's: the
-    #: same z-only arc through the IK, abd held, joint PD.  See swing.py.
+    #: impedance every trot flies, the fold's too since 2026-09-28; "joint"
+    #: is the same z-only arc through the IK, abd held, joint PD, which the
+    #: fold trot flew until then.  See swing.py.
     swing: str = "cartesian"
-    #: m, the swing apex above the resting foot.  `config.SWING_HEIGHT` (40 mm,
-    #: DOG5's) unless the entry point says otherwise -- `--swing-height`.  It
-    #: is the one number that scales the whole swing demand (speed, torque,
-    #: slew) linearly, so it is the first thing to lower for a short swing.
+    #: m, the swing apex above the foot's liftoff point.  `config.SWING_HEIGHT`
+    #: (40 mm, DOG5's) unless the entry point says otherwise --
+    #: `--swing-height`.  It is the one number that scales the whole swing
+    #: demand (speed, torque, slew) linearly, so it is the first thing to
+    #: lower for a short swing.
     swing_height: float = cfg.SWING_HEIGHT
     #: The swing's INERTIAL feedforward, `swing.swing_feedforward`: tau +=
     #: M0 J^+ (a_ref - Jdot qd_ref) on each swing leg, open loop, both modes.
@@ -242,6 +244,18 @@ class BalanceLaw:
     #: `--kd-swing`.
     kp_swing: np.ndarray | None = None
     kd_swing: np.ndarray | None = None
+    #: THE STANCE XY SPRING, 2026-09-25, on request: each PLANTED foot pulled
+    #: toward its resting site in the TRUNK frame, x and y only, N/m and
+    #: N s/m per leg, on top of the SRB torque and the joint layer.  With the
+    #: feet on the floor that is trunk xy stiffness relative to the feet --
+    #: what the joint layer gives at 113 N/m per leg per 3 N*m/rad, but here
+    #: without the 1250 N/m of z that comes with it and fights the attitude
+    #: loop.  z is untouched: height is the SRB law's.  OFF at 0 (the trot
+    #: and the sway demos as they were); `--kp-stance-xy`, `--kd-stance-xy`.
+    #: Sizing: four feet at 400 N/m are 1600 N/m on 5.9 kg, 2.6 Hz; zeta 0.5
+    #: wants ~25 N s/m per leg.
+    kp_stance_xy: float = 0.0
+    kd_stance_xy: float = 0.0
     #: The joint-space layer, `config.KP_JOINT_HOLD`: live only while
     #: `hold_joints` has latched a pose.  OFF (0 / 0) unless the entry point
     #: passes gains -- the trot entry points do, the plain stand does not.
@@ -260,9 +274,9 @@ class BalanceLaw:
         #: `begin_step`.
         self.foot_xy_to: np.ndarray | None = None
         self._swinging = np.zeros(C.N_LEGS, dtype=bool)
-        #: The joint swing's LIFTOFF LATCH, (4, 3) each, NaN while the leg is
-        #: down: the measured trunk-frame foot and joints on the first
-        #: swinging sweep.  See the swing block in `update`.
+        #: THE LIFTOFF LATCH, (4, 3) each, NaN while the leg is down: the
+        #: measured trunk-frame foot and joints on the first swinging sweep.
+        #: The arc starts here in both modes; see the swing block in `update`.
         self._lift_x = np.full((C.N_LEGS, 3), np.nan)
         self._lift_q = np.full((C.N_LEGS, 3), np.nan)
         #: (12,) the joint layer's stance target, or None while it is off.
@@ -459,10 +473,11 @@ class BalanceLaw:
         """Move the feet to `foot_xy_to` (4, 2, HIP frame) with the gait.
 
         Drive `update` with a gait clock from here.  Every leg that swings
-        lands on its `foot_xy_to` site instead of where it left, and
-        `foot_xy` -- what the tracking reference and the next arc start from
-        -- takes the new site AT TOUCHDOWN, leg by leg.  One gait cycle moves
-        all four; `step_landed` says when.
+        lands on its `foot_xy_to` site instead of where it left (the arc
+        still STARTS on the foot, latched at liftoff), and `foot_xy` -- what
+        the tracking reference and the stance xy spring read -- takes the
+        new site AT TOUCHDOWN, leg by leg.  One gait cycle moves all four;
+        `step_landed` says when.
 
         THE SRB MODEL STAYS PINNED.  `srb` and `state.read`'s must be the
         same object or the CoM offset stops cancelling, and the runner reads
@@ -580,36 +595,48 @@ class BalanceLaw:
             swing_s = clock_now.swing_s
             p_swing = np.full((C.N_LEGS, 3), np.nan)
             if swinging.any():
-                rest = SWING.rest_feet_b(command.h, self.foot_xy)
-                land = (rest if self.foot_xy_to is None
+                # THE ARC STARTS WHERE THE FOOT IS, LATCHED AT LIFTOFF, AND IN
+                # PLACE IT LANDS THERE TOO -- not at `foot_xy` and the
+                # commanded height.  In BOTH modes since 2026-09-28.
+                #   The joint swing had it from 2026-09-17, when the first
+                # hardware run kicked hard: at 30 N*m/rad 10 mm of foot offset
+                # is 5 N*m on the knee, and a foot that slid, a pitched trunk
+                # (2 deg x 215 mm = 7.5 mm) or a trunk off the command all
+                # make that offset.  In MuJoCo with the runner's one-sweep
+                # delay and 40 Hz velocity filter, 8 mm of z offset demanded
+                # 94 N*m; latched, 1.0 N*m.
+                #   The Cartesian swing gets it after the fold trot WALKED in
+                # x on 2026-09-28, at 2 mm of apex as at 40, rpy held (the
+                # operator's report).  A resting site the feet do not stand
+                # on is a step every swing: the joint layer holds the angles
+                # latched at HOLD, so if the trunk reached HOLD with the feet
+                # m ahead of the site, each swing lands its foot m behind the
+                # layer's target and the layer then moves the trunk after it.
+                # Two pairs taking turns, quasi-static, the arithmetic goes
+                # 1/2, 3/4, 5/8, 11/16 ... -> 2/3 m of trunk a half cycle, in
+                # the direction opposite to m, for as long as the two fixed
+                # points disagree.  One fixed point cannot walk.  A step
+                # (`foot_xy_to`) still lands on its destination.  Nothing
+                # here reads a world position: a trunk that moves during the
+                # swing still carries the foot with it.
+                land = (None if self.foot_xy_to is None
                         else SWING.rest_feet_b(command.h, self.foot_xy_to))
                 q4 = C.unflat(state.q)
                 for i in np.flatnonzero(swinging):
+                    if not np.isfinite(self._lift_x[i, 0]):
+                        self._lift_x[i] = state.x_b[i]
+                        self._lift_q[i] = q4[i]
                     p, v, a = SWING.swing_reference_pva(
-                        rest[i], float(swing_s[i]), gait.swing_duration,
-                        height=self.swing_height, land_b=land[i])
+                        self._lift_x[i], float(swing_s[i]),
+                        gait.swing_duration, height=self.swing_height,
+                        land_b=None if land is None else land[i])
                     p_swing[i] = p
                     if self.swing == "joint":
                         # z only, abd held: no step destination to go to.
-                        # THE ARC STARTS WHERE THE FOOT IS, LATCHED AT LIFTOFF
-                        # -- not at `foot_xy` and a height.  The first hardware
-                        # run, 2026-09-17, kicked hard: at 30 N*m/rad 10 mm
-                        # of foot offset is 5 N*m on the knee, and a foot that
-                        # slid, a pitched trunk (2 deg x 215 mm = 7.5 mm) or
-                        # a trunk off the command all make that offset.  In
-                        # MuJoCo with the runner's one-sweep delay and 40 Hz
-                        # velocity filter, 8 mm of z offset demanded 94 N*m;
-                        # latched, 1.0 N*m.  The foot lands where it lifted.
-                        if not np.isfinite(self._lift_x[i, 0]):
-                            self._lift_x[i] = state.x_b[i]
-                            self._lift_q[i] = q4[i]
                         qj, qdj = SWING.joint_swing_reference(
                             i, self._lift_x[i], float(swing_s[i]),
                             gait.swing_duration, self._lift_q[i],
                             height=self.swing_height)
-                        p_swing[i], v, a = SWING.swing_reference_pva(
-                            self._lift_x[i], float(swing_s[i]),
-                            gait.swing_duration, height=self.swing_height)
                         tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
                             state, i, qj, qdj)
                     else:
@@ -638,6 +665,21 @@ class BalanceLaw:
         else:
             self._lift_x[:] = np.nan
             self._lift_q[:] = np.nan
+
+        # -- the stance xy spring ------------------------------------------
+        if self.kp_stance_xy > 0.0 or self.kd_stance_xy > 0.0:
+            rest = SWING.rest_feet_b(command.h, self.foot_xy)
+            planted = (np.ones(C.N_LEGS, dtype=bool) if clock_now is None
+                       else clock_now.contact)
+            qd4 = C.unflat(state.qd)
+            for i in np.flatnonzero(planted):
+                jac = state.jac[i]
+                e = rest[i] - state.x_b[i]
+                v = jac @ qd4[i]
+                f = np.array([self.kp_stance_xy * e[0] - self.kd_stance_xy * v[0],
+                              self.kp_stance_xy * e[1] - self.kd_stance_xy * v[1],
+                              0.0])
+                tau[3 * i:3 * i + 3] += jac.T @ f
 
         # -- the joint-space layer (DOG5's JointImpedance) ------------------
         # The joint angles latched on reaching HOLD are the target for every

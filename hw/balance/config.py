@@ -442,11 +442,20 @@ SETTLE_EVERY = 2                    # cycles  [DOG5 FLOWN]
 #: joint floor fights the swing"), so there it is the damper alone.  DOG5's reason for it: a pure force law is velocity-level, and a
 #: foot off the ground coasts; kp gives the joint a fixed point.  DOG5 put
 #: the value back to 3.0 on 2026-08-28 -- 8.0 was at the delay-phase gate
-#: and 15.0 shook at 9-12 Hz.  `--kp-joint` / `--kd-joint`.  [DOG5 FLOWN]
-KP_JOINT_HOLD = 3.0                 # N*m/rad
-KD_JOINT_HOLD = 0.1                 # N*m*s/rad
+#: and 15.0 shook at 9-12 Hz.  `--kp-joint` / `--kd-joint`.
+#:
+#: 5.0 / 0.2 SINCE 2026-09-25, ON REQUEST: a stiffer trunk.  Through the
+#: lift pose's Jacobian one leg's 3 N*m/rad was 113 / 111 / 1253 N/m in
+#: x / y / z and 5 is 189 / 186 / 2088 -- 755 N/m of trunk xy on four feet
+#: against 453, 377 on a diagonal against 226.  Between DOG5's flown 3.0 and
+#: its 8.0 gate; zeta on the knee's rotor goes 0.31 -> 0.47.  The z share
+#: (eleven times the xy) is the part that leans on the attitude loop, which
+#: is why the step past this is `--kp-stance-xy`, not more of this.
+#: [DOG5 FLOWN at 3.0 / 0.1; 5.0 / 0.2 is DOG6's]
+KP_JOINT_HOLD = 5.0                 # N*m/rad
+KD_JOINT_HOLD = 0.2                 # N*m*s/rad
 
-#: The swing apex above the resting foot, in the trunk frame.  [DOG5 FLOWN]
+#: The swing apex above the foot's liftoff point, trunk frame.  [DOG5 FLOWN]
 SWING_HEIGHT = 0.040                # m
 
 #: Swing-foot Cartesian impedance, TRUNK frame, (x, y, z).  N/m and N s/m --
@@ -456,7 +465,8 @@ SWING_HEIGHT = 0.040                # m
 KP_SWING = np.array([140.0, 140.0, 180.0])
 KD_SWING = np.array([8.0, 8.0, 15.0])
 
-#: The fold's JOINT swing, (abd, pitch, knee).  N*m/rad and N*m*s/rad.
+#: The JOINT swing (`--swing joint`), (abd, pitch, knee).  N*m/rad and
+#: N*m*s/rad.  The fold trot's until 2026-09-28, when it failed on it.
 #: [DERIVED -- NOT FLOWN; DOG5 had no joint swing to copy]
 #: From the reflected rotor alone, `params.ARMATURE` 0.0085 kg m^2, at the
 #: 250 Hz sweep: omega_n = sqrt(30 / 0.0085) = 59 rad/s, zeta = 0.79, and the
@@ -540,7 +550,7 @@ def describe() -> str:
         "    swing apex %.0f mm, no placement   Kp %s N/m  Kd %s N s/m   "
         "slew %.0f N*m/s"
         % (1e3 * SWING_HEIGHT, KP_SWING, KD_SWING, TAU_SLEW_TROT_NM_S),
-        "    joint swing (fold)   Kp %s N*m/rad  Kd %s N*m*s/rad   abd held"
+        "    joint swing          Kp %s N*m/rad  Kd %s N*m*s/rad   abd held"
         % (KP_SWING_JOINT, KD_SWING_JOINT),
         "    joint hold layer     Kp %.1f N*m/rad  Kd %.2f N*m*s/rad   every "
         "leg, q latched on reaching HOLD" % (KP_JOINT_HOLD, KD_JOINT_HOLD),

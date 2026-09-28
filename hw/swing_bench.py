@@ -320,10 +320,13 @@ class SwingBench:
                 self.tau_pd[sl] = pd
                 continue
             s = float(self.swing_s[i])
+            # THE ARC STARTS ON THE FOOT, latched at liftoff, in both modes
+            # -- as `law.update` does since 2026-09-28 (its swing block says
+            # why the resting site was a walk on the floor).
+            if not np.isfinite(self._lift_x[i, 0]):
+                self._lift_x[i] = body.x_b[i]
+                self._lift_q[i] = q4[i]
             if self.swing == "joint":
-                if not np.isfinite(self._lift_x[i, 0]):
-                    self._lift_x[i] = body.x_b[i]
-                    self._lift_q[i] = q4[i]
                 qj, qdj = SWING.joint_swing_reference(
                     i, self._lift_x[i], s, self.gait.swing_duration, self._lift_q[i],
                     height=self.swing_height)
@@ -332,7 +335,7 @@ class SwingBench:
                                                     height=self.swing_height)
                 pd = SWING.joint_swing_torque(body, i, qj, qdj)
             else:
-                p, v, a = SWING.swing_reference_pva(self.rest[i], s,
+                p, v, a = SWING.swing_reference_pva(self._lift_x[i], s,
                                                     self.gait.swing_duration,
                                                     height=self.swing_height)
                 pd = SWING.swing_torque(body, i, p, v, kp=self.kp_swing,
@@ -340,7 +343,7 @@ class SwingBench:
                 # THE ARC'S OWN IK, FOR THE GUARD AND THE REPORT ONLY -- no
                 # torque reads it.  191 us a leg, which this loop can afford.
                 qj, _ = SWING.joint_swing_reference(
-                    i, self.rest[i], s, self.gait.swing_duration, q4[i],
+                    i, self._lift_x[i], s, self.gait.swing_duration, q4[i],
                     height=self.swing_height)
             self.q_arc[i] = qj
             dev = np.degrees(np.abs(q4[i] - qj))
