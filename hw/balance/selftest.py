@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import replace
 
 import numpy as np
 
@@ -1587,6 +1588,18 @@ def main() -> int:
     expect[swing_now] = 0.0
     close("joint layer: stance legs get Kp (q_hold - q), swing legs no spring",
           with_layer - base, C.flat(expect), 1e-9, " N*m")
+    moving = replace(at_fold, qd=np.full(C.N_JOINTS, 2.0))
+    jn = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                        srb=fold.srb, track_stop_deg=0.0,
+                        kp_joint=cfg.KP_JOINT_HOLD, kd_joint=0.0)
+    jn.arm(0.0, at_fold)
+    jn.hold_joints(at_fold.q - dq)
+    expect = C.unflat(-cfg.KD_JOINT_HOLD * moving.qd).copy()
+    expect[swing_now] = 0.0
+    close("...and the damper: -Kd qd on stance legs, NONE on swing legs "
+          "(2026-10-01)",
+          jl.update(t_two, moving, gait=jg).tau
+          - jn.update(t_two, moving, gait=jg).tau, C.flat(expect), 1e-9, " N*m")
     jl.release_joints()
     close("...and released, the law is exactly the one without it",
           jl.update(t_two, at_fold, gait=jg).tau, base, 1e-12, " N*m")

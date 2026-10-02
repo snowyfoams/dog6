@@ -437,9 +437,11 @@ SETTLE_EVERY = 2                    # cycles  [DOG5 FLOWN]
 #: torque and the swing.  q_hold is the measured joint angles on the sweep
 #: the robot REACHES HOLD, fixed from then on through the hold and every
 #: trot: feet planted, fixed joints are a fixed trunk -- position and rpy.
-#: A W step releases it and re-latches at the new stance.  A SWINGING leg's
-#: target follows the leg, as DOG5's q_ref did ("left at the stance pose the
-#: joint floor fights the swing"), so there it is the damper alone.  DOG5's reason for it: a pure force law is velocity-level, and a
+#: A W step releases it and re-latches at the new stance.  A SWINGING leg
+#: gets NONE of the layer since 2026-10-01: before then its target followed
+#: the leg, as DOG5's q_ref did ("left at the stance pose the joint floor
+#: fights the swing"), and the damper alone stayed -- a drag on the arc that
+#: halved the apex (`law.BalanceLaw.update` says why it went).  DOG5's reason for it: a pure force law is velocity-level, and a
 #: foot off the ground coasts; kp gives the joint a fixed point.  DOG5 put
 #: the value back to 3.0 on 2026-08-28 -- 8.0 was at the delay-phase gate
 #: and 15.0 shook at 9-12 Hz.  `--kp-joint` / `--kd-joint`.

@@ -979,8 +979,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                            default=BCFG.KP_JOINT_HOLD, metavar="NM_PER_RAD",
                            help="the joint-space layer: every leg held at the "
                                 "joint angles latched on reaching HOLD, through "
-                                "the hold and the trot (a swinging leg gets the "
-                                "damper only).  0 turns the spring off")
+                                "the hold and the trot (a swinging leg gets "
+                                "none of it).  0 turns the spring off")
         joint.add_argument("--kd-joint", type=float,
                            default=BCFG.KD_JOINT_HOLD, metavar="NMS_PER_RAD")
     law.add_argument("--kp-stance-xy", type=float, default=0.0, metavar="N_PER_M",
@@ -1186,7 +1186,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         if args.joint_hold:
             print("       MODE joint-hold: every leg held at the angles "
                   "latched on reaching HOLD, hold and trot, Kp %.1f N*m/rad "
-                  "Kd %.2f N*m*s/rad; swing legs damper only"
+                  "Kd %.2f N*m*s/rad; swing legs none"
                   % (args.kp_joint, args.kd_joint))
         else:
             print("       MODE no-joint-hold: SRB alone -- height and rpy "

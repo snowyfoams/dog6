@@ -87,8 +87,9 @@ THE JOINT-SPACE LAYER, 2026-09-21
     fixed once and kept through the hold and every trot (every --half-gait
     press too) -- with the feet planted, fixed joints fix the trunk's
     position and rpy.  T does not re-latch it; W releases it and re-latches
-    at the new stance.  A swinging leg's target follows the leg -- the
-    damper alone, nothing pulling it back down.  DOG5's 3.0 / 0.1
+    at the new stance.  A swinging leg gets none of the layer -- no spring
+    pulling it back down and, since 2026-10-01, no damper dragging on the
+    arc either.  DOG5's 3.0 / 0.1
     (`config.KP_JOINT_HOLD`).
 
     TWO MODES, BOTH KEPT.  `--joint-hold` (the default) is the above.

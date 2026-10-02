@@ -683,16 +683,23 @@ class BalanceLaw:
 
         # -- the joint-space layer (DOG5's JointImpedance) ------------------
         # The joint angles latched on reaching HOLD are the target for every
-        # leg, standing or trotting: with the feet planted, fixed joints are
-        # a fixed trunk pose -- position AND rpy.  A swinging leg's target is
-        # where it IS, so it gets the damper and no spring pulling it down.
+        # PLANTED leg, standing or trotting: with the feet planted, fixed
+        # joints are a fixed trunk pose -- position AND rpy.
+        #   A SWINGING LEG GETS NONE OF IT, 2026-10-01, on request.  Until
+        # then its spring target followed the leg and the damper stayed:
+        # -Kd qd against an arc that runs the knee at 7-13 rad/s, 83 N s/m at
+        # the foot in z at 0.2 -- twice the swing PD's own Kd_z, all of it
+        # opposing the lift, and it halved a 20 mm apex in the one-leg model
+        # (doc/dog6_swing_leg.tex).  cMPC damps stance legs only, for the
+        # same reason (`sim.cmpc.controller`); the swing law is complete
+        # without it.  The bench never had it, so a swing tuned hung up is
+        # now the swing the trot flies.
         if self.q_hold is not None:
-            target = C.unflat(self.q_hold).copy()
+            hold = C.unflat(self.kp_joint * (self.q_hold - state.q)
+                            - self.kd_joint * np.asarray(state.qd))
             if clock_now is not None:
-                off = ~clock_now.contact
-                target[off] = C.unflat(state.q)[off]
-            tau += (self.kp_joint * (C.flat(target) - state.q)
-                    - self.kd_joint * np.asarray(state.qd))
+                hold[~clock_now.contact] = 0.0
+            tau += C.flat(hold)
 
         # -- the trips -----------------------------------------------------
         # THE RESIDUAL TRIP COUNTS ONLY FOUR-FOOT SWEEPS IN A TROT.  A pair of
