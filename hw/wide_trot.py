@@ -4,8 +4,8 @@
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V -m hw.wide_trot --fake --auto 1 --no-imu      the whole path, no robot
     $V -m hw.wide_trot --log wide.npz                on the robot: 160 mm,
-                                                     0.5 s / 20 mm, spring on
-    $V -m hw.wide_trot --period 0.8 --swing-height 40    hw.trot's clock
+                                                     0.6 s / 20 mm, spring on
+    $V -m hw.wide_trot --period 0.8 --swing-height 40    hw.trot's old clock
     $V -m hw.wide_trot --track 95                    the feet 10 mm further out
     $V -m hw.wide_trot --kp-stance-xy 0 --kd-stance-xy 0   the spring off
 
@@ -49,15 +49,17 @@ WHAT IT FLIES, AND WHY EACH PIECE
                   toward a CoM offset for ~0.5 deg less roll.  Pass 0 0 for
                   hw.trot's behaviour.
     THE REST      `hw.fold_trot`'s: `hw.trot.trot_options` (cap 9 N m, slew
-                  60, no overspeed trip), roll 290 / 23
+                  120, no overspeed trip), roll 290 / 23
                   (`fold_stand.ROLL_GAINS`), limits OFF (`fold_stand.LIMITS`,
                   `--limits` puts them back), the Cartesian swing, the joint
                   layer, `hw.trot_esti`'s Kalman filter printed under the
-                  status line.  The attitude setpoint is LATCHED in limp as
+                  status line and, since 2026-10-02, closing the hold's and
+                  the trot's x/y (`--no-est-xy`: printed only).  The attitude setpoint is LATCHED in limp as
                   hw.trot's (the robot starts flat on its belly).
-    THE CLOCK     0.5 s / 20 mm (`PERIOD_S`, `SWING_HEIGHT`), the operator's
-                  best clock on the robot; in simulation this posture also
-                  survives every perturbation at 0.8 s / 40 mm.
+    THE CLOCK     0.6 s / 20 mm (`PERIOD_S`, `SWING_HEIGHT`), the operator's
+                  best fold trot on the robot, 2026-10-02 (0.5 s before);
+                  in simulation this posture also survives every
+                  perturbation at 0.8 s / 40 mm.
 
 WHAT THE STUDY COULD NOT SETTLE (doc/trot_posture/README.md section 6)
     Everything above is simulation of the CAD model.  The real lateral CoM
@@ -92,15 +94,15 @@ from . import stand as STAND         # noqa: E402
 from . import trot as TROT           # noqa: E402
 from .balance import config as BCFG  # noqa: E402
 from .balance import posture as POSE  # noqa: E402
-from .trot_esti import EstimatorTap  # noqa: E402
 
 __all__ = ["main", "wide_posture", "pinned_at", "HEIGHT_MM", "PERIOD_S",
            "SWING_HEIGHT", "STANCE_XY", "TRACKS", "CROUCH_H"]
 
 #: mm, floor to trunk bottom, the stand -- `--height`'s default here.
 HEIGHT_MM = 160.0
-#: The clock and apex, the operator's best on the robot (hw.fold_trot's).
-PERIOD_S = 0.5
+#: The clock and apex, the operator's best on the robot (hw.fold_trot's,
+#: 2026-10-02; 0.5 s until then).
+PERIOD_S = 0.6
 SWING_HEIGHT = 0.020                 # m
 #: The stance xy spring, per leg: N/m, N s/m.  `--kp-stance-xy 0
 #: --kd-stance-xy 0` switches it off.
@@ -148,7 +150,7 @@ def _defaults(argv: list, pairs) -> list:
 
 def main(argv=None) -> int:
     """`hw.fold_trot`'s run from `wide_posture(--track)`, at `--height`
-    (160 mm), the stance xy spring on, 0.5 s / 20 mm."""
+    (160 mm), the stance xy spring on, 0.6 s / 20 mm."""
     argv = list(sys.argv[1:] if argv is None else argv)
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--track", type=float, default=TRACKS[0], choices=TRACKS,
@@ -162,7 +164,7 @@ def main(argv=None) -> int:
     return STAND.main(rest, crouch=crouch, only_law="srb",
                       tilt_stop=FS.TILT_STOP_DEG, roll_gains=FS.ROLL_GAINS,
                       track_stop=FS.TRACK_STOP_DEG, velocity=False,
-                      estimator=EstimatorTap, limits=FS.LIMITS,
+                      limits=FS.LIMITS,
                       swing_height=SWING_HEIGHT,
                       **TROT.trot_options(PERIOD_S))
 

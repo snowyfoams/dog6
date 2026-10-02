@@ -158,6 +158,11 @@ def test_the_filter_s_trust_ramp_is_wider_than_the_gait_s_load_ramp():
     Nothing is tuned here to fix that: `trust_window` is MIT's number and
     `CONTACT_RAMP` is DOG5's flown one, and the day the filter enters the loop
     is the day one of them has to give.  This test is where it will be noticed.
+
+    THAT DAY WAS 2026-10-01 (`hw.fully_trot`) AND NEITHER GAVE.  Matching the
+    window to the ramp made the estimate worse in MuJoCo -- 5.3 mm off the
+    true trunk after 10 s of the fold trot against 2.0 at MIT's 0.20 -- so
+    the gap pinned here is now the flown filter's, in the loop too.
     """
     gait = GAIT.TrotGait(period=0.8)
     gait.reset(10.0)
@@ -345,6 +350,80 @@ def test_the_tap_holds_no_reference_to_the_sweep_s_arrays():
     z = tap.out.p_w[2]
     tap.out.p_w[2] += 1.0
     assert tap.est.x[2] == z - P.FOOT_RADIUS
+
+
+# -- the feed: the same filter, IN THE LOOP (hw.fully_trot) -----------------
+def test_the_feed_hands_the_law_the_sweep_it_measured_and_the_world_it_is_in():
+    """`estimate()` is what `hw.stand.run` gives the law.  It must carry the
+    `now` of the sweep the filter READ -- the law ages it against its own --
+    the heading the filter's world is pinned to, and nothing at all until the
+    filter has an output in that world."""
+    from hw.fully_trot import EstimatorFeed
+    body, orientation = _body(rpy=(0.02, -0.01, 0.4))
+    feed = EstimatorFeed(None)
+    stand = _FakeStand(phase_name="hold", yaw_offset=0.4)
+    assert feed.estimate() is None
+    feed.update(1.000, stand, body, orientation)          # the reset sweep
+    assert feed.estimate() is None, "a reset sweep has no output yet"
+    feed.update(1.004, stand, body, orientation)
+    est = feed.estimate()
+    assert est.t == 1.004 and est.yaw_offset == 0.4
+    np.testing.assert_array_equal(est.p_w, feed.out.p_w)
+    np.testing.assert_array_equal(est.v_w, feed.out.v_w)
+    assert est.acc_age_s == orientation.acc_age_s
+    est.p_w[0] += 1.0                                     # a copy, not a view
+    assert feed.estimate().p_w[0] == feed.out.p_w[0]
+
+    stand.yaw_offset = 0.9                                # the world turns
+    feed.update(1.008, stand, body, orientation)
+    assert feed.estimate() is None, "an estimate from the old world survived"
+    feed.update(1.012, stand, body, orientation)
+    assert feed.estimate().yaw_offset == 0.9 and feed.estimate().t == 1.012
+
+
+def test_a_refused_sweep_leaves_the_last_estimate_to_age():
+    """No accelerometer on a sweep: the filter skips it, and the estimate
+    keeps the time it was MADE -- so the law sees it age, not refresh."""
+    from hw.fully_trot import EstimatorFeed
+    body, orientation = _body()
+    blind = IMU.TrunkOrientation(R=body.R, omega_b=np.zeros(3), roll=0.0,
+                                 pitch=0.0, yaw=0.0, age_s=0.0)
+    feed = EstimatorFeed(None)
+    stand = _FakeStand()
+    _run_tap(feed, stand, body, orientation, 10)
+    made = feed.estimate().t
+    feed.update(made + 0.004, stand, body, blind)
+    assert feed.refusal is not None and feed.estimate().t == made
+
+
+def test_a_broken_feed_stops_feeding():
+    """`hw.trot_esti`'s rule, carried into the loop: a filter that throws is
+    off, and from then on the law is handed None -- the flown x/y-free law."""
+    from hw.fully_trot import EstimatorFeed
+    body, orientation = _body()
+    feed = EstimatorFeed(None)
+    _run_tap(feed, _FakeStand(), body, orientation, 10)
+    assert feed.estimate() is not None
+
+    class _Exploding(_FakeStand):
+        @property
+        def phase_name(self):
+            raise RuntimeError("boom")
+
+        @phase_name.setter
+        def phase_name(self, value):
+            pass
+
+    _run_tap(feed, _Exploding(), body, orientation, 2)
+    assert feed.broken and feed.estimate() is None
+    assert "OFF" in feed.status()
+
+
+def test_the_feed_is_the_tap_s_filter():
+    """Same numbers as the read-out: MIT's trust window stayed (2026-10-01,
+    it made the MuJoCo estimate better than the gait's ramp did)."""
+    from hw.fully_trot import EstimatorFeed
+    assert EstimatorFeed(None).params == TE.EstimatorTap(None).params
 
 
 if __name__ == "__main__":

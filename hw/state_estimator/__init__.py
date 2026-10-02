@@ -31,17 +31,28 @@ THE HEIGHT DATUM
     says what taking it off `r[:, 2]` costs instead.
 
 WHO CALLS IT, AND WHAT IS STILL OPEN
-    `hw.trot_esti` does, and ONLY to print: `EstimatorTap` steps the filter
-    once per sweep off the same `BodyState` and `TrunkOrientation` the balance
-    law is given, and reads it out in every phase.  Nothing in the control path
-    reads a number that comes out of here.
+    `hw.trot_esti` and `hw.fold_trot` do, ONLY to print: `EstimatorTap` steps
+    the filter once per sweep off the same `BodyState` and `TrunkOrientation`
+    the balance law is given, and reads it out in every phase.
 
-    WHAT STANDS BETWEEN THAT AND THE LOOP IS 290 us.  One `update` is 290 us on
-    the Pi (2026-09-24) and the balance law already fills the 333 us CAN slot it
-    would have to share; `hw.stand.ESTIMATOR_SLOT` buys the read-out a slot of
-    its own, which is a luxury a controller does not have -- the law needs the
-    estimate before it acts.  The 28x28 solve in `lkf.update` is most of that
-    cost and is where the work is.
+    `hw.fully_trot` WAS THE FIRST CONTROL PATH THAT READS IT (2026-10-01): its
+    trot closes the wrench's x/y rows on the filter's x/y and rate
+    (`hw.balance.law.BalanceLaw.est_xy`).  SINCE 2026-10-02 EVERY TROT DOES,
+    on request: `trot.trot_options` brings `hw.trot_esti.EstimatorFeed` with
+    `--est-xy` on by default, `--no-est-xy` for print only -- and their HOLD
+    closes x/y on it too (the same day, on request).  STILL 290 us,
+    STILL ITS OWN SLOT:
+    one `update` is 290 us on the Pi (2026-09-24) and the balance law already
+    fills the 333 us CAN slot it would have to share, so the filter runs in
+    `hw.stand.ESTIMATOR_SLOT` and the law reads its answer one sweep late --
+    which a 0.5 Hz x/y loop can take and the attitude loop could not.  The
+    28x28 solve in `lkf.update` is most of that cost and is where the work is
+    if anything faster is ever to feed on it.
+
+    AND ITS x/y ARE LEG ODOMETRY.  In MuJoCo the fold trot's drift came
+    through planted feet sliding, which no row of this filter can see, so a
+    loop closed on its x/y holds the robot where the legs say it is
+    (`hw.fully_trot` has the numbers).
 
     Yaw is magnetometer-based and `hw.imu` calls it untrusted.  It enters
     through R_wb, so the x/y estimates are only as good as it is.  z and v_z

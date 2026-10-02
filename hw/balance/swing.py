@@ -15,19 +15,11 @@ cMPC's swing law, eq (1), with two things taken out on the operator's word and
 on a measurement -- and nothing else changed:
 
     NO PLACEMENT (eq 33).  The operator's decision, 2026-09-16.  The arc
-    starts and ends at the same trunk-frame point: WHERE THE FOOT IS ON THE
-    LIFTOFF SWEEP, latched (`law.BalanceLaw._lift_x`) -- the joint swing's
-    way since 2026-09-17, the Cartesian's since 2026-09-28.  Until then the
-    Cartesian arc ran from the foot's RESTING site, `foot_xy` at the
-    commanded height, and on 2026-09-28 the fold trot WALKED in x on it, at
-    2 mm of apex as at 40, rpy held (the operator's report).  A resting site
-    the feet do not stand on is a step every swing, and the joint layer,
-    holding the angles latched at HOLD, moves the trunk after the feet --
-    law.py's swing block has the arithmetic.  Start and end the same point
-    is DOG5's `swing_foot_body` with its step at zero, and it needs no
-    velocity estimate, no world position and no rotation -- DOG6 has none of
-    the three.  What it cannot do is hold the foot still in the WORLD: a
-    trunk that moves during the swing carries the foot with it.
+    starts and ends at the same trunk-frame point: the foot's resting site in
+    the posture being held, which is the `foot_xy` the tracking reference
+    already pins and the height the reference is commanding.  This is exactly
+    DOG5's `swing_foot_body` with its step at zero, and it needs no velocity
+    estimate, no world position and no rotation -- DOG6 has none of the three.
 
     NO FEEDFORWARD (eq 2-3's Lambda and bias).  Measured on this Pi on
     2026-09-16: `sim.cmpc.swing.swing_torque` with feedforward is 2.3 ms PER
@@ -137,6 +129,53 @@ THE JOINT SWING, 2026-09-17: THE FOLD'S OWN, NOT SHARED
     bounce the robot: with the inertial term in, the apex is real and so is
     the descent, whose speed scales with the apex.  20 mm is the flown number.
 
+THE KNEE SWING, 2026-10-02: ONLY THE SHIN MOVES  (`--swing knee`)
+    The operator's brief, for `hw.fold2_trot`: a new trajectory that swings
+    the shin alone, in the knee frame, with an apex, zero speed at
+    touchdown, smooth, mirror-correct on all four legs, every foot swinging
+    TOWARD the CoM.
+
+    IN THE KNEE FRAME THE FOOT HAS ONE DEGREE OF FREEDOM.  Abd and pitch are
+    held at the angles latched at liftoff, so the knee axis stays put in the
+    trunk and the foot runs on its own circle about it, 105 mm in radius:
+    the trajectory IS the knee angle, q_knee = q_lift + A phi(s) with
+    phi = 64 s^3 (1 - s)^3 (`knee_bump`) -- zero, zero slope and zero
+    curvature at liftoff and at touchdown, 1 with zero slope at s = 1/2.
+    Zero speed at touchdown, no torque step at either end, one apex, smooth
+    between.  The foot lands where it lifted.
+
+    THE SIGN IS THE KINEMATICS', NOT A TABLE.  A is signed per leg from the
+    knee column of the Jacobian at liftoff: the way that moves the foot
+    toward the CoM (x toward the trunk origin).  In `posture.FOLD2` that
+    folds every knee further -- +, -, -, + on FL, FR, RL, RR, each knee's
+    own sign, because the right legs are the left mirrored in y and the
+    front the rear mirrored in x.  The same +A on all four would fold two
+    knees and open two: two feet driven into the floor.
+
+    THE APEX IS SOLVED, NOT SCALED.  |A| is the angle at which the foot,
+    turning toward the CoM, is `height` above where it lifted in trunk z:
+    rise(A) = b sin A + a (1 - cos A), a the foot's depth below the knee
+    and b its rise per radian at liftoff (`knee_swing_amplitude`).  FOLD2's
+    160 mm hold, shin 14.9 deg inboard of vertical: 24.3 deg for 20 mm, the
+    foot 39 mm toward the CoM at the apex.
+
+    REFUSED WHERE THE SHIN LEANS OUTBOARD (b < 0): there a swing toward the
+    CoM first drives the foot into the floor.  `hw.fold_trot`'s front legs
+    are such legs (foot 25 mm ahead of the knee); `hw.stand` refuses `--swing
+    knee` on them before the bus opens.
+
+    WHAT IT ASKS, 120 ms / 20 mm at FOLD2's hold: knee ~12 rad/s and ~6.3
+    N*m to turn the shin round at the apex (the reflected rotor is 96 % of
+    it), nothing of the pitch -- against the z arc's knee 11.3 rad/s / 5.7
+    N*m AND pitch 6.6 / 5.1.  Joint PD on all three (`config.KP_SWING_KNEE`),
+    abd and pitch to their liftoff angles; `--swing-ff` adds M0 qdd_ref.
+
+    AND IT DOES NOT FIT IN 120 ms.  The bump's torque rate there is 836
+    N*m/s against the trot's 120 N*m/s slew; the PD winds up behind the
+    limiter and the knee flies past (`knee_swing_demand` has the MuJoCo
+    numbers).  240 ms of swing fits -- `--period 1.2` at duty 0.8 -- and is
+    the shortest `hw.stand` lets through at the default slew.
+
 WHY THE TRUNK FRAME AND NOT THE WORLD
     cMPC generates the reference in the world because placement involves the
     ground.  With placement off nothing does: the reference is a fixed point
@@ -156,6 +195,7 @@ if __package__ in (None, ""):        # allow `python hw/balance/swing.py`
     __package__ = "hw.balance"
 
 from sim import coordinates as C     # noqa: E402
+from sim import kinematics as SK     # noqa: E402
 from sim import leg_dynamics as LD   # noqa: E402
 from sim import params as P          # noqa: E402
 from sim import stand as ST          # noqa: E402
@@ -167,11 +207,13 @@ from . import config as cfg          # noqa: E402
 __all__ = ["rest_feet_b", "swing_reference", "swing_reference_pva",
            "swing_torque", "swing_feedforward", "feedforward_inertia",
            "joint_swing_reference", "joint_swing_torque", "swing_demand",
-           "SWING_MODES"]
+           "roll_level", "knee_bump", "knee_swing_amplitude",
+           "knee_swing_reference", "knee_swing_demand", "SWING_MODES"]
 
-#: `law.BalanceLaw.swing`: the Cartesian impedance, or the joint PD (`--swing
-#: joint`, the fold trot's until 2026-09-28).
-SWING_MODES = ("cartesian", "joint")
+#: `law.BalanceLaw.swing`: the Cartesian impedance, the joint PD (`--swing
+#: joint`, the fold trot's until 2026-09-28), or the knee alone (`--swing
+#: knee`, 2026-10-02, for `hw.fold2_trot`).
+SWING_MODES = ("cartesian", "joint", "knee")
 
 
 def rest_feet_b(h: float, foot_xy=None) -> np.ndarray:
@@ -180,11 +222,6 @@ def rest_feet_b(h: float, foot_xy=None) -> np.ndarray:
 
     `foot_xy` is HIP-frame, as everywhere in this package; None is the
     nominal `sim.stand.FOOT_XY`.
-
-    NOT WHERE THE ARC STARTS, since 2026-09-28 in either mode: the law
-    latches the measured foot at liftoff for that (the module docstring, NO
-    PLACEMENT).  This site is the tracking reference's, the stance xy
-    spring's, a foot step's landing site, and the banner's swing demand.
     """
     foot_xy = ST.FOOT_XY if foot_xy is None else foot_xy
     height = float(h) + cfg.TRUNK_BOTTOM_OFFSET
@@ -199,11 +236,9 @@ def swing_reference_pva(rest_b, progress: float, duration: float,
                         height: float = cfg.SWING_HEIGHT, land_b=None):
     """``(p, v, a)`` for one foot, trunk frame, at swing `progress` in [0, 1].
 
-    `rest_b` is the arc's START: the law passes the foot it latched at
-    liftoff, the selftest and the banner the resting site.  `land_b` None
-    lands back on `rest_b`, the in-place trot.  Given, the arc lands THERE
-    instead -- the hold's foot step (`law.BalanceLaw.begin_step`), not
-    placement: a fixed trunk-frame point, no velocity term.  `a` is what
+    `land_b` None lands on `rest_b`, the in-place trot.  Given, the arc
+    lands THERE instead -- the hold's foot step (`law.BalanceLaw.begin_step`),
+    not placement: a fixed trunk-frame point, no velocity term.  `a` is what
     `swing_feedforward` turns into torque.
     """
     land_b = rest_b if land_b is None else land_b
@@ -216,6 +251,21 @@ def swing_reference(rest_b, progress: float, duration: float,
     """``(p, v)`` -- `swing_reference_pva` without the acceleration."""
     p, v, _ = swing_reference_pva(rest_b, progress, duration, height, land_b)
     return p, v
+
+
+def roll_level(p, v, a, roll: float, roll_rate: float):
+    """``(p, v, a)`` of an arc taken in the trunk frame WITH THE ROLL REMOVED,
+    about the trunk origin, returned in the trunk frame -- `law.BalanceLaw.
+    swing_roll`, 2026-10-02.  `roll` is the trunk's roll from level, rad;
+    `roll_rate` its rate.  The leveled frame turns at -roll_rate about the
+    trunk x axis, so a point fixed in it moves in the trunk frame: that is
+    the second term of v.  `a` is only rotated -- its rate terms are second
+    order, and only `--swing-ff` reads it."""
+    m = C.rot_x(-float(roll))
+    p_b = m @ np.asarray(p, dtype=float)
+    v_b = (m @ np.asarray(v, dtype=float)
+           - float(roll_rate) * np.cross(C.X_AXIS, p_b))
+    return p_b, v_b, m @ np.asarray(a, dtype=float)
 
 
 def swing_torque(state, leg: int, p_ref, v_ref, kp=None, kd=None) -> np.ndarray:
@@ -236,10 +286,9 @@ def joint_swing_reference(leg: int, rest_b, progress: float, duration: float,
                           q_seed, height: float = cfg.SWING_HEIGHT):
     """``(q, qd)`` for one leg: the z-only arc through the IK, abd HELD.
 
-    `rest_b` is the arc's start, TRUNK frame (the law passes the foot it
-    latched at liftoff); `q_seed` picks the IK branch -- pass the leg's
-    measured joints.  Abd is fixed at the start's IK angle for the whole
-    swing, and pitch and knee alone
+    `rest_b` is the TRUNK-frame resting site (`rest_feet_b`); `q_seed` picks
+    the IK branch -- pass the leg's measured joints.  Abd is fixed at the
+    resting site's IK angle for the whole swing, and pitch and knee alone
     make the lift: their rates are the least-squares solve of the arc's z
     velocity through the Jacobian's pitch and knee columns.
     """
@@ -398,3 +447,95 @@ def joint_swing_torque(state, leg: int, q_ref, qd_ref, kp=None,
     qd = C.unflat(state.qd)[leg]
     return (kp * (np.asarray(q_ref, dtype=float) - q)
             + kd * (np.asarray(qd_ref, dtype=float) - qd))
+
+
+# ===========================================================================
+# the knee swing (`--swing knee`, 2026-10-02) -- the module docstring
+# ===========================================================================
+#: max |phi'|, |phi''| and |phi^(3)| of `knee_bump` over [0, 1]: 7.68 /
+#: sqrt 5 = 3.43 at s = (5 -+ sqrt 5) / 10, 24 at the apex, 384 at liftoff
+#: and touchdown.  The banner's speed, torque and torque rate.
+KNEE_BUMP_D1_MAX = 7.68 / np.sqrt(5.0)
+KNEE_BUMP_D2_MAX = 24.0
+KNEE_BUMP_D3_MAX = 384.0
+
+
+def knee_bump(progress: float) -> tuple[float, float, float]:
+    """``(phi, dphi/ds, d2phi/ds2)`` at swing progress s in [0, 1]:
+    phi = 64 s^3 (1 - s)^3.  0, 0, 0 at both ends; 1, 0, -24 at s = 1/2."""
+    s = min(max(float(progress), 0.0), 1.0)
+    u = s * (1.0 - s)
+    du = 1.0 - 2.0 * s
+    return (64.0 * u ** 3, 192.0 * u * u * du,
+            192.0 * (2.0 * u * du * du - 2.0 * u * u))
+
+
+def knee_swing_amplitude(leg: int, q, height: float) -> float:
+    """Signed rad the knee turns to the apex from the leg's joints `q`: the
+    way that moves the foot toward the CoM, by the angle that puts it
+    `height` above where it was in trunk z.  ValueError, with the reason,
+    where the shin leans outboard, lies flat, or cannot reach the apex."""
+    foot, anchors, axes, _, _ = SK.leg_frames(leg, np.asarray(q, dtype=float))
+    k = axes[2]
+    r = foot - anchors[2]
+    r_perp = r - k * float(k @ r)            # in the knee's rotation plane
+    t = np.cross(k, r_perp)                  # d(foot)/d(q_knee)
+    if abs(t[0]) < 1e-9:
+        raise ValueError("%s: the shin lies flat, no way toward the CoM"
+                         % C.LEGS[leg])
+    sign = -np.sign(foot[0]) * np.sign(t[0])  # x toward the trunk origin
+    a = -float(r_perp[2])                    # the foot's depth below the knee
+    b = float(sign * t[2])                   # its rise per rad, toward the CoM
+    if b < -1e-9:
+        raise ValueError("%s: the shin leans OUTBOARD (%.1f mm/rad down "
+                         "toward the CoM) -- swinging toward the CoM would "
+                         "drive the foot into the floor"
+                         % (C.LEGS[leg], -1e3 * b))
+    rho = float(np.hypot(a, b))
+    if a <= 0.0 or not -1.0 <= (height - a) / rho <= 1.0:
+        raise ValueError("%s: a %.0f mm apex is out of the shin's reach"
+                         % (C.LEGS[leg], 1e3 * height))
+    amp = float(np.arctan2(a, b) + np.arcsin((height - a) / rho))
+    return float(sign) * amp
+
+
+def knee_swing_reference(q_lift, amp: float, progress: float,
+                         duration: float):
+    """``(q, qd, qdd)`` for one leg: `q_lift` with the knee turned
+    ``amp * phi(s)``; abd and pitch at their liftoff angles, at rest."""
+    phi, d1, d2 = knee_bump(progress)
+    q = np.array(q_lift, dtype=float)
+    q[2] += amp * phi
+    qd = np.zeros(3)
+    qdd = np.zeros(3)
+    qd[2] = amp * d1 / duration
+    qdd[2] = amp * d2 / duration ** 2
+    return q, qd, qdd
+
+
+def knee_swing_demand(leg: int, q, duration: float, height: float) -> dict:
+    """What the knee swing asks from the leg's joints `q`: the signed
+    amplitude, how far the foot travels toward the CoM by the apex, the peak
+    knee speed and inertial torque (`JOINT_INERTIA_EST`'s knee), and the
+    bump's own peak TORQUE RATE, M0 |A| max|phi^(3)| / T^3, N*m/s.  Raises
+    as `knee_swing_amplitude`.
+
+    THE TORQUE RATE, NOT `swing_demand`'s QUARTER-SWING RISE, IS THE NUMBER
+    TO HOLD AGAINST THE GATE'S SLEW.  MuJoCo, `hw.fold2_trot`, 20 mm, slew
+    120: at 0.6 s of period (120 ms of swing, 836 N*m/s) the PD wound up
+    behind the limiter and the knee went to 66 deg for 24 -- apexes 85-99 mm,
+    and the PD-only run fell over; at 1.0 s (181) still 22-55 mm and -1.4
+    m/s landings, though the quarter-swing number there is 45; at 1.2 s
+    (105) apex 21 mm, touchdown +0.01 m/s, 6 mm of tracking, roll 0.27 deg
+    rms.  With slew 1000 the 0.6 s swing tracked (apex 23 mm) on the 9 N*m
+    cap.  `hw.stand` refuses `--swing knee` past the slew."""
+    amp = knee_swing_amplitude(leg, q, height)
+    q = np.asarray(q, dtype=float)
+    q_apex = q.copy()
+    q_apex[2] += amp
+    dx = abs(float(SK.foot_position(leg, q_apex)[0]
+                   - SK.foot_position(leg, q)[0]))
+    m0 = JOINT_INERTIA_EST[2] * abs(amp)
+    return dict(amp=amp, dx=dx, qd=abs(amp) * KNEE_BUMP_D1_MAX / duration,
+                tau=float(m0 * KNEE_BUMP_D2_MAX / duration ** 2),
+                slew=float(m0 * KNEE_BUMP_D3_MAX / duration ** 3))

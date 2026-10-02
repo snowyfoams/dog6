@@ -243,8 +243,10 @@ STATUS_EVERY_SWEEPS = 2
 #: THE TAP STILL SEES THE SWEEP'S OWN MEASUREMENT: `body` and `orientation` are
 #: latched at slot 0 and handed over here unchanged, so only the arithmetic
 #: happens 2 ms later, not the reading.  That is a luxury a tap can have and a
-#: controller cannot -- the law needs the estimate before it acts, which is
-#: exactly why `state_estimator.adapters.run_once` documents the order it does.
+#: fast controller cannot -- the law acts BEFORE this slot, which is exactly
+#: why `state_estimator.adapters.run_once` documents the order it does.
+#: The trots' x/y loop (`--est-xy`) feeds on it anyway, ONE SWEEP LATE (`run`'s
+#: `feed`): 4 ms is 0.7 deg of phase at that loop's 0.48 Hz.
 ESTIMATOR_SLOT = 6
 
 #: Low-pass on the finite-differenced encoder, the velocity the law damps
@@ -282,6 +284,12 @@ class StandLog:
         # the trot: NaN outside it.  x_b beside p_swing is the swing error.
         "contact_w": (C.N_LEGS,), "swing_s": (C.N_LEGS,),
         "p_swing": (C.N_LEGS, 3), "x_b": (C.N_LEGS, 3),
+        # the state estimator, when one is FED to the law (a trot's --est-xy):
+        # the estimate the law read (trunk origin, world), its age, the CoM
+        # x/y setpoint the trot holds, and 1 on the sweeps the x/y rows were
+        # driven by it.  NaN everywhere else.  b_d[0:2] is the force it asked.
+        "p_est": (3,), "v_est": (3,), "est_age": (), "xy_des": (2,),
+        "xy_on": (),
     }
 
     def __init__(self) -> None:
@@ -372,6 +380,53 @@ def _torque_lines(tau_cmd, tau_meas) -> str:
     return "\n".join(rows)
 
 
+def _crouch_report(stand, body) -> str:
+    """The crouch as REACHED: every joint commanded beside measured, every
+    foot from the FK, and the left/right mirror of each axle.
+
+    Printed ONCE, on the sweep the crouch's position ramp arrives (and again
+    when the park's does).  The crouch is the drivers' own position loop
+    against whatever the floor allows -- in the fold the knee motors meet
+    the floor before the joints meet their targets -- so the pose the robot
+    SITS in is not the pose it was sent, and a leg that stopped on the floor
+    earlier than its twin reads here as an error on that leg and as a foot
+    out of mirror.  The operator's 2026-10-01: the rear feet were not the
+    same in the fold crouch.  THIS TABLE SAYS WHICH LEG AND WHICH JOINT.
+
+    The angles are JOINT coordinates through the measured table, so a joint
+    whose measured angle MATCHES its command while the leg visibly does not
+    match its twin is a zero or a direction in `hw.hardware_map`, not the
+    floor: read it against a protractor with `hw.record --raw` and re-measure
+    that row with `calibrate_leg.py --ids N`.
+    """
+    q_cmd = C.unflat(np.degrees(np.asarray(stand.q_des, dtype=float)))
+    q = C.unflat(np.degrees(np.asarray(body.q, dtype=float)))
+    x = 1e3 * np.asarray(body.x_b, dtype=float)
+    legs = ("FL", "FR", "RL", "RR")
+    rows = ["  CROUCH REACHED -- joint angles (deg) and feet (mm, trunk frame):",
+            "   leg   abd cmd / meas / err   pitch cmd / meas / err   "
+            "knee cmd / meas / err  |  foot x      y      z"]
+    for i, leg in enumerate(legs):
+        e = q[i] - q_cmd[i]
+        rows.append("   %-3s %+7.1f %+7.1f %+5.1f   %+7.1f %+7.1f %+5.1f   "
+                    "%+7.1f %+7.1f %+5.1f  |  %+7.1f %+6.1f %+6.1f"
+                    % (leg, q_cmd[i, 0], q[i, 0], e[0], q_cmd[i, 1], q[i, 1], e[1],
+                       q_cmd[i, 2], q[i, 2], e[2], *x[i]))
+    rows.append("   mirror, left MINUS right (a symmetric pose reads 0 everywhere; "
+                "joints mirror by sign, so the sum is printed):")
+    for lo, hi, axle in ((0, 1, "front"), (2, 3, "rear")):
+        dq = q[lo] + q[hi]
+        rows.append("   %-5s joints abd %+5.1f  pitch %+5.1f  knee %+5.1f deg  |  "
+                    "feet dx %+5.1f  d|y| %+5.1f  dz %+5.1f mm"
+                    % (axle, *dq, x[lo, 0] - x[hi, 0], abs(x[lo, 1]) - abs(x[hi, 1]),
+                       x[lo, 2] - x[hi, 2]))
+    worst = int(np.argmax(np.abs(np.asarray(body.q) - np.asarray(stand.q_des))))
+    rows.append("   largest tracking error: %s, %.1f deg"
+                % (HM.JOINT_LABELS[worst],
+                   np.degrees(abs(float(body.q[worst]) - float(stand.q_des[worst])))))
+    return "\n".join(rows)
+
+
 class VelocityTap:
     """`hw.velocity_estimator` on the stand's own IMU, for the status lines.
 
@@ -416,11 +471,50 @@ class VelocityTap:
                 % (v[0], v[1], v[2], self.est.elapsed_s))
 
 
+class SwingHeight:
+    """The swing foot's REAL height, for the trot's status lines: its FK above
+    the floor the planted feet stand on, peaked over each swing.
+
+    From the law's own state, which while trotting is `state.on_stance`'s:
+    `z_origin` is the trunk above the feet that are DOWN, so z_origin -
+    FOOT_RADIUS + (R x_b)_z is a foot's clearance in the WORLD -- zero on
+    average for a planted foot, the lift for a swinging one, the trunk's
+    tilt taken out by the IMU (none of it without one).  `--swing-height` is
+    what the arc ASKS, trunk frame, above the resting foot; this is what the
+    foot DID.  Print only: nothing reads it.
+    """
+
+    def __init__(self) -> None:
+        self.peak = np.full(C.N_LEGS, np.nan)    # m, the swing in flight
+        self.last = np.full(C.N_LEGS, np.nan)    # m, each leg's last whole swing
+
+    def update(self, out) -> None:
+        """Every sweep; `out` is the law's output while trotting, else None."""
+        if out is None or out.state is None or out.swing_s is None:
+            self.peak[:] = np.nan                # a swing cut off is not a swing
+            return
+        st = out.state
+        z = st.z_origin - P.FOOT_RADIUS + st.x_b @ st.R[2]
+        up = np.asarray(out.swing_s) > 0.0
+        landed = ~up & np.isfinite(self.peak)
+        self.last[landed] = self.peak[landed]
+        self.peak[landed] = np.nan
+        self.peak[up] = np.fmax(self.peak[up], z[up])
+
+    def status(self, asked: float) -> str:
+        return ("swing foot apex %.0f mm asked, reached %s mm (last swing, "
+                "above the planted feet)"
+                % (1e3 * asked, "  ".join(
+                    "%s %s" % (C.LEGS[i], " -- " if not np.isfinite(z)
+                               else "%4.1f" % (1e3 * z))
+                    for i, z in enumerate(self.last))))
+
+
 def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         auto_s: float | None = None, clock=time.perf_counter,
         imu=None, log: "StandLog | None" = None,
         velocity: "VelocityTap | None" = None, estimator=None,
-        hook=None, terse: bool = False) -> str | None:
+        hook=None, terse: bool = False, feed: bool = False) -> str | None:
     """Drive `stand` on an ARMED `mb` until done, X, or a trip.
 
     Returns the stop reason, or None for a clean exit from "done".  Does not
@@ -439,10 +533,16 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     `status() -> str`, which may hand back several lines, under every status
     line.  `hw.trot_esti.EstimatorTap` is one, over `hw.state_estimator`'s
     filter; it costs as much as the law does, so it is stepped in
-    `ESTIMATOR_SLOT` on the sweep's own latched measurement.  NOTHING HERE
-    READS WHAT EITHER TAP RETURNS: the law is fed by `stand.update(now, body)`
-    alone, and the day a tap does enter the loop it stops being a tap and this
-    argument is the wrong door.
+    `ESTIMATOR_SLOT` on the sweep's own latched measurement.  Without `feed`
+    NOTHING HERE READS WHAT EITHER TAP RETURNS: the law is fed by
+    `stand.update(now, body)` alone.
+    `feed` True is the estimator IN THE LOOP (a trot's `--est-xy`), and its door
+    is not the tap's return value: after each `update` the runner hands
+    `estimator.estimate()` -- a `balance.law.TrunkEstimate`, or None -- to
+    `stand.feed_estimate`, and the law reads it on the NEXT sweep's slot 0.
+    One sweep late, 4 ms, because slot 0 has no room for the filter; the law
+    ages every estimate and uses none past `config.EST_MAX_AGE_S`.  What it
+    does with one is `balance`'s decision, not this loop's.
     `hook` is `main`'s: keys, an ENTER veto, and a call every sweep.
 
     `terse` cuts the 2 Hz stream down to the phase's OWN line -- rpy, its
@@ -470,6 +570,9 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     q = np.zeros(n)
     worst_gap = np.zeros(n)
     overruns = 0
+    #: `_crouch_report`, once per arrival of a position ramp (crouch, park).
+    pose_reported = False
+    swing_z = SwingHeight()
     imu_warned = False
     # The phase NAME as well as the index: the trot is a sub-state of hold
     # and changes the name without changing the index.
@@ -495,9 +598,11 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
             # decides what to do about the age.  A sweep that blocks on the
             # IMU is a sweep that misses its CAN deadline.
             orientation = level if imu is None else (imu.orientation() or level)
-            # The SRB model is the POSTURE'S, not the module constant's -- the
-            # measurement must use the same c^b the reference does.
-            body = BSTATE.read(q, qd_ctrl, orientation, srb=stand.crouch.srb)
+            # The SRB model is the LAW'S -- the posture's, pinned at the hold
+            # height `--height` asked for -- not the module constant's: the
+            # measurement must use the same c^b the reference does, and the
+            # same object.
+            body = BSTATE.read(q, qd_ctrl, orientation, srb=stand.balance.srb)
             stand.body = body
             if velocity is not None:
                 said = velocity.update(stand.phase_name == "limp")
@@ -614,6 +719,9 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
             if reason:
                 return reason
 
+            swing_z.update(stand.out if mode == "torque" and stand.trotting
+                           else None)
+
             if log is not None and mode == "torque":
                 out = stand.out
                 if out is not None and out.state is not None:
@@ -635,7 +743,20 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                         contact_w=None if out is None else out.contact,
                         swing_s=None if out is None else out.swing_s,
                         p_swing=None if out is None else out.p_swing,
-                        x_b=body.x_b)
+                        x_b=body.x_b,
+                        **({} if not feed or out is None
+                           or out.estimate is None else dict(
+                               p_est=out.estimate.p_w, v_est=out.estimate.v_w,
+                               est_age=out.est_age_s, xy_des=out.xy_des,
+                               xy_on=float(out.xy_on))))
+
+            # THE CROUCH AS REACHED, once, the sweep the position ramp arrives.
+            if stand.phase_name in ("crouch", "park"):
+                if stand.ramp_remaining(now) <= 0.0 and not pose_reported:
+                    print(_crouch_report(stand, body), flush=True)
+                    pose_reported = True
+            else:
+                pose_reported = False
 
             if now - last_status >= STATUS_PERIOD_S:
                 last_status = now
@@ -671,6 +792,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                                  "  SETTLE" if stand.gait.settling(now) else "",
                                  "  exit latched" if stand.trot_exit else ""),
                               flush=True)
+                        print("          " + swing_z.status(
+                            stand.balance.swing_height), flush=True)
                     if not terse:
                         print("          %s  imu %3.0f ms%s%s"
                               % (watch.moment_status(),
@@ -678,10 +801,17 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                                  " STALE" if body.imu_stale else "", tail),
                               flush=True)
                 else:
-                    print("   %-6s t=%5.1f  h_cmd=%6.1f  %s%s"
+                    track = ""
+                    if stand.phase_name in ("settle", "crouch", "park", "done") \
+                            and stand.q_des is not None and not terse:
+                        err = np.abs(np.asarray(body.q) - np.asarray(stand.q_des))
+                        k = int(np.argmax(err))
+                        track = "  track %.1f deg (%s)" % (np.degrees(err[k]),
+                                                           HM.JOINT_LABELS[k])
+                    print("   %-6s t=%5.1f  h_cmd=%6.1f  %s%s%s"
                           % (stand.phase_name, now - stand.t_phase,
                              1e3 * BSTATE.origin_to_height(stand.h_cmd),
-                             body.status(), tail), flush=True)
+                             body.status(), track, tail), flush=True)
                 if velocity is not None and not terse:
                     print("          " + velocity.status(), flush=True)
                 if estimator is not None:
@@ -723,6 +853,10 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         if k == est_slot and est_sweep is not None:
             said = estimator.update(*est_sweep)
             est_sweep = None
+            if feed:
+                # THE ESTIMATOR IN THE LOOP: its answer goes to the law, which
+                # reads it at the next slot 0 and decides what it is worth.
+                stand.feed_estimate(estimator.estimate())
             if said:
                 print("\n   " + said, flush=True)
 
@@ -745,7 +879,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          step_period: float = None, swing: str = "cartesian",
          swing_height: float = None,
          velocity: bool = False, estimator=None, hook=None,
-         terse: bool = False, limits: bool = True) -> int:
+         terse: bool = False, limits: bool = True,
+         rise_track: bool = False, height: float = None,
+         stand_xy=None, slide_from: float = None,
+         est_xy: bool = None) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -779,6 +916,22 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     is done: `hw.trot_esti` passes a class.
     `terse` is `run`'s: the 2 Hz stream carries the phase's rpy line and the
     taps, and nothing else.
+    `rise_track` is `--rise-track`'s default: the joint-space layer holds
+    the legs on the IK reference through the rise, before HOLD latches the
+    measured pose (`law.BalanceLaw.rise_track`).  `hw.fold_trot` passes
+    True; it needs the layer, so it means nothing without a gait or hook.
+    `height` (m) is `--height`'s default; None is `config.H_LIFT`.
+    `stand_xy` ((4, 2) hip-frame foot xy) with `slide_from` (m) is the
+    SLANTED RISE (`law.BalanceLaw.stand_xy`): the stand's feet differ from
+    the crouch's and the tracked layer carries the trunk over the planted
+    feet as the commanded height passes `slide_from`.  `hw.fold_trot`.
+    `est_xy` is `--est-xy`'s default -- THE ESTIMATOR IN THE LOOP
+    (`law.BalanceLaw.est_xy`): the hold's and the trot's x/y rows close on
+    the state estimator, `--kp-xy` / `--kd-xy`.  None is no loop and no flag (a stand
+    with no trot).  Every trot passes True through `trot.trot_options`
+    (2026-10-02).  It needs a gait and an `estimator` whose objects also have
+    `estimate()` (`hw.trot_esti.EstimatorFeed`); with the loop on `run` is
+    called with `feed`, and with `--no-est-xy` the filter only prints.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -824,7 +977,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     law.add_argument("--rise", type=float, default=BCFG.T_RISE,
                      metavar="SECONDS",
                      help="S-curve duration; the only knob the reference has")
-    law.add_argument("--height", type=float, default=1e3 * BCFG.H_LIFT,
+    law.add_argument("--height", type=float,
+                     default=1e3 * (BCFG.H_LIFT if height is None else height),
                      metavar="MM",
                      help="lift target, mm FLOOR TO TRUNK BOTTOM (the ruler's "
                           "number, not the code's trunk-origin frame)")
@@ -919,13 +1073,19 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         trot.add_argument("--swing-height", type=float,
                           default=1e3 * (BCFG.SWING_HEIGHT if swing_height is None
                                          else swing_height), metavar="MM",
-                          help="the swing apex above the foot's liftoff point.  Speed, "
+                          help="the swing apex above the resting foot.  Speed, "
                                "torque and slew demand all scale with it, so "
                                "it is the first thing to lower for a fast "
                                "gait; the banner prints the demand.  With "
                                "--swing-ff the apex is real: 20 mm flew on "
                                "the nominal trot, 40 mm landed hard enough to "
                                "bounce the robot (2026-09-25)")
+        trot.add_argument("--swing-roll", action="store_true",
+                          help="level the Cartesian swing arc in ROLL (the "
+                               "trunk's roll from level, IMU), so the foot "
+                               "lands on the floor whatever the roll.  The "
+                               "joint-hold latch stays HOLD's "
+                               "(law.BalanceLaw.swing_roll)")
         trot.add_argument("--swing-ff", action="store_true",
                           help="add the arc's own inertial torque, M0 J^+ "
                                "(a_ref - Jdot qd_ref), to each swing leg open "
@@ -941,16 +1101,24 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                % P.ARMATURE)
         trot.add_argument("--kp-swing", type=float, nargs=3, metavar="N_PER_M",
                           default=list(BCFG.KP_SWING),
-                          help="the Cartesian swing PD's x y z stiffness.  With "
-                               "--swing-ff, Kp is no longer what lifts the foot "
-                               "and stiffening z drives the foot into x (no "
-                               "Lambda in this PD): leave it")
+                          help="the Cartesian swing PD's x y z stiffness.  The "
+                               "default is the operator's best fold trot, "
+                               "2026-10-02 (config.KP_SWING); DOG5's was 140 "
+                               "140 180.  With --swing-ff, stiffening z drives "
+                               "the foot into x (no Lambda in this PD)")
         trot.add_argument("--kd-swing", type=float, nargs=3,
                           metavar="NS_PER_M", default=list(BCFG.KD_SWING),
-                          help="the Cartesian swing PD's x y z damping.  z at "
-                               "15 is zeta 0.28 on the foot's 3.9 kg; 30 is "
-                               "0.57 and tracked the arc a little better in the "
-                               "leg's own dynamics (2026-09-25)")
+                          help="the Cartesian swing PD's x y z damping.  The "
+                               "default is the operator's best fold trot, "
+                               "2026-10-02 (config.KD_SWING); DOG5's was 8 8 "
+                               "15")
+        trot.add_argument("--kp-swing-knee", type=float, nargs=3,
+                          metavar="NM_PER_RAD", default=list(BCFG.KP_SWING_KNEE),
+                          help="--swing knee's joint PD, abd pitch knee: abd "
+                               "and pitch held at liftoff, the knee on its "
+                               "bump (config.KP_SWING_KNEE)")
+        trot.add_argument("--kd-swing-knee", type=float, nargs=3,
+                          metavar="NMS_PER_RAD", default=list(BCFG.KD_SWING_KNEE))
         trot.add_argument("--half-gait", action="store_true",
                           help="T steps the gait by HAND, half a cycle a "
                                "press: one diagonal lifts and lands, HOLD by "
@@ -983,6 +1151,53 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                 "none of it).  0 turns the spring off")
         joint.add_argument("--kd-joint", type=float,
                            default=BCFG.KD_JOINT_HOLD, metavar="NMS_PER_RAD")
+        joint.add_argument("--kp-joint-abd", type=float,
+                           default=BCFG.KP_JOINT_HOLD_ABD, metavar="NM_PER_RAD",
+                           help="the layer's gain on the ABDUCTION joints once "
+                                "HOLD has latched (hold and trot); pitch and "
+                                "knee keep --kp-joint, the tracked rise keeps "
+                                "--kp-joint on all three")
+        joint.add_argument("--kd-joint-abd", type=float,
+                           default=BCFG.KD_JOINT_HOLD_ABD, metavar="NMS_PER_RAD")
+        joint.add_argument("--rise-track", dest="rise_track",
+                           action="store_true", default=rise_track,
+                           help="the layer holds the legs on the IK reference "
+                                "(feet at the crouch's sites, the commanded "
+                                "height) THROUGH THE RISE, until HOLD latches "
+                                "the measured pose.  Nothing else holds trunk "
+                                "x over the feet, and the parallel fold walks "
+                                "forward without it (law.BalanceLaw.rise_track)")
+        joint.add_argument("--no-rise-track", dest="rise_track",
+                           action="store_false", default=argparse.SUPPRESS,
+                           help="the rise on the SRB law alone, the layer from "
+                                "HOLD on (as before 2026-10-01)")
+    if est_xy is not None:
+        loop = ap.add_argument_group(
+            "the state estimator in the loop",
+            "the hold's and the trot's CoM x/y and rate from the Kalman "
+            "filter, held at the x/y latched as each HOLD and each trot starts "
+            "(law.BalanceLaw.est_xy).  --kp-xy 0 --kd-xy 0 is the flown "
+            "torque, filter printed")
+        loop.add_argument("--est-xy", dest="est_xy", action="store_true",
+                          default=bool(est_xy),
+                          help="close the hold's and the trot's x/y on the "
+                               "filter (every trot entry point's default "
+                               "since 2026-10-02)")
+        loop.add_argument("--no-est-xy", dest="est_xy", action="store_false",
+                          default=argparse.SUPPRESS,
+                          help="the filter printed, not fed: the x/y rows "
+                               "zero, the hold and the trot as they were "
+                               "before 2026-10-02")
+        loop.add_argument("--kp-xy", type=float, default=BCFG.KP_XY_EST,
+                          metavar="PER_S2",
+                          help="x/y position gain, acceleration units like "
+                               "--kp-z: the hold holds the CoM where the filter "
+                               "had it on reaching HOLD, the trot where it had "
+                               "it at T.  Hold and trot only")
+        loop.add_argument("--kd-xy", type=float, default=BCFG.KD_XY_EST,
+                          metavar="PER_S",
+                          help="x/y velocity gain on the filter's v, like "
+                               "--kd-z.  Hold and trot only")
     law.add_argument("--kp-stance-xy", type=float, default=0.0, metavar="N_PER_M",
                      help="a Cartesian spring on every PLANTED foot toward its "
                           "trunk-frame site, x and y only, per leg -- trunk xy "
@@ -1023,6 +1238,14 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         args.latch = (bool(BCFG.SETPOINT_DYNAMIC) if dynamic_setpoint is None
                       else bool(dynamic_setpoint))
 
+    if est_xy is not None and (gait is None or estimator is None):
+        ap.error("est_xy needs a gait (the trot entry points offer it) and "
+                 "an estimator to feed it")
+    #: The x/y loop, as this run flies it: offered by the entry point AND on.
+    xy_loop = est_xy is not None and bool(args.est_xy)
+    if xy_loop and not hasattr(estimator, "estimate"):
+        ap.error("--est-xy needs an estimator with estimate() "
+                 "(hw.trot_esti.EstimatorFeed)")
     if gait is not None:
         from .balance.gait import TrotGait
         try:
@@ -1056,6 +1279,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     slew = float(args.tau_slew)
     if gait is not None:
         swing = args.swing
+        if args.swing_roll and swing != "cartesian":
+            ap.error("--swing-roll levels the Cartesian arc; --swing %s "
+                     "latches its own at liftoff" % swing)
     if not args.limits:
         # --no-limits, `main`'s docstring.  Set before anything is built or
         # printed, so the banner reports what actually flies.
@@ -1084,8 +1310,59 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     if args.kd_roll is not None:
         gains.kd_att[0] = args.kd_roll
     gains.kp_att[2], gains.kd_att[2] = args.kp_yaw, args.kd_yaw
+    if xy_loop:
+        # Read only in the hold and the trot, and only off a usable estimate
+        # -- the law's `est_xy`.  Every other sweep the x/y rows stay zero.
+        gains.kp_pos[:2] = args.kp_xy
+        gains.kd_pos[:2] = args.kd_xy
     if args.ablate_attitude:
         gains.ablate_attitude()
+    # THE PIN FOLLOWS --height (posture.CrouchPose.srb_at): at the default it
+    # is the posture's `srb`, the same object.  With a slanted rise it is
+    # pinned at the STAND's feet -- the stance the hold will hold.
+    layer_on = ((gait is not None or hook is not None) and args.joint_hold
+                and args.rise_track)
+    slide = stand_xy is not None and layer_on
+    if stand_xy is not None and not slide:
+        print("  NOTE: the stand's own foot sites need the tracked joint layer "
+              "(--rise-track with the layer on); without it the rise is "
+              "straight, on the crouch's feet")
+    srb = crouch.srb_at(1e-3 * args.height,
+                        np.asarray(stand_xy, float) if slide else None)
+    knee_plan = None
+    if gait is not None and swing == "knee":
+        # THE KNEE SWING'S PLAN AT THE HOLD, BEFORE THE BUS OPENS: every leg
+        # must be able to swing toward the CoM to the apex (swing.py, "THE
+        # KNEE SWING").  The law re-plans at each liftoff from the measured
+        # joints; this is the hold it will lift from.
+        if step_to is not None:
+            ap.error("--swing knee lands each foot where it lifted; this "
+                     "entry point's W step needs the Cartesian swing")
+        q_stand = BLAW.ik_reference(1e-3 * args.height, crouch.q,
+                                    np.asarray(stand_xy, float) if slide
+                                    else crouch.foot_xy)
+        knee_plan = []
+        for leg in range(C.N_LEGS):
+            try:
+                knee_plan.append(BSWING.knee_swing_demand(
+                    leg, q_stand[leg], gait.swing_duration,
+                    1e-3 * args.swing_height))
+            except ValueError as refusal:
+                ap.error("--swing knee at this hold: %s" % refusal)
+        if knee_plan[0]["slew"] > slew:
+            # THE BUMP'S TORQUE RATE PAST THE GATE'S SLEW: the PD winds up
+            # behind the limiter and the knee flies past the apex (MuJoCo,
+            # swing.knee_swing_demand).  The shortest swing that fits: T^3.
+            t_fit = gait.swing_duration * (knee_plan[0]["slew"] / slew) ** (1 / 3)
+            ap.error("--swing knee: the knee bump asks ~%.0f N*m/s of torque "
+                     "rate in %.0f ms of swing, the gate allows %.0f "
+                     "(--tau-slew).  In MuJoCo the knee then overshoots: at "
+                     "0.6 s a 20 mm apex came out 85-99 mm.  Lengthen --period "
+                     "to %.2f s or more (%.0f ms of swing; 1.2 s is what "
+                     "tracked in MuJoCo at 20 mm), lower --swing-height, or "
+                     "raise --tau-slew knowing what it is"
+                     % (knee_plan[0]["slew"], 1e3 * gait.swing_duration, slew,
+                        t_fit / (1.0 - gait.duty), 1e3 * t_fit))
     balance = BLAW.BalanceLaw(gains=gains, rise_s=args.rise,
                               h_lift=1e-3 * args.height,
                               gravity_legs_per_sweep=args.gravity_legs,
@@ -1093,23 +1370,36 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               dynamic_setpoint=args.latch,
                               tilt_stop_deg=args.tilt_stop,
                               track_stop_deg=args.track_stop,
-                              residual_trip=args.limits, srb=crouch.srb,
+                              residual_trip=args.limits, srb=srb,
                               swing=swing,
                               swing_height=(1e-3 * args.swing_height
                                             if gait is not None
                                             else BCFG.SWING_HEIGHT),
                               swing_ff=bool(gait is not None and args.swing_ff),
+                              swing_roll=bool(gait is not None
+                                              and args.swing_roll),
                               kp_stance_xy=args.kp_stance_xy,
                               kd_stance_xy=args.kd_stance_xy,
                               ff_inertia=(None if gait is None or args.ff_armature is None
                                           else BSWING.feedforward_inertia(args.ff_armature)),
                               **({} if gait is None else dict(
                                   kp_swing=np.asarray(args.kp_swing, float),
-                                  kd_swing=np.asarray(args.kd_swing, float))),
+                                  kd_swing=np.asarray(args.kd_swing, float),
+                                  kp_swing_knee=np.asarray(args.kp_swing_knee,
+                                                           float),
+                                  kd_swing_knee=np.asarray(args.kd_swing_knee,
+                                                           float))),
                               **({} if (gait is None and hook is None)
                                  or not args.joint_hold
                                  else dict(kp_joint=args.kp_joint,
-                                           kd_joint=args.kd_joint)))
+                                           kd_joint=args.kd_joint,
+                                           kp_joint_abd=args.kp_joint_abd,
+                                           kd_joint_abd=args.kd_joint_abd,
+                                           rise_track=args.rise_track)),
+                              **({} if not slide else dict(
+                                  stand_xy=np.asarray(stand_xy, float),
+                                  slide_from_h=slide_from)),
+                              est_xy=xy_loop)
     stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
                           gait=gait, step_to=step_to, step_gait=step_gait,
                           trot_swings=(1 if gait is not None and args.half_gait
@@ -1140,6 +1430,13 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   "PD, abd held: Kp %s N*m/rad Kd %s N*m*s/rad"
                   % (args.swing_height, BCFG.KP_SWING_JOINT,
                      BCFG.KD_SWING_JOINT))
+        elif swing == "knee":
+            print("       swing: THE SHIN ALONE, in the knee frame -- abd and "
+                  "pitch held at liftoff, the knee on 64 s^3 (1-s)^3 toward "
+                  "the CoM, apex %.0f mm, zero speed at touchdown, lands where "
+                  "it lifted; joint PD Kp %s N*m/rad Kd %s N*m*s/rad"
+                  % (args.swing_height, np.asarray(args.kp_swing_knee),
+                     np.asarray(args.kd_swing_knee)))
         else:
             print("       swing apex %.0f mm straight up, NO placement; Kp %s "
                   "N/m Kd %s N s/m" % (args.swing_height,
@@ -1150,35 +1447,55 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         # either way -- it did at 80 ms of swing on the robot, 2026-09-25 --
         # but past this a swing is the PD behind a limiter, late or wound up,
         # and the log's `x_b` against `p_swing` says which.
-        demand = BSWING.swing_demand(
-            0, BSWING.rest_feet_b(1e-3 * args.height, crouch.foot_xy)[0],
-            gait.swing_duration, 1e-3 * args.swing_height,
-            C.unflat(crouch.q)[0])
-        print("       swing %.0f ms: knee ~%.1f rad/s, ~%.1f N*m (M at the lift "
-              "pose); slew: ~%.0f N*m/s to rise, ~%.0f to LAND SOFTLY, "
-              "against %.0f%s"
-              % (1e3 * gait.swing_duration, demand["qd"][2], demand["tau"].max(),
-                 demand["slew"], 3.0 * demand["slew"], slew,
-                 "" if demand["slew"] <= slew else
-                 "\n       WARNING: THE SWING OUTRUNS THE SLEW.  The PD winds "
-                 "up behind the limiter (fold_trot's MuJoCo run: 160/240/260 "
-                 "ms all diverged, knee ~90 deg over).  Lower --swing-height, "
-                 "lower --duty or lengthen --period until this fits, or raise "
-                 "--tau-slew knowing what it is."))
+        if knee_plan is not None:
+            kp0 = knee_plan[0]
+            demand = dict(qd=np.array([0.0, 0.0, kp0["qd"]]),
+                          tau=np.array([0.0, 0.0, kp0["tau"]]),
+                          slew=kp0["slew"])
+            print("       knee swing at the %.0f mm hold: knee %s deg (FL FR RL "
+                  "RR, each toward the CoM), the foot %.0f mm in at the apex; "
+                  "%.0f ms: knee ~%.1f rad/s, ~%.1f N*m, torque rate ~%.0f "
+                  "N*m/s against the %.0f slew"
+                  % (args.height,
+                     " ".join("%+.1f" % np.degrees(k["amp"]) for k in knee_plan),
+                     1e3 * kp0["dx"], 1e3 * gait.swing_duration, kp0["qd"],
+                     kp0["tau"], kp0["slew"], slew))
+        else:
+            demand = BSWING.swing_demand(
+                0, BSWING.rest_feet_b(1e-3 * args.height, crouch.foot_xy)[0],
+                gait.swing_duration, 1e-3 * args.swing_height,
+                C.unflat(crouch.q)[0])
+            print("       swing %.0f ms: knee ~%.1f rad/s, ~%.1f N*m (M at the "
+                  "lift pose); slew: ~%.0f N*m/s to rise, ~%.0f to LAND "
+                  "SOFTLY, against %.0f%s"
+                  % (1e3 * gait.swing_duration, demand["qd"][2],
+                     demand["tau"].max(), demand["slew"], 3.0 * demand["slew"],
+                     slew,
+                     "" if demand["slew"] <= slew else
+                     "\n       WARNING: THE SWING OUTRUNS THE SLEW.  The PD "
+                     "winds up behind the limiter (fold_trot's MuJoCo run: "
+                     "160/240/260 ms all diverged, knee ~90 deg over).  Lower "
+                     "--swing-height, lower --duty or lengthen --period until "
+                     "this fits, or raise --tau-slew knowing what it is."))
         if demand["tau"].max() > args.tau_cap:
             print("       WARNING: the swing's ~%.1f N*m is over the %.1f N*m "
                   "cap -- the arc cannot be followed at any gain"
                   % (demand["tau"].max(), args.tau_cap))
         print("       swing feedforward %s"
-              % ("ON: tau += M0 J^+ (a_ref - Jdot qd_ref) per swing leg, open "
+              % ("ON: tau += %s per swing leg, open "
                  "loop, M0 diag %s kg m^2 (armature %s); logged as tau_ff"
-                 % (np.array2string(np.diag(BSWING.feedforward_inertia(args.ff_armature)),
+                 % ("M0 qdd_ref (the knee bump's)" if swing == "knee"
+                    else "M0 J^+ (a_ref - Jdot qd_ref)",
+                    np.array2string(np.diag(BSWING.feedforward_inertia(args.ff_armature)),
                                     precision=4),
                     "%.5f measured" % args.ff_armature if args.ff_armature is not None
                     else "%.5f INHERITED from DOG5" % P.ARMATURE)
                  if args.swing_ff else
                  "OFF (--swing-ff turns it on): the PD alone makes the "
                  "swing torque, out of tracking error"))
+        if args.swing_roll:
+            print("       SWING ROLL-LEVELED: the arc about the trunk origin, "
+                  "roll removed; the joint-hold latch stays HOLD's")
         if args.swing_ff and args.swing_height > 20.0:
             print("       NOTE: with the feedforward the apex is REAL.  On the "
                   "nominal trot 20 mm is what flew (2026-09-25); at 40 mm the "
@@ -1186,13 +1503,54 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         if args.joint_hold:
             print("       MODE joint-hold: every leg held at the angles "
                   "latched on reaching HOLD, hold and trot, Kp %.1f N*m/rad "
-                  "Kd %.2f N*m*s/rad; swing legs none"
-                  % (args.kp_joint, args.kd_joint))
+                  "Kd %.2f N*m*s/rad (abd Kp %.1f Kd %.2f); swing legs none"
+                  % (args.kp_joint, args.kd_joint, args.kp_joint_abd,
+                     args.kd_joint_abd))
+            print("       RISE: %s"
+                  % ("TRACKED -- the layer holds the legs on the IK reference "
+                     "at the commanded height until HOLD latches (--no-rise-track "
+                     "for the SRB law alone)" if args.rise_track else
+                     "SRB law alone, the layer from HOLD on (--rise-track holds "
+                     "the legs on the IK reference through it)"))
+            if slide:
+                sxy = np.asarray(stand_xy, float)
+                print("       SLANTED: the feet's sites slide from the crouch's to the "
+                      "stand's, trunk x %s mm (hip frame %s), as the commanded "
+                      "height passes %.0f mm -- the trunk moves over the planted "
+                      "feet; HOLD latches the reference there"
+                      % (np.array2string(1e3 * (sxy[:, 0] + P.HIP_OFFSET[:, 0]), precision=0),
+                         np.array2string(1e3 * sxy[0], precision=0),
+                         1e3 * (slide_from if slide_from is not None else crouch.h)))
         else:
             print("       MODE no-joint-hold: SRB alone -- height and rpy "
                   "held, the body free to shift")
         print("       residual trip counts four-foot sweeps only while "
               "trotting")
+        if est_xy is not None and not xy_loop:
+            print("       x/y LOOP OFF (--no-est-xy): the Kalman filter is "
+                  "printed, not fed -- the hold's and the trot's x/y rows "
+                  "are zero")
+        elif xy_loop:
+            if args.kp_xy or args.kd_xy:
+                print("       ESTIMATOR IN THE LOOP, the hold and the trot: CoM "
+                      "x/y held where the Kalman filter had it on reaching "
+                      "HOLD and again at T, kp %.1f /s^2 kd %.1f "
+                      "/s (%.2f Hz), |a_xy| <= %.1f m/s^2 (%.1f N).  Read one "
+                      "sweep late; an estimate past %.0f ms, on a %.0f ms old "
+                      "0x40 or a stale attitude is refused and that sweep "
+                      "flies the x/y-free law.  Height and attitude stay the "
+                      "legs' and the IMU's."
+                      % (args.kp_xy, args.kd_xy,
+                         np.sqrt(max(args.kp_xy, 0.0)) / (2 * np.pi),
+                         BCFG.XY_ACC_MAX, BCFG.MASS * BCFG.XY_ACC_MAX,
+                         1e3 * BCFG.EST_MAX_AGE_S,
+                         1e3 * BCFG.EST_ACC_MAX_AGE_S))
+            else:
+                print("       ESTIMATOR FED, x/y GAINS ZERO (--kp-xy 0 --kd-xy 0): "
+                      "the flown trot's torque; the filter is logged and printed")
+            if args.no_imu:
+                print("       NOTE: no IMU -- the filter runs on a level, "
+                      "motionless trunk: leg odometry with a fake accelerometer")
     if not args.limits:
         print("  LIMITS OFF (--no-limits): soft joint limits (torque block and "
               "e-stop), position-mode and torque-phase tracking, tilt stop, "
@@ -1223,8 +1581,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         print("       mu %.2f, leg gravity %d leg%s/sweep"
               % (args.mu, args.gravity_legs,
                  "" if args.gravity_legs == 1 else "s"))
-        print("       SRB PINNED at the %s stance: %s"
-              % (crouch.name, crouch.srb.describe()))
+        print("       SRB PINNED at the %s stance, %.0f mm hold: %s"
+              % (crouch.name, args.height, srb.describe()))
         if args.ablate_attitude:
             print("       ATTITUDE GAINS ZEROED -- the ablation half of the "
                   "A/B; the trunk will NOT push back")
@@ -1336,7 +1694,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             # nothing may sit between it and the first slot.
             stop = run(mb, stand, rate_hz=args.rate, key=key,
                        auto_s=args.auto, imu=imu, log=log, velocity=tap,
-                       estimator=est_tap, hook=hook, terse=terse)
+                       estimator=est_tap, hook=hook, terse=terse,
+                       feed=xy_loop)
     except KeyboardInterrupt:
         stop = "Ctrl-C"
     finally:

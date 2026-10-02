@@ -948,30 +948,64 @@ def main() -> int:
     # leg's shape, hung from the rear pitch hinge, would put it -- then,
     # 2026-09-28, the rear FOLD_REAR_FORWARD and the front FOLD_FRONT_FORWARD
     # further forward in trunk x.  Every knee stays behind its hip.
-    def _frames(leg):
-        foot, anchors, *_ = SK.leg_frames(leg, POSE.FOLD.q[leg])
+    # 2026-10-01, then each foot turned about its abduction axis to
+    # FOLD_ABD.  The pitch hinge is ON that axis, so the turn keeps the
+    # hinge-to-foot x and the foot's distance from the axis, and nothing else.
+    # 2026-10-02, then every knee opened FOLD_KNEE_OPEN, abd and pitch kept:
+    # these checks run on the fold with the knee shut again, `q_shut`, so
+    # they say FOLD is that fold with ONLY the knee moved.
+    q_shut = POSE.FOLD.q.copy()
+    q_shut[:, 2] += np.sign(q_shut[:, 2]) * POSE.FOLD_KNEE_OPEN
+    z_shut = P.FOOT_RADIUS - SK.all_foot_positions(q_shut)[:, 2].mean()
+
+    def _frames(leg, q=q_shut):
+        foot, anchors, *_ = SK.leg_frames(leg, q[leg])
         return foot, anchors[1], anchors[2]      # foot, pitch hinge, knee
+
+    def _x_and_radius(v):
+        return [v[0], np.hypot(v[1], v[2])]
     folded = POSE.regularise(POSE.FOLD_CAPTURED_Q)[:2] - P.HIP_TO_PITCH[:2]
     for name, legs, ahead in (("front", (0, 1), POSE.FOLD_FRONT_FORWARD),
                               ("rear", (2, 3), POSE.FOLD_REAR_FORWARD)):
         close("%s feet: the captured front fold from their own pitch hinge, "
               "%.0f mm ahead" % (name, 1e3 * ahead),
-              [*(_frames(legs[0])[0] - _frames(legs[0])[1]),
-               *(_frames(legs[1])[0] - _frames(legs[1])[1])],
-              [*(folded[0] + [ahead, 0.0, 0.0]),
-               *(folded[1] + [ahead, 0.0, 0.0])], 1e-12, " m")
+              [*_x_and_radius(_frames(legs[0])[0] - _frames(legs[0])[1]),
+               *_x_and_radius(_frames(legs[1])[0] - _frames(legs[1])[1])],
+              [*_x_and_radius(folded[0] + [ahead, 0.0, 0.0]),
+               *_x_and_radius(folded[1] + [ahead, 0.0, 0.0])], 1e-12, " m")
+    close("...turned about the abduction axis to a round %.0f deg"
+          % np.degrees(POSE.FOLD_ABD),
+          np.abs(POSE.FOLD.q[:, 0]), np.full(C.N_LEGS, POSE.FOLD_ABD),
+          1e-12, " rad")
     check("...and every knee is still BEHIND its pitch hinge",
           all(_frames(leg)[2][0] < _frames(leg)[1][0] for leg in range(4)),
           "knee x - hinge x %s mm" % np.array2string(
               1e3 * np.array([_frames(leg)[2][0] - _frames(leg)[1][0]
                               for leg in range(4)]), precision=1))
     check("regularising moved the height by under a millimetre",
-          abs(POSE.FOLD.z_origin
+          abs(z_shut
               - (P.FOOT_RADIUS - SK.all_foot_positions(raw)[:, 2].mean())) < 1e-3,
-          "h %.2f mm, from a capture at %.2f"
-          % (1e3 * POSE.FOLD.h,
+          "h %.2f mm knee shut, from a capture at %.2f"
+          % (1e3 * (z_shut - cfg.TRUNK_BOTTOM_OFFSET),
              1e3 * (P.FOOT_RADIUS - SK.all_foot_positions(raw)[:, 2].mean()
                     - cfg.TRUNK_BOTTOM_OFFSET)))
+
+    # THE FEET ON THE FLOOR, 2026-10-02: the MG5010 knee housing is 31.7 mm
+    # in radius about the knee axis (the meshes).  With the knee shut it
+    # reached 20 mm below the floor plane and the robot sat on it, feet up.
+    knee_r = 0.0317
+
+    def _housing_above_floor(q, z_origin):
+        return np.array([z_origin + _frames(leg, q)[2][2] - knee_r
+                         for leg in range(C.N_LEGS)])
+    shut_gap = _housing_above_floor(q_shut, z_shut)
+    open_gap = _housing_above_floor(POSE.FOLD.q, POSE.FOLD.z_origin)
+    check("FOLD's knees open %.0f deg, abd and pitch kept, and the knee "
+          "motors clear the floor with the feet planted"
+          % np.degrees(POSE.FOLD_KNEE_OPEN),
+          shut_gap.max() < 0.0 and open_gap.min() > 0.005,
+          "housing %.1f mm above the floor, %.1f with the knee shut"
+          % (1e3 * open_gap.min(), 1e3 * shut_gap.max()))
 
     check("the fold crouch does NOT start on the floor",
           POSE.FOLD.h > 0.05 and abs(POSE.NOMINAL.h) < 1e-9,
@@ -1027,6 +1061,68 @@ def main() -> int:
           "front %.0f%% / rear %.0f%%, CoM sits behind the support centroid"
           % (100 * fz_fold[:2].sum() / fz_fold.sum(),
              100 * fz_fold[2:].sum() / fz_fold.sum()))
+
+    # THE KNEES-OUT FOLD, 2026-10-01 (`hw.fold2_trot`): the front legs the
+    # rear legs mirrored fore-aft, every knee motor outboard of its hip, every
+    # foot FOLD2_FOOT_OUT outboard of its pitch hinge in the crouch AND at the
+    # stand -- there is no slanted rise, so the two are one set of feet.
+    from .. import fold2_trot as F2
+    f2 = POSE.FOLD2
+    close("FOLD2: the front feet are the rear feet MIRRORED, x negated",
+          f2.foot_xy[:2], f2.foot_xy[2:] * [-1.0, 1.0], 1e-15, " m")
+    close("...and so are the joints: abd kept, pitch and knee negated",
+          f2.q[:2], f2.q[2:] * [1.0, -1.0, -1.0], 1e-12, " rad")
+    close("...left and right mirror on each axle",
+          [*f2.foot_xy[0], *f2.foot_xy[2]],
+          [*(f2.foot_xy[1] * [1, -1]), *(f2.foot_xy[3] * [1, -1])], 1e-15,
+          " m")
+    q_stand2 = LAW.ik_reference(F2.HEIGHT, f2.q, f2.foot_xy)
+    outboard, foot_out = [], []
+    for q4 in (f2.q, q_stand2):
+        for leg in range(C.N_LEGS):
+            foot, anchors, *_ = SK.leg_frames(leg, q4[leg])
+            out = 1.0 if leg < 2 else -1.0               # +x front, -x rear
+            outboard.append(out * (anchors[2][0] - anchors[1][0]))
+            foot_out.append(out * (foot[0] - anchors[1][0]))
+    check("...every knee OUTBOARD of its pitch hinge, crouch and %.0f mm "
+          "stand" % (1e3 * F2.HEIGHT), min(outboard) > 0.02,
+          "knee outboard by %.0f..%.0f mm" % (1e3 * min(outboard),
+                                             1e3 * max(outboard)))
+    close("...every foot FOLD2_FOOT_OUT outboard of it, both", foot_out,
+          np.full(2 * C.N_LEGS, POSE.FOLD2_FOOT_OUT), 1e-12, " m")
+    close("...abd a round %.0f deg, at FOLD's crouch height with the knee "
+          "shut" % np.degrees(POSE.FOLD_ABD),
+          [*np.abs(f2.q[:, 0]), f2.z_origin],
+          [*np.full(C.N_LEGS, POSE.FOLD_ABD), z_shut], 1e-12)
+    check("...inside JOINT_LIMITS, crouch and stand",
+          P.within_limits(f2.q) and P.within_limits(q_stand2),
+          "knee %.1f / %.1f deg against %.1f"
+          % (np.degrees(np.abs(f2.q[:, 2]).max()),
+             np.degrees(np.abs(q_stand2[:, 2]).max()),
+             np.degrees(P.KNEE_LIM)))
+    close("the reference at FOLD2's own height IS the FOLD2 pose",
+          LAW.ik_reference(f2.h, f2.q, f2.foot_xy), f2.q, 1e-12, " rad")
+    close("the mirror puts the CoM on BOTH trot diagonals at the stand",
+          f2.srb_at(F2.HEIGHT).com_body[:2], [0.0, 0.0], 1e-4, " m")
+    bad2, tau_fold2, fz_fold2 = _lift(f2)
+    check("THE KNEES-OUT FOLD LIFTS: no trip over the whole rise",
+          not bad2, bad2[0] if bad2 else
+          "rise + allocator clean, %.2f N*m peak" % tau_fold2)
+    close("...and front and rear carry the weight EQUALLY",
+          fz_fold2[:2].sum() / fz_fold2.sum(), 0.5, 0.005)
+    opts = F2.stand_options()
+    check("hw.fold2_trot flies FOLD2 at %.0f mm, tracked, NO slanted rise"
+          % (1e3 * F2.HEIGHT),
+          opts["crouch"] is f2 and opts["rise_track"]
+          and opts.get("stand_xy") is None and F2.HEIGHT == 0.160
+          and opts["height"] == F2.HEIGHT)
+    check("...on hw.fold_trot's clock and apex, hw.trot's cap",
+          F2.PERIOD_S == 0.6 and F2.SWING_HEIGHT == 0.020
+          and opts["swing_height"] == F2.SWING_HEIGHT
+          and opts["gait"].period == F2.PERIOD_S
+          and opts["tau_cap"] == F2.TAU_CAP == SAFE.TAU_HARD_NM,
+          "%.1f s, %.0f mm, %.1f N*m" % (F2.PERIOD_S, 1e3 * F2.SWING_HEIGHT,
+                                         F2.TAU_CAP))
 
     # -- the SRB model is PINNED PER POSTURE, and still a constant ---------
     check("the nominal posture flies config.SRB ITSELF, not a copy",
@@ -1261,7 +1357,7 @@ def main() -> int:
                         IMU.TrunkOrientation.level(), srb=fold.srb)
     stance_fr = np.array([True, False, True, True])
     check("a foot at its apex reads the trunk LOW over all four feet...",
-          lifted.h < cfg.H_LIFT - 0.009,
+          lifted.h < cfg.H_LIFT - 0.9 * cfg.SWING_HEIGHT / 4,
           "h %.1f mm against %.1f" % (1e3 * lifted.h, 1e3 * cfg.H_LIFT))
     close("...and exactly right over the stance feet",
           STATE.on_stance(lifted, stance_fr, fold.srb).h, cfg.H_LIFT, 1e-9,
@@ -1344,36 +1440,9 @@ def main() -> int:
           and float(np.abs(kick).max()) < 0.2,
           "PD at liftoff %s N*m (unlatched: 8 mm = ~4 N*m on the knee)"
           % np.array2string(kick, precision=3))
-    # THE SAME LATCH IN THE CARTESIAN SWING, 2026-09-28: the fold trot walked
-    # in x on the resting-site arc, at 2 mm of apex as at 40.  The arc starts
-    # on the foot -- zero PD at liftoff -- and lands where it lifted, not on
-    # the site 8 mm away.
-    cart_law = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
-                              srb=fold.srb, track_stop_deg=0.0)
-    cart_law.arm(0.0, at_fold)
-    cart_law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
-    cart_out = cart_law.update(t_lift, off_state, gait=lat_gait)
-    on_foot = SWING.swing_reference(off_state.x_b[lifter], s0,
-                                    lat_gait.swing_duration)
-    on_site = SWING.swing_reference(rest[lifter], s0, lat_gait.swing_duration)
-    kick = SWING.swing_torque(off_state, lifter, *on_foot)
-    unlatched = SWING.swing_torque(off_state, lifter, *on_site)
-    p_land, v_land = SWING.swing_reference(off_state.x_b[lifter], 1.0,
-                                           lat_gait.swing_duration)
-    check("Cartesian swing, foot 8 mm off its site: the arc starts ON the "
-          "foot and lands there",
-          np.allclose(cart_law._lift_x[lifter], off_state.x_b[lifter],
-                      atol=1e-12)
-          and np.allclose(cart_out.p_swing[lifter], on_foot[0], atol=1e-12)
-          and np.allclose(p_land, off_state.x_b[lifter], atol=1e-12)
-          and np.allclose(v_land, 0.0, atol=1e-12)
-          and float(np.abs(kick).max()) < 0.2,
-          "PD at liftoff %s N*m; on the site it would be %s"
-          % (np.array2string(kick, precision=3),
-             np.array2string(unlatched, precision=3)))
     check("hw.fold_trot: hw.trot's cap, the operator's clock and apex "
-          "(2026-09-28)",
-          FT.TAU_CAP == TROT.TAU_CAP and FT.PERIOD_S == 0.5
+          "(2026-10-02)",
+          FT.TAU_CAP == TROT.TAU_CAP and FT.PERIOD_S == 0.6
           and FT.SWING_HEIGHT == 0.020,
           "%.1f s, %.0f ms of swing, %.0f mm apex"
           % (FT.PERIOD_S, 1e3 * FT.PERIOD_S * (1.0 - cfg.DUTY),
@@ -1425,6 +1494,10 @@ def main() -> int:
                                   period=FT.PERIOD_S,
                                   swing_height=FT.SWING_HEIGHT,
                                   tilt_stop_deg=FS.TILT_STOP_DEG),
+            "fold2": _tracked_trot(POSE.FOLD2, fold_gains,
+                                   period=F2.PERIOD_S,
+                                   swing_height=F2.SWING_HEIGHT,
+                                   tilt_stop_deg=FS.TILT_STOP_DEG),
             "nominal": _tracked_trot(POSE.NOMINAL, CTRL.BalanceGains())}
     for name, (trips, taus, fz_sum, heights, moment) in runs.items():
         step = float(np.abs(np.diff(taus, axis=0)).max())
@@ -1451,6 +1524,9 @@ def main() -> int:
     check("the nominal's diagonals pass through the CoM",
           runs["nominal"][4] < 0.2,
           "worst residual moment on two feet %.3f N*m" % runs["nominal"][4])
+    check("...and the knees-out fold's, by its mirror",
+          runs["fold2"][4] < 0.2,
+          "worst residual moment on two feet %.3f N*m" % runs["fold2"][4])
 
     # The residual trip: suppressed on two feet, live on four.  A monitor that
     # fires on the first sweep with ANY residual makes the two cases differ
@@ -1603,6 +1679,289 @@ def main() -> int:
     jl.release_joints()
     close("...and released, the law is exactly the one without it",
           jl.update(t_two, at_fold, gait=jg).tau, base, 1e-12, " N*m")
+    # THE RISE TRACKED, 2026-10-01: before HOLD the layer's target is the IK
+    # reference at the commanded height; after HOLD nothing changes.
+    rt = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                        srb=fold.srb, track_stop_deg=0.0,
+                        kp_joint=cfg.KP_JOINT_HOLD, kd_joint=cfg.KD_JOINT_HOLD,
+                        rise_track=True)
+    rt.arm(0.0, at_fold)
+    rt.ramp = LAW.REF.Quintic.ramp(at_fold.h, at_fold.h + 0.040, 1.0)
+    jl.ramp = rt.ramp                      # the same 40 mm, untracked
+    out_rt = rt.update(1.0, at_fold)
+    out_jl = jl.update(1.0, at_fold)
+    expect = (cfg.KP_JOINT_HOLD * (out_rt.q_ref - at_fold.q)
+              - cfg.KD_JOINT_HOLD * at_fold.qd)
+    close("rise tracked: before HOLD the joint layer holds the legs on the "
+          "IK reference at the commanded height", out_rt.tau - out_jl.tau,
+          expect, 1e-9, " N*m")
+    check("...which is a real pull: the reference 40 mm up is %.1f deg from "
+          "the crouch" % np.degrees(np.abs(out_rt.q_ref - at_fold.q)).max(),
+          np.degrees(np.abs(out_rt.q_ref - at_fold.q)).max() > 5.0)
+    # ABD'S OWN GAINS, 2026-10-02: once a pose is latched, the abd column
+    # flies kp_joint_abd / kd_joint_abd; pitch and knee, and the tracked
+    # rise, keep kp_joint / kd_joint.  40 / 1.0 is a test value, not a gain.
+    def _layer(**kw):
+        law = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                             srb=fold.srb, track_stop_deg=0.0, **kw)
+        law.arm(0.0, at_fold)
+        return law
+    j_off = _layer()
+    j_abd = _layer(kp_joint=cfg.KP_JOINT_HOLD, kd_joint=cfg.KD_JOINT_HOLD,
+                   kp_joint_abd=40.0, kd_joint_abd=1.0)
+    j_off.hold_joints(at_fold.q - dq)
+    j_abd.hold_joints(at_fold.q - dq)
+    kp_col = np.array([40.0, cfg.KP_JOINT_HOLD, cfg.KP_JOINT_HOLD])
+    kd_col = np.array([1.0, cfg.KD_JOINT_HOLD, cfg.KD_JOINT_HOLD])
+    expect = -kp_col * C.unflat(dq) - kd_col * C.unflat(moving.qd)
+    expect[swing_now] = 0.0
+    close("abd's own gains once HOLD latched: abd Kp/Kd its own, pitch and "
+          "knee Kp/Kd the layer's, swing legs none",
+          j_abd.update(t_two, moving, gait=jg).tau
+          - j_off.update(t_two, moving, gait=jg).tau, C.flat(expect), 1e-9,
+          " N*m")
+    r_abd = _layer(kp_joint=cfg.KP_JOINT_HOLD, kd_joint=cfg.KD_JOINT_HOLD,
+                   kp_joint_abd=40.0, kd_joint_abd=1.0, rise_track=True)
+    r_abd.ramp = rt.ramp
+    close("...and the tracked rise ignores them: the rise is the layer's "
+          "Kp/Kd on all three joints", r_abd.update(1.0, at_fold).tau,
+          out_rt.tau, 1e-12, " N*m")
+    check("...and the defaults are the layer as it was",
+          cfg.KP_JOINT_HOLD_ABD == cfg.KP_JOINT_HOLD
+          and cfg.KD_JOINT_HOLD_ABD == cfg.KD_JOINT_HOLD,
+          "abd %.1f / %.2f" % (cfg.KP_JOINT_HOLD_ABD, cfg.KD_JOINT_HOLD_ABD))
+    # THE SWING LEVELED IN ROLL, 2026-10-02 (`swing_roll`): the arc about the
+    # trunk origin with the roll from level removed.  The stance latch stays
+    # HOLD's -- a per-touchdown re-latch was tried the same day and removed.
+    def _sr(on):
+        law = _layer(kp_joint=cfg.KP_JOINT_HOLD, kd_joint=cfg.KD_JOINT_HOLD,
+                     swing_roll=on)
+        law.hold_joints(at_fold.q)
+        return law
+
+    def _gait():
+        g = GAIT.TrotGait()
+        g.reset(0.0)
+        return g
+    sp_roll = _sr(False).sp_roll
+    at_level = state_at(cfg.H_LIFT, R=C.rot_zyx(sp_roll, 0.0, 0.0),
+                        foot_xy=fold.foot_xy, q_seed=fold.q, srb=fold.srb)
+    close("swing_roll at a LEVEL trunk (the run's setpoint, %+.2f deg) is the "
+          "swing as it was" % np.degrees(sp_roll),
+          _sr(True).update(t_two, at_level, gait=_gait()).tau,
+          _sr(False).update(t_two, at_level, gait=_gait()).tau, 1e-12, " N*m")
+    roll3 = np.radians(3.0)
+    rolled = state_at(cfg.H_LIFT, R=C.rot_zyx(sp_roll + roll3, 0.0, 0.0),
+                      foot_xy=fold.foot_xy, q_seed=fold.q, srb=fold.srb)
+    sr, g = _sr(True), _gait()
+    out = sr.update(t_two, rolled, gait=g)
+    s_two = g.sample(t_two)
+    rest = SWING.rest_feet_b(sr.ramp.at(t_two - sr.t0).h, sr.foot_xy)
+    arc = np.array([SWING.swing_reference(rest[i], float(s_two.swing_s[i]),
+                                          g.swing_duration,
+                                          height=sr.swing_height)[0]
+                    for i in np.flatnonzero(swing_now)])
+    close("...rolled 3 deg from level, the swing target is the level arc "
+          "turned by the roll, about the trunk origin",
+          (C.rot_x(roll3) @ out.p_swing[swing_now].T).T, arc, 1e-12, " m")
+    p_a, v_a, _ = SWING.roll_level(rest[0], np.zeros(3), np.zeros(3), roll3,
+                                   0.7)
+    p_b, _, _ = SWING.roll_level(rest[0], np.zeros(3), np.zeros(3),
+                                 roll3 + 0.7e-6, 0.7)
+    close("...and its velocity carries the roll rate (0.7 rad/s against a "
+          "finite difference)", v_a, (p_b - p_a) / 1e-6, 1e-6, " m/s")
+    tl, gl = _sr(True), _gait()
+    latched, base = tl.q_hold, tl.q_hold.copy()
+    landings, prev = 0, gl.sample(0.0).contact
+    for t_k in np.arange(0.0, 2.0 * gl.period, 0.004):
+        now_c = gl.sample(t_k).contact
+        landings += int((~prev & now_c).sum())
+        prev = now_c
+        tl.update(t_k, rolled, gait=gl)
+    check("...and the stance latch does NOT follow it: HOLD's, level, the "
+          "same array, through %d touchdowns at the rolled trunk" % landings,
+          landings >= 4 and tl.q_hold is latched
+          and np.array_equal(tl.q_hold, base))
+    # THE KNEE SWING, 2026-10-02 (`--swing knee`, swing.py): the shin alone,
+    # in the knee frame, toward the CoM -- at FOLD2's hold, for
+    # `hw.fold2_trot`.
+    f2k = POSE.FOLD2
+    q_f2 = LAW.ik_reference(F2.HEIGHT, f2k.q, f2k.foot_xy)
+    close("knee bump: 0, 0, 0 at liftoff and touchdown; 1 with zero slope "
+          "at the apex", [SWING.knee_bump(s) for s in (0.0, 0.5, 1.0)],
+          [[0.0, 0.0, 0.0], [1.0, 0.0, -24.0], [0.0, 0.0, 0.0]], 1e-12)
+    amps = np.array([SWING.knee_swing_amplitude(i, q_f2[i], F2.SWING_HEIGHT)
+                     for i in range(C.N_LEGS)])
+    check("...FOLD2: every knee turns ITS OWN way, the sign of its own angle, "
+          "by the same |A|",
+          np.array_equal(np.sign(amps), np.sign(q_f2[:, 2]))
+          and np.ptp(np.abs(amps)) < 1e-12,
+          "%s deg (FL FR RL RR)" % np.array2string(np.degrees(amps),
+                                                   precision=2))
+    apex_d, rest_err, held = [], [], []
+    for i in range(C.N_LEGS):
+        f0 = SK.foot_position(i, q_f2[i])
+        q_a = SWING.knee_swing_reference(q_f2[i], amps[i], 0.5, 0.24)[0]
+        apex_d.append(SK.foot_position(i, q_a) - f0)
+        end = SWING.knee_swing_reference(q_f2[i], amps[i], 1.0, 0.24)
+        rest_err.append(np.r_[end[0] - q_f2[i], end[1], end[2]])
+        held.append(max(np.abs(SWING.knee_swing_reference(
+            q_f2[i], amps[i], s, 0.24)[0][:2] - q_f2[i][:2]).max()
+            for s in np.linspace(0.0, 1.0, 11)))
+    apex_d = np.array(apex_d)
+    close("...at the apex every foot is the apex height up, trunk z",
+          apex_d[:, 2], np.full(C.N_LEGS, F2.SWING_HEIGHT), 1e-12, " m")
+    check("...and has moved TOWARD the CoM, the same distance on all four",
+          all(np.sign(apex_d[i, 0]) == -np.sign(SK.foot_position(i, q_f2[i])[0])
+              for i in range(C.N_LEGS))
+          and np.ptp(np.abs(apex_d[:, 0])) < 1e-12,
+          "%.1f mm in" % (1e3 * abs(apex_d[0, 0])))
+    close("...MIRRORED: FR is FL in -y, RL is FL in -x, RR is both",
+          apex_d[1:], [apex_d[0] * [1, -1, 1], apex_d[0] * [-1, 1, 1],
+                       apex_d[0] * [-1, -1, 1]], 1e-12, " m")
+    close("...abd and pitch never move; it lands where it lifted, qd and qdd "
+          "zero", [*held, *np.ravel(rest_err)], np.zeros(C.N_LEGS * 10), 1e-12)
+    q_fs = LAW.ik_reference(FT.HEIGHT, POSE.FOLD.q, FT.STAND_XY)
+    refused = []
+    for i in range(C.N_LEGS):
+        try:
+            SWING.knee_swing_amplitude(i, q_fs[i], F2.SWING_HEIGHT)
+            refused.append(False)
+        except ValueError:
+            refused.append(True)
+    check("...REFUSED where the shin leans outboard: hw.fold_trot's front "
+          "legs, not its rear", refused == [True, True, False, False],
+          "refused %s" % refused)
+    d_06 = SWING.knee_swing_demand(0, q_f2[0], 0.12, F2.SWING_HEIGHT)
+    d_12 = SWING.knee_swing_demand(0, q_f2[0], 0.24, F2.SWING_HEIGHT)
+    check("...its torque rate outruns the trot's slew at 120 ms of swing "
+          "(0.6 s) and fits at 240 (1.2 s)",
+          d_06["slew"] > cfg.TAU_SLEW_TROT_NM_S > d_12["slew"],
+          "%.0f / %.0f N*m/s against %.0f" % (d_06["slew"], d_12["slew"],
+                                              cfg.TAU_SLEW_TROT_NM_S))
+    st_f2 = state_at(F2.HEIGHT, foot_xy=f2k.foot_xy, q_seed=f2k.q,
+                     srb=f2k.srb)
+
+    def _knee_law(kp, kd):
+        law = LAW.BalanceLaw(foot_xy=f2k.foot_xy, dynamic_setpoint=False,
+                             srb=f2k.srb, track_stop_deg=0.0,
+                             h_lift=F2.HEIGHT, swing="knee",
+                             swing_height=F2.SWING_HEIGHT,
+                             kp_swing_knee=np.full(3, kp),
+                             kd_swing_knee=np.full(3, kd))
+        law.arm(0.0, st_f2)
+        return law
+    k_on, k_off, g_k = _knee_law(30.0, 0.8), _knee_law(0.0, 0.0), _gait()
+    t_k = 0.0
+    while True:
+        smp = g_k.sample(t_k)
+        o_on = k_on.update(t_k, st_f2, gait=g_k)
+        o_off = k_off.update(t_k, st_f2, gait=g_k)
+        if (smp.swing_s >= 0.5).any() or t_k > g_k.period:
+            break
+        t_k += 0.004
+    legs = np.flatnonzero(smp.swing_s > 0)
+    expect = np.zeros(C.N_JOINTS)
+    feet = []
+    for i in legs:
+        q_i = C.unflat(st_f2.q)[i]
+        q_r, qd_r, _ = SWING.knee_swing_reference(
+            q_i, SWING.knee_swing_amplitude(i, q_i, F2.SWING_HEIGHT),
+            float(smp.swing_s[i]), g_k.swing_duration)
+        expect[3 * i:3 * i + 3] = 30.0 * (q_r - q_i) + 0.8 * qd_r
+        feet.append(HK.foot_position(i, q_r))
+    close("the law, --swing knee: the swing legs get the knee PD on the bump, "
+          "abd and pitch held at liftoff; nothing else changes",
+          o_on.tau - o_off.tau, expect, 1e-9, " N*m")
+    close("...its p_swing is the bump's foot (%s, s %.2f)"
+          % ("/".join(np.array(C.LEGS)[legs]), float(smp.swing_s[legs[0]])),
+          o_on.p_swing[legs], np.array(feet), 1e-12, " m")
+    try:
+        k_on.begin_step(f2k.foot_xy)
+        stepped = True
+    except ValueError:
+        stepped = False
+    check("...and a W foot step is refused: it lands where it lifted",
+          not stepped)
+    rt.hold_joints(at_fold.q)
+    jl.hold_joints(at_fold.q)
+    close("...and once HOLD has latched, tracked and untracked are the same law",
+          rt.update(1.0, at_fold).tau, jl.update(1.0, at_fold).tau, 1e-12, " N*m")
+    jl.release_joints()
+    # THE PIN FOLLOWS --height, 2026-10-01 (posture.CrouchPose.srb_at).
+    check("srb_at(H_LIFT) is the posture's own pinned model, the same object",
+          fold.srb_at(cfg.H_LIFT) is fold.srb
+          and POSE.NOMINAL.srb_at(cfg.H_LIFT) is cfg.SRB)
+    p115 = np.zeros((C.N_LEGS, 3))
+    p115[:, :2] = fold.foot_xy
+    p115[:, 2] = -(0.115 + cfg.TRUNK_BOTTOM_OFFSET - P.FOOT_RADIUS)
+    com115, _ = SK.body_inertia(HK.all_leg_ik(p115, q_seed=fold.q))
+    close("srb_at(115 mm) is the whole-robot CoM at THAT hold pose",
+          fold.srb_at(0.115).com_body, com115, 1e-12, " m")
+    check("...which for the fold is %.1f mm behind the 145 pin -- the pitch "
+          "bias --height used to carry"
+          % (1e3 * (fold.srb.com_body[0] - fold.srb_at(0.115).com_body[0])),
+          fold.srb.com_body[0] - fold.srb_at(0.115).com_body[0] > 0.003
+          and fold.srb_at(0.115) is fold.srb_at(0.115)
+          and abs(POSE.NOMINAL.srb_at(0.115).com_body[0]) < 1e-6)
+    # THE SLANTED RISE, 2026-10-01 (law.BalanceLaw.stand_xy).
+    stand_xy = fold.foot_xy.copy()
+    stand_xy[:, 0] = P.HIP_TO_PITCH[:, 0] - 0.035
+    try:
+        LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb, stand_xy=stand_xy,
+                       kp_joint=1.0, kd_joint=0.1)
+        refused = False
+    except ValueError:
+        refused = True
+    check("stand_xy without rise_track is refused", refused)
+    sl = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                        srb=fold.srb_at(0.160, stand_xy), track_stop_deg=0.0,
+                        h_lift=0.160, rise_s=3.0, kp_joint=cfg.KP_JOINT_HOLD,
+                        kd_joint=cfg.KD_JOINT_HOLD, rise_track=True,
+                        stand_xy=stand_xy, slide_from_h=0.110)
+    at_crouch = state_at(fold.h, foot_xy=fold.foot_xy, q_seed=fold.q,
+                       srb=fold.srb)   # the fold crouch, 60 mm
+    sl.arm(0.0, at_crouch)
+    sl.update(0.1, at_crouch)
+    check("slanted rise: below slide_from_h the sites are still the crouch's",
+          np.allclose(sl.foot_xy, fold.foot_xy, atol=1e-12)
+          and sl.ramp.at(0.1).h < 0.110)
+    # the sweep where the commanded height is halfway between 110 and 160
+    t_mid = next(t for t in np.arange(0.0, 3.0, 0.001) if sl.ramp.at(t).h >= 0.135)
+    sl.update(t_mid, at_crouch)
+    s_mid = (sl.ramp.at(t_mid).h - 0.110) / 0.050
+    expect_xy = fold.foot_xy + ST.smoothstep(s_mid) * (stand_xy - fold.foot_xy)
+    close("...halfway up the slide the sites are the smoothstep between, in height",
+          sl.foot_xy, expect_xy, 1e-9, " m")
+    out_arr = sl.update(3.0, at_crouch)
+    check("...at the ramp's arrival they are EXACTLY the stand's, and q_ref is "
+          "the IK there",
+          np.array_equal(sl.foot_xy, stand_xy)
+          and np.allclose(out_arr.q_ref, C.flat(LAW.ik_reference(
+              0.160, C.unflat(at_crouch.q), stand_xy)), atol=1e-12))
+    q_hold_ref = sl.hold_reference(at_crouch.q)
+    check("hold_reference is that IK, not the measured pose",
+          np.allclose(q_hold_ref, out_arr.q_ref, atol=1e-12)
+          and not np.allclose(q_hold_ref, at_crouch.q, atol=1e-3))
+    sl.hold_joints(q_hold_ref)
+    sl.foot_xy[0, 0] += 0.01                   # a step would move it; the slide must not touch it now
+    sl.update(3.5, at_crouch)
+    check("...and once a pose is latched the slide leaves foot_xy alone",
+          abs(sl.foot_xy[0, 0] - stand_xy[0, 0] - 0.01) < 1e-12)
+    sl.foot_xy[0, 0] -= 0.01
+    seq_sl = SEQ.StandSequence(SAFE.SafetyGate(3.0, unconfirmed_reason="selftest",
+                                              limits=(np.full(C.N_JOINTS, -np.inf),
+                                                      np.full(C.N_JOINTS, np.inf))),
+                               law="srb", balance=sl, crouch=fold, gait=GAIT.TrotGait())
+    check("sequence: with a slanted rise 'home' is the stand's sites, and the feet are home there",
+          np.array_equal(seq_sl.home_xy, stand_xy) and seq_sl.feet_home)
+    plain = LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb, track_stop_deg=0.0)
+    seq_pl = SEQ.StandSequence(SAFE.SafetyGate(3.0, unconfirmed_reason="selftest",
+                                              limits=(np.full(C.N_JOINTS, -np.inf),
+                                                      np.full(C.N_JOINTS, np.inf))),
+                               law="srb", balance=plain, crouch=fold)
+    check("...and without one it is the crouch's, as before",
+          np.array_equal(seq_pl.home_xy, fold.foot_xy) and seq_pl.feet_home)
     try:
         SAFE.SafetyGate(FT.TAU_CAP)
         default_refuses = False
@@ -1743,6 +2102,190 @@ def main() -> int:
     check("...and parks by itself once the feet are home and all four down",
           seq.phase_name == "park" and seq.feet_home,
           "%s after %.2f s" % (seq.phase_name, t - 2.0))
+
+    # =====================================================================
+    print("\n13. the state estimator in the hold's and the trot's x/y "
+          "(hw.fully_trot)")
+    # =====================================================================
+    def _xy_gains():
+        g = CTRL.BalanceGains()
+        g.kp_pos[:2], g.kd_pos[:2] = cfg.KP_XY_EST, cfg.KD_XY_EST
+        return g
+
+    # -- the controller: the x/y rows are the z row's PD, or exactly zero ---
+    cmd = REF.com_command(REF.HeightCommand(cfg.H_LIFT, 0.0, 0.0), at_fold.R,
+                          fold.srb)
+    plain = CTRL.balance_wrench(at_fold, cmd, np.eye(3), CTRL.BalanceGains(),
+                                srb=fold.srb)
+    no_xy = CTRL.balance_wrench(at_fold, cmd, np.eye(3), _xy_gains(),
+                                srb=fold.srb)
+    check("x/y gains and NO x/y measurement: the wrench is bit-identical",
+          np.array_equal(plain.b_d, no_xy.b_d) and not no_xy.b_d[:2].any())
+    e_xy, v_xy = np.array([0.004, -0.002]), np.array([0.010, 0.020])
+    fed = CTRL.balance_wrench(at_fold, cmd, np.eye(3), _xy_gains(),
+                              srb=fold.srb, xy=CTRL.XyFeedback(e_xy, v_xy))
+    close("given one, the x/y rows are m (kp e - kd v), the z row's PD",
+          fed.b_d[:2], cfg.MASS * (cfg.KP_XY_EST * e_xy - cfg.KD_XY_EST * v_xy),
+          1e-12, " N")
+    check("...and no other row of the wrench moves",
+          np.array_equal(fed.b_d[2:], no_xy.b_d[2:]))
+    far = CTRL.balance_wrench(at_fold, cmd, np.eye(3), _xy_gains(),
+                              srb=fold.srb, xy=CTRL.XyFeedback(
+                                  np.array([0.3, 0.4]), np.zeros(2)))
+    close("the authority clamp: |a_xy| stops at XY_ACC_MAX, direction kept",
+          far.acc_lin[:2], cfg.XY_ACC_MAX * np.array([0.6, 0.8]), 1e-12,
+          " m/s^2")
+
+    # -- the law: only est_xy, only xy_hold, only a usable estimate ---------
+    def _xy_law(est_xy=True, state=at_fold):
+        law = LAW.BalanceLaw(gains=_xy_gains(), foot_xy=fold.foot_xy,
+                             dynamic_setpoint=False, srb=fold.srb,
+                             track_stop_deg=0.0, est_xy=est_xy)
+        law.arm(0.0, state)
+        law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
+        return law
+    tg = GAIT.TrotGait()
+    tg.reset(0.0)
+    p0 = np.array([0.012, -0.003, 0.2])
+    com_xy = fold.srb.com_body[:2]                 # R = I at this fixture
+
+    def _est(t, p=p0, v=np.zeros(3), yaw=0.0, acc_age=0.0):
+        return LAW.TrunkEstimate(t=t, p_w=np.asarray(p, float),
+                                 v_w=np.asarray(v, float), yaw_offset=yaw,
+                                 acc_age_s=acc_age)
+    off, bare = _xy_law(est_xy=False), _xy_law(est_xy=False)
+    off.feed_estimate(_est(0.996, p=p0 + [0.05, 0.05, 0.0]))
+    a_out = off.update(1.0, at_fold, gait=tg, xy_hold=True)
+    b_out = bare.update(1.0, at_fold, gait=tg, xy_hold=True)
+    check("without est_xy a fed estimate moves NO torque -- every other trot",
+          np.array_equal(a_out.tau, b_out.tau) and not a_out.wrench.b_d[:2].any()
+          and not a_out.xy_on)
+    check("...and is still on the output, for the log",
+          a_out.estimate is not None and abs(a_out.est_age_s - 0.004) < 1e-12)
+    hold_law = _xy_law()
+    hold_law.feed_estimate(_est(0.996, p=p0 + [0.05, 0.05, 0.0]))
+    h_out = hold_law.update(1.0, at_fold)
+    check("with est_xy, a sweep without xy_hold (the rise, the W step) never "
+          "reads it: rows zero, no latch",
+          not h_out.wrench.b_d[:2].any() and not h_out.xy_on
+          and hold_law.xy_des is None)
+
+    trot_law = _xy_law()
+    trot_law.feed_estimate(_est(0.996))
+    first = trot_law.update(1.0, at_fold, gait=tg, xy_hold=True)
+    close("the trot's first sweep LATCHES the CoM x/y the estimate gives",
+          trot_law.xy_des, p0[:2] + com_xy, 1e-15, " m")
+    check("...so closing the loop asks for no force on that sweep",
+          first.xy_on and not first.wrench.b_d[:2].any())
+    trot_law.feed_estimate(_est(1.0, p=p0 + [0.010, 0.0, 0.0]))
+    ahead = trot_law.update(1.004, at_fold, gait=tg, xy_hold=True)
+    close("the trunk 10 mm AHEAD of the latch is pushed back: -m kp 0.010",
+          ahead.wrench.b_d[:2], [-cfg.MASS * cfg.KP_XY_EST * 0.010, 0.0],
+          1e-9, " N")
+    trot_law.feed_estimate(_est(1.004, v=[0.0, 0.05, 0.0]))
+    moving = trot_law.update(1.008, at_fold, gait=tg, xy_hold=True)
+    close("a 50 mm/s drift to the left is damped: -m kd 0.05 in y",
+          moving.wrench.b_d[:2], [0.0, -cfg.MASS * cfg.KD_XY_EST * 0.05],
+          1e-9, " N")
+
+    refusals = (("an estimate 30 ms old", _est(0.982), "old"),
+                ("one from the FUTURE", _est(1.020), "old"),
+                ("one in another world frame", _est(1.008, yaw=0.3), "world"),
+                ("one made on a 120 ms old 0x40", _est(1.008, acc_age=0.12),
+                 "accelerometer"),
+                ("a non-finite one", _est(1.008, p=[np.nan, 0.0, 0.2]),
+                 "finite"))
+    for label, est, word in refusals:
+        before = trot_law.xy_refused
+        trot_law.feed_estimate(est)
+        r_out = trot_law.update(1.012, at_fold, gait=tg, xy_hold=True)
+        check("REFUSED: %s -- x/y rows zero, the flown law, counted" % label,
+              not r_out.xy_on and not r_out.wrench.b_d[:2].any()
+              and r_out.trip is None and trot_law.xy_refused == before + 1
+              and word in trot_law.xy_refusal, trot_law.xy_refusal)
+    stale_imu = state_at(cfg.H_LIFT, age_s=2.0 * cfg.IMU_MAX_AGE_S,
+                         foot_xy=fold.foot_xy, q_seed=fold.q, srb=fold.srb)
+    trot_law.feed_estimate(_est(1.008))
+    s_out = trot_law.update(1.012, stale_imu, gait=tg, xy_hold=True)
+    check("REFUSED: a fresh estimate on a STALE attitude -- rotated by that R",
+          not s_out.xy_on and s_out.imu_held and not s_out.wrench.b_d[:2].any()
+          and "attitude" in trot_law.xy_refusal, trot_law.xy_refusal)
+    check("a feed of None keeps the last estimate rather than clearing it",
+          (trot_law.feed_estimate(None) or True)
+          and trot_law.estimate is not None)
+
+    # THE CoM, NOT THE ORIGIN: a trunk turning in place moves its CoM by
+    # omega x R c^b, and that is the velocity the damper must see.
+    tilt_R = C.rot_x(np.deg2rad(4.0))
+    w_b = np.array([0.0, 0.6, 0.0])                 # pitching at 0.6 rad/s
+    at_tilt = state_at(cfg.H_LIFT, R=tilt_R, omega_b=w_b,
+                       foot_xy=fold.foot_xy, q_seed=fold.q, srb=fold.srb)
+    tilt_law = _xy_law(state=at_tilt)
+    tilt_law.feed_estimate(_est(0.996))
+    tilt_out = tilt_law.update(1.0, at_tilt, gait=tg, xy_hold=True)
+    com_w = tilt_R @ fold.srb.com_body
+    v_com = np.cross(at_tilt.omega_w, com_w)[:2]
+    close("latched at a tilt on the CoM: p_w + R c^b",
+          tilt_law.xy_des, p0[:2] + com_w[:2], 1e-15, " m")
+    close("...and a still ORIGIN under a turning trunk is a moving CoM, damped",
+          tilt_out.wrench.b_d[:2],
+          -cfg.MASS * cfg.KD_XY_EST * v_com, 1e-12, " N")
+
+    # -- the sequence: a fresh latch per HOLD and per trot -----------------
+    xseq = SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                             balance=LAW.BalanceLaw(
+                                 gains=_xy_gains(), foot_xy=fold.foot_xy,
+                                 dynamic_setpoint=False, srb=fold.srb,
+                                 track_stop_deg=0.0, est_xy=True),
+                             gait=GAIT.TrotGait(),
+                             step_to=TR.STEP_FOOT_XY,
+                             step_gait=GAIT.TrotGait(period=TR.STEP_PERIOD_S))
+    xseq.phase = SEQ.PHASES.index("hold")
+    xseq.body = at_fold
+    xseq.gate.start(0.0, q=at_fold.q)
+    xseq.balance.arm(0.0, at_fold)
+    xseq.feed_estimate(_est(0.996, p=p0 + [0.05, 0.0, 0.0]))
+    xseq.update(1.0, at_fold)
+    check("sequence: HOLD latches the x/y where the filter has it and drives",
+          xseq.out.xy_on and xseq.balance.xy_des is not None
+          and not xseq.out.wrench.b_d[:2].any())
+    close("...the CoM's x/y on its first usable sweep: p_w + R c^b",
+          xseq.balance.xy_des, p0[:2] + [0.05, 0.0] + com_xy, 1e-15, " m")
+    xseq.feed_estimate(_est(1.0, p=p0 + [0.06, 0.0, 0.0]))
+    xseq.update(1.004, at_fold)
+    check("...and pushes back as the filter's x moves off it",
+          xseq.out.xy_on and xseq.out.wrench.b_d[0] < 0.0)
+    xseq.balance.xy_des = np.array([9.0, 9.0])         # a stale latch
+    xseq.toggle_trot(1.0)
+    check("...T releases any old latch before the trot's first sweep",
+          xseq.balance.xy_des is None)
+    t = 1.004
+    xseq.feed_estimate(_est(t))
+    xseq.update(t + 0.004, at_fold)
+    check("...and the trot's first sweep latches a fresh one and drives x/y",
+          xseq.out.xy_on and xseq.balance.xy_des is not None
+          and not xseq.out.wrench.b_d[:2].any())
+    xseq.toggle_trot(t + 0.004)
+    t += 0.004
+    xseq.balance.xy_des = np.array([9.0, 9.0])         # the trot's, marked
+    while xseq.trotting and t < 4.0:
+        xseq.feed_estimate(_est(t))
+        t += 0.004
+        xseq.update(t, at_fold)
+    check("...and the exit releases it: HOLD again, latched afresh where the "
+          "trot ended, not the trot's",
+          xseq.phase_name == "hold" and xseq.out.xy_on
+          and np.allclose(xseq.balance.xy_des, p0[:2] + com_xy, 0.0, 1e-15)
+          and not xseq.out.wrench.b_d[:2].any(), "%.2f s" % (t - 1.0))
+    xseq.toggle_step(t)
+    xseq.feed_estimate(_est(t))
+    xseq.update(t + 0.004, at_fold)
+    check("W from HOLD releases the hold's latch, and the step never reads it",
+          xseq.phase_name == "step" and xseq.balance.xy_des is None
+          and not xseq.out.xy_on)
+    report = xseq.balance.report()
+    check("the exit report counts what the loop drove and refused",
+          "x/y on the estimator" in report and "refused" in report)
 
     # =====================================================================
     print("\n" + "=" * 78)

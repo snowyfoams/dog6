@@ -19,11 +19,13 @@ following `--kp-att / --kd-att` (90 / 17) -- except the tilt stop, 45 deg
 
 The trot is `trot_options` below -- the cap, slew and overspeed decision
 first made for `hw.fold_trot` -- with the Cartesian swing and a FASTER clock:
-0.8 s a cycle (`PERIOD_S`), not 1.2.  Since 2026-09-28 `hw.fold_trot` flies
-THIS trot from the fold crouch, on its own tested clock and apex (0.5 s,
-20 mm).
+0.6 s a cycle (`PERIOD_S`), not 1.2.  Since 2026-09-28 `hw.fold_trot` flies
+THIS trot from the fold crouch.  Since 2026-10-02 every trot flies the
+operator's best fold trot by default, on request: 0.6 s, 20 mm apex, slew
+120 N*m/s, swing Kp 10/10/400 N/m and Kd 5/5/40 N s/m (`config.KP_SWING`
+has the run).
 
-    $V -m hw.trot --period 0.6                  faster still
+    $V -m hw.trot --period 0.8                  the clock before 2026-10-02
     $V -m hw.trot --settle 0                    no four-foot re-level
     $V -m hw.trot --kp-joint 3 --kd-joint 0.1   the joint layer (these are
                                                 the defaults)
@@ -189,16 +191,18 @@ THE SWING FEEDFORWARD, 2026-09-25 (`--swing-ff`, off by default)
     own dynamics, 20 mm / 140 ms: 4.3 mm of x at touchdown without it, 0.8
     with it.  It is in now, one Jacobian more.
 
-THE ARC IS LATCHED AT LIFTOFF, 2026-09-28
-    The Cartesian arc now starts where the foot IS on the liftoff sweep and,
-    in place, lands there -- not on the resting site at the commanded
-    height.  The joint swing had that latch since 2026-09-17; the Cartesian
-    one gets it because the fold trot walked in x on it, at 2 mm of apex as
-    at 40, rpy held (the operator's report).  `balance.law.BalanceLaw.update`'s
-    swing block says why a resting site the feet do not stand on is a walk:
-    the joint layer holds the angles latched at HOLD, the arc landed on the
-    site, and two fixed points that disagree move the trunk every swing.  W's
-    step still lands on its destination.  The bench latches the same way.
+THE STATE ESTIMATOR CLOSES THE HOLD'S AND THE TROT'S x/y, 2026-10-02, ON REQUEST
+    Every trot, this one included: `trot_options` brings `hw.trot_esti`'s
+    `EstimatorFeed` and `est_xy`, so the CoM's world x/y and rate come from
+    the Kalman filter (leg odometry + accelerometer) and the SRB wrench's x
+    and y rows hold the x/y latched on the first sweep of each HOLD and each
+    trot -- what `hw.fully_trot` flew first in the trot, and its docstring
+    has the whole account and the MuJoCo numbers.  The HOLD since the same
+    day, on request; the rise and the W step print the filter and never
+    read it.  `--no-est-xy` is the hold and the trot as they were (the
+    filter printed, not fed); `--kp-xy 0 --kd-xy 0` feeds and logs it
+    with the x/y rows zero.  THE LEGS ARE ITS ONLY RULER: a foot that slips
+    moves the robot without moving the estimate.
 
 VELOCITY, THE WHOLE RUN, 2026-09-21
     `hw.velocity_estimator` -- the DETA10's accelerometer integrated, biases
@@ -250,8 +254,8 @@ TAU_CAP = SAFE.TAU_HARD_NM
 #:     period   swing   handover ramp   knee peak    handover rate
 #:     1.2 s    240 ms  144 ms           7.1 rad/s   13 N*m/s
 #:     1.0 s    200 ms  120 ms           8.5 rad/s   19 N*m/s
-#:     0.8 s    160 ms   96 ms          10.6 rad/s   29 N*m/s   <- this
-#:     0.6 s    120 ms   72 ms          14.1 rad/s   51 N*m/s
+#:     0.8 s    160 ms   96 ms          10.6 rad/s   29 N*m/s   <- until 2026-10-02
+#:     0.6 s    120 ms   72 ms          14.1 rad/s   51 N*m/s   <- this
 #:     0.5 s    100 ms   60 ms          16.9 rad/s   73 N*m/s   past the slew
 #:
 #: The 60 N*m/s trot slew follows 0.6 s; at 0.5 s it lags every handover.
@@ -262,7 +266,7 @@ TAU_CAP = SAFE.TAU_HARD_NM
 #: / 4) -- `balance.swing.swing_demand`, printed in the banner against
 #: `--tau-slew`.  At 40 mm of apex, on the leg's measured mass matrix
 #: (`leg_dynamics.mass_matrix`, 61-96 % of it the reflected rotor): 160 ms of
-#: swing (this 0.8 s) needs ~5 N*m and ~130 N*m/s, DOG5's 240 ms ~2.3 N*m and
+#: swing (a 0.8 s period) needs ~5 N*m and ~130 N*m/s, DOG5's 240 ms ~2.3 N*m and
 #: ~40, and 80 ms (a 0.4 s period at duty 0.80) ~20 N*m and ~1000 -- past the
 #: 9 N*m cap, which fits ~18 mm in that 40 ms half-swing.  The foot still
 #: lifts there (seen on the robot, 2026-09-25); what it cannot do is follow
@@ -270,7 +274,11 @@ TAU_CAP = SAFE.TAU_HARD_NM
 #: log's `x_b` against `p_swing` says which -- late and short, or wound up.
 #: The apex scales all of it linearly (`--swing-height`); the swing duration
 #: is (1 - duty) x period, so a short period needs a LOW duty to keep it.
-PERIOD_S = 0.8
+#:
+#: 0.6 SINCE 2026-10-02: the operator's best fold trot, with the 120 N*m/s
+#: slew it flew on (`config.TAU_SLEW_TROT_NM_S`), carried to every trot on
+#: request (`config.KP_SWING` has the run).
+PERIOD_S = 0.6
 
 #: Raised from `hw.stand`'s 12 deg on request 2026-09-17, to `hw.fold_trot`'s.
 #: STILL A TRIP: past it the run stops and the trunk drops.  Run supported.
@@ -303,11 +311,16 @@ STEP_PERIOD_S = 1.2
 def trot_options(period: float = BCFG.GAIT_PERIOD) -> dict:
     """What turns `hw.stand.main` into a trot, whatever the crouch.
 
-    A fresh gait each call: the clock carries its own start time.
+    A fresh gait each call: the clock carries its own start time.  The state
+    estimator comes with it and closes the hold's and the trot's x/y,
+    `--est-xy` on by default (see the module docstring); `--no-est-xy`
+    prints it only.
     """
+    # Imported here: `hw.trot_esti` imports this module for its own main.
+    from .trot_esti import EstimatorFeed
     return dict(gait=GAIT.TrotGait(period=period), tau_cap=TAU_CAP,
                 tau_ceiling=TAU_CAP, tau_slew=BCFG.TAU_SLEW_TROT_NM_S,
-                overspeed_trip=False)
+                overspeed_trip=False, estimator=EstimatorFeed, est_xy=True)
 
 
 def main(argv=None) -> int:

@@ -2,7 +2,11 @@
 
     posture.NOMINAL     `sim.stand.Q_CROUCH` -- trunk on the floor, h = 0
     posture.FOLD        the 2026-09-16 hand-captured fold, rear parallel;
-                        rear and front feet 20 mm forward, h = 60 mm
+                        rear and front feet 20 mm forward, abd 90 deg,
+                        knees opened 15 deg, h = 87.8 mm
+    posture.FOLD2       knees out: the front legs the rear legs mirrored,
+                        every foot 35 mm outboard of its pitch hinge, abd
+                        90 deg, h = 60.5 mm (`hw.fold2_trot`)
     posture.WIDE        NOMINAL's feet 20 mm further out, h = 40 mm
 
 WHY THIS EXISTS.  `hw.stand` used to name `sim.stand.Q_CROUCH` in four places
@@ -53,7 +57,11 @@ A HAND-CAPTURED POSE IS NOT A POSE UNTIL IT HAS BEEN REGULARISED
     front's.  Then (2026-09-28) the rear feet move `FOLD_REAR_FORWARD`, 20
     mm, further forward and the front feet `FOLD_FRONT_FORWARD`, 20 mm,
     every knee still behind its hip.  NOT symmetric front to back: the rear
-    feet sit 101 mm nearer the trunk origin than the front ones.  The
+    feet sit 101 mm nearer the trunk origin than the front ones.  Then
+    (2026-10-01) every foot turns about its abduction axis to abd 90 deg,
+    `FOLD_ABD`, pitch and knee unchanged.  Then (2026-10-02) every knee
+    opens `FOLD_KNEE_OPEN`, 15 deg, abd and pitch unchanged, so the feet
+    reach the floor before the knee motors do.  The
     captured rear fold is kept only in `FOLD_CAPTURED_Q`.  `selftest`
     gates the symmetry, the equal height, and each foot at the front
     fold's site plus its shift.
@@ -79,8 +87,9 @@ from sim import stand as ST          # noqa: E402
 from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
 
-__all__ = ["CrouchPose", "NOMINAL", "FOLD", "WIDE", "POSTURES",
-           "FOLD_CAPTURED_Q", "regularise", "WIDE_SPLAY", "WIDE_H"]
+__all__ = ["CrouchPose", "NOMINAL", "FOLD", "FOLD2", "WIDE", "POSTURES",
+           "FOLD_CAPTURED_Q", "regularise", "FOLD2_FOOT_OUT", "WIDE_SPLAY",
+           "WIDE_H"]
 
 #: The raw capture, 2026-09-16, read off the encoders with the robot folded
 #: by hand.  FLAT, in the joint frame, FL/FR/RL/RR.  KEPT SO THE DERIVATION
@@ -166,6 +175,41 @@ class CrouchPose:
             object.__setattr__(self, "_srb", cached)
         return cached
 
+    def srb_at(self, h_lift: float, foot_xy=None) -> cfg.SrbModel:
+        """The pinned model for a hold at `h_lift` (floor to trunk bottom),
+        with the feet at `foot_xy` (hip frame; None is this posture's own).
+
+        `srb` pins at `config.H_LIFT`, the stand's default; `--height` moves
+        the hold and the pin has to move with it, or the hold is held about
+        a CoM the robot is not at.  For the fold at 115 mm against the 145
+        pin that is 4.3 mm of c^b x -- 0.25 N*m of pitch moment the law
+        never asked for, parked at ~1 deg nose-up by the integrator-less
+        attitude loop (2026-10-01).  Nominal's x stays 0 at any height by
+        symmetry, and z cancels out of the height error, so for it this is
+        the same model to within what cancels.
+
+        AT `config.H_LIFT` IT IS `srb` ITSELF, the same object -- which is
+        what keeps the nominal path bit-identical and the selftest's "same
+        object" gate meaningful.  One model per height, cached.
+        """
+        h_lift = float(h_lift)
+        xy = (self.foot_xy if foot_xy is None
+              else np.asarray(foot_xy, dtype=float).reshape(C.N_LEGS, 2))
+        own_feet = np.allclose(xy, self.foot_xy, rtol=0.0, atol=1e-12)
+        if abs(h_lift - cfg.H_LIFT) < 1e-9 and own_feet:
+            return self.srb
+        cache = self.__dict__.setdefault("_srb_at", {})
+        key = (round(h_lift, 6), tuple(np.round(xy.ravel(), 6)))
+        if key not in cache:
+            p = np.zeros((C.N_LEGS, 3))
+            p[:, :2] = xy
+            p[:, 2] = -(h_lift + cfg.TRUNK_BOTTOM_OFFSET - P.FOOT_RADIUS)
+            cache[key] = cfg.SrbModel.from_pose(
+                "%s@%.0fmm%s" % (self.name, 1e3 * h_lift,
+                                 "" if own_feet else ", stand feet"),
+                HK.all_leg_ik(p, q_seed=self.q))
+        return cache[key]
+
     @property
     def reach_used(self) -> np.ndarray:
         """Fraction of LEG_REACH each leg is extended to."""
@@ -228,11 +272,37 @@ FOLD_REAR_FORWARD = 0.020
 #: front feet alone.
 FOLD_FRONT_FORWARD = 0.020
 
+#: rad, |abd| on every fold leg.  The operator's decision, 2026-10-01: a round
+#: 90 deg, against the 85.77 the shifted fold solved to.  Each foot is TURNED
+#: ABOUT ITS OWN ABDUCTION AXIS to it, so pitch and knee -- the leg's shape,
+#: and every foot's x -- are untouched.  At abd 90 the leg plane is vertical
+#: and the foot sits `knee_to_foot`'s 5 mm out-of-plane offset from the axis:
+#: hip-frame y 10.9 -> 5.0 mm, 5.9 mm inboard, and 0.6 mm lower, h 59.9 ->
+#: 60.5 mm.  A foot pinned at that y keeps abd at 90 at EVERY height, so the
+#: rise holds it, and so does `hw.fold_trot`'s stand, which takes its y here.
+FOLD_ABD = np.pi / 2
 
-def _fold_sites() -> np.ndarray:
+#: rad, how far every fold knee is OPENED from the shape above, abd and pitch
+#: kept.  The operator's decision, 2026-10-02: in the fold crouch the feet
+#: were not on the floor -- the MG5010 knee housings (31.7 mm about the knee
+#: axis) reached 20.1 mm below the floor plane, so the robot sat on its knee
+#: motors -- "the shin should swing more toward the ground".  The crouch's
+#: shin is nearly horizontal, so opening the knee drops the foot nearly
+#: straight down: 10 deg leaves the housings 1.8 mm into the floor, 15 deg
+#: 7.2 mm above it, the foot 27.3 mm lower and 2.7 mm further back, h 60.5
+#: -> 87.8 mm.  The thigh does not move, so neither does the knee: its
+#: clearance to the trunk is what it was.  MuJoCo, `hw.fold_trot`'s sequence
+#: with knee-motor contact: feet 9.6 / 19.3 N front / rear in the crouch
+#: against 0 before, the rise handover lunge +4 mm against +13.
+FOLD_KNEE_OPEN = np.radians(15.0)
+
+
+def _fold_sites(knee_open: float = FOLD_KNEE_OPEN) -> np.ndarray:
     """The capture's FRONT axle, regularised, carried PARALLEL onto the rear,
     then the rear feet `FOLD_REAR_FORWARD` ahead and the front feet
-    `FOLD_FRONT_FORWARD` ahead.
+    `FOLD_FRONT_FORWARD` ahead, then every foot turned about its abduction
+    axis to abd `FOLD_ABD`, 90 deg (2026-10-01), then every knee opened by
+    `knee_open` (`FOLD_KNEE_OPEN`, 2026-10-02).
 
     2026-09-25, the operator's decision: front and rear legs PARALLEL, every
     knee behind its hip -- the front fold, the knee tucked under the abd
@@ -258,7 +328,10 @@ def _fold_sites() -> np.ndarray:
     hip[2:] = hip[:2] - P.HIP_TO_PITCH[:2] + P.HIP_TO_PITCH[2:]
     hip[2:, 0] += FOLD_REAR_FORWARD
     hip[:2, 0] += FOLD_FRONT_FORWARD
-    return hip
+    q = HK.all_leg_ik(hip, q_seed=_fold_seed())
+    q[:, 0] = np.sign(q[:, 0]) * FOLD_ABD
+    q[:, 2] -= np.sign(q[:, 2]) * knee_open
+    return SK.hip_to_foot_stance(q)
 
 
 def _fold_seed() -> np.ndarray:
@@ -283,9 +356,68 @@ FOLD = CrouchPose.from_hip_sites(
     "fold", _fold_sites(), q_seed=_fold_seed(),
     note="hand-posed 2026-09-16, regularised: mirror symmetric, one foot "
          "height; rear parallel to the front, 2026-09-25; rear feet %.0f mm "
-         "and front %.0f mm forward of that, 2026-09-28.  The trunk does NOT "
-         "start on the floor."
-         % (1e3 * FOLD_REAR_FORWARD, 1e3 * FOLD_FRONT_FORWARD))
+         "and front %.0f mm forward of that, 2026-09-28; abd %.0f deg, "
+         "2026-10-01; knees opened %.0f deg, feet on the floor, 2026-10-02.  "
+         "The trunk does NOT start on the floor."
+         % (1e3 * FOLD_REAR_FORWARD, 1e3 * FOLD_FRONT_FORWARD,
+            np.degrees(FOLD_ABD), np.degrees(FOLD_KNEE_OPEN)))
+
+#: THE KNEES-OUT FOLD, 2026-10-01, the operator's decision (`hw.fold2_trot`):
+#: the front legs are the rear legs MIRRORED fore-aft, so every knee motor is
+#: OUTBOARD of its hip -- the rear knees behind the rear hips as in `FOLD`,
+#: the front knees now AHEAD of the front hips instead of under the trunk.
+#:
+#: m, how far outboard of its pitch hinge each foot stands, trunk x: behind
+#: it on a rear leg, ahead of it on a front one.  `hw.fold_trot`'s stand
+#: (`STAND_FOOT_BACK`, 35 mm behind every hinge), whose rear legs are this
+#: shape already -- at its 160 mm hold, thigh 38 deg and shin 15 deg from
+#: vertical -- mirrored onto the front.
+#:
+#: ONE SET OF FEET, CROUCH AND STAND.  `hw.fold_trot` reaches its stand by
+#: sliding all four sites back through the rise: one rigid shift, the trunk
+#: carried 85 mm forward over planted feet.  Mirrored, the front sites would
+#: have to slide FORWARD while the rear slid back -- the stance spreading
+#: 171 mm on the floor.  So the crouch has the stand's feet already.  At
+#: `FOLD`'s crouch height (60.5 mm, before its knees opened on 2026-10-02)
+#: that lays the thigh flat, knee folded to 129 deg against `FOLD`'s 125,
+#: and lifts every knee housing 66 mm off the floor (`FOLD`'s sat 20 mm INTO
+#: its plane).  The mirror puts the CoM on both
+#: trot diagonals (c^b x 0.0; `hw.fold_trot`'s stand: 5.7 mm off both).
+FOLD2_FOOT_OUT = 0.035
+
+
+def _fold2_sites() -> np.ndarray:
+    """The rear feet `FOLD2_FOOT_OUT` behind the rear pitch hinges, at
+    `FOLD`'s y (abd 90) and the crouch height `FOLD` had before its knees
+    opened (`FOLD_KNEE_OPEN`, 2026-10-02), 60.5 mm -- FOLD2's knees were
+    never on the floor, so it keeps its height; the front feet the rear ones
+    MIRRORED: hip-frame x negated, y and z the rear's.  The rear chain is the
+    front's with every link along -x (`sim.params.LEG_GEOMETRY`), so the
+    mirrored site is the mirrored leg."""
+    hip = _fold_sites(knee_open=0.0)
+    hip[2:, 0] = P.HIP_TO_PITCH[2:, 0] - FOLD2_FOOT_OUT
+    hip[:2] = hip[2:] * np.array([-1.0, 1.0, 1.0])
+    return hip
+
+
+def _fold2_seed() -> np.ndarray:
+    """`FOLD`'s rear joints, knee behind the hip, and the front the same
+    mirrored: abd kept, pitch and knee negated -- the 2026-09-17 mirror, the
+    other way round.  Picks the knee-outboard elbow on every leg."""
+    q = FOLD.q.copy()
+    q[:2] = q[2:] * np.array([1.0, -1.0, -1.0])
+    return q
+
+
+#: The knees-out crouch.  DERIVED from `FOLD` at import: its y, and its
+#: height before the knees opened.
+FOLD2 = CrouchPose.from_hip_sites(
+    "fold2", _fold2_sites(), q_seed=_fold2_seed(),
+    note="knees out, 2026-10-01: the front legs the rear legs mirrored, "
+         "every foot %.0f mm outboard of its pitch hinge, crouch and stand; "
+         "abd %.0f deg; FOLD's height before 2026-10-02.  The trunk does "
+         "NOT start on the floor." % (1e3 * FOLD2_FOOT_OUT,
+                                      np.degrees(FOLD_ABD)))
 
 #: THE WIDE CROUCH, 2026-09-17: the feet splayed out, for the trot.
 #:
@@ -320,11 +452,11 @@ WIDE = CrouchPose.from_hip_sites(
     note="NOMINAL's feet %.0f mm further out, trunk %.0f mm off the floor"
          % (1e3 * WIDE_SPLAY, 1e3 * WIDE_H))
 
-POSTURES = {p.name: p for p in (NOMINAL, FOLD, WIDE)}
+POSTURES = {p.name: p for p in (NOMINAL, FOLD, FOLD2, WIDE)}
 
 
 if __name__ == "__main__":
-    for pose in (NOMINAL, FOLD, WIDE):
+    for pose in (NOMINAL, FOLD, FOLD2, WIDE):
         print(pose.describe())
         print()
     raw = C.unflat(FOLD_CAPTURED_Q)

@@ -144,8 +144,9 @@ no rotation; DOG6 had none of the three when this was chosen. The cost is
 that the foot cannot be held still in the \emph{world}: a trunk that moves
 during the swing carries the foot with it.
 \item \textbf{Latched, not commanded.} The arc starts where the foot
-\emph{is}, not at a nominal resting site. The joint-hold layer pins the
-stance at the angles latched on reaching HOLD. A resting site that differs
+\emph{is}, not at a nominal resting site. The joint-hold layer pinned the
+stance at the angles latched on reaching HOLD (its spring is out since
+2026-10-02; the damper stays). A resting site that differs
 from where the feet stand is therefore a step every swing, and two fixed
 points that disagree walk the trunk. A single latched point cannot walk.
 \item \textbf{Trunk frame.} No $\mathbf{R}$ appears anywhere in the swing
@@ -210,7 +211,8 @@ anticipates the motion (\S\ref{sec:gains}).
 
 \paragraph{Nothing else, since 2026-10-01.} The trot's joint-hold layer
 adds $K_p(\vq_{hold}-\vq) - K_h\dot\vq$ to every \emph{planted} leg, with
-$K_h = 0.2$\,N\,m\,s/rad. Until 2026-10-01 a swinging leg kept the damper
+$K_h = 0.2$\,N\,m\,s/rad; $K_p$ has been $0$ since 2026-10-02, on request,
+so a planted leg gets the damper alone. Until 2026-10-01 a swinging leg kept the damper
 $-K_h\dot\vq_i$: its spring target followed the leg, but the damper stayed,
 and it was \emph{absolute}. The MIT method has no such term, and the
 simulator damps stance legs only. The damper is now dropped on swinging legs,

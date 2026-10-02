@@ -258,18 +258,60 @@ KP_YAW = 25.0           # 1/s^2   -> 0.80 Hz
 KD_YAW = 10.0           # 1/s     -> zeta 1.00, the gyro's omega_z
 
 #: Horizontal CoM.  BOTH OFF, AND THIS IS NOT A TUNING EITHER.  p_c,x and
-#: p_c,y are WORLD coordinates and nothing on DOG6 measures them -- there is
-#: no state estimator, and pinning foot xy in the BODY frame says where the
-#: feet are relative to the trunk, not where the trunk is in the world.  A
-#: non-zero gain here is a spring anchored to a point that does not exist.
+#: p_c,y are WORLD coordinates and nothing in `state.BodyState` measures them
+#: -- pinning foot xy in the BODY frame says where the feet are relative to
+#: the trunk, not where the trunk is in the world.  A non-zero gain here is a
+#: spring anchored to a point that does not exist.
 #:
 #: Whatever tangential force the feet end up applying comes from the MOMENT
 #: rows of the allocation, not from a commanded CoM translation.  Trunk xy
 #: stays unregulated exactly as it was under the per-leg law; the difference
 #: is that it is now an explicit zero rather than a quantity the law has no
 #: way to name.
+#:
+#: THE ONE EXCEPTION IS `hw.fully_trot`'S TROT, 2026-10-01: there the state
+#: estimator (`hw.state_estimator`, MIT's KF) is fed to the law and DOES
+#: measure p_c,x/y and their rate, so that trot closes x/y on it with the
+#: gains below -- and its hold too since 2026-10-02.  These two stay zero for
+#: every phase and entry point that has no estimate fed to it.
 KP_XY = 0.0
 KD_XY = 0.0
+
+#: THE x/y LOOP ON THE STATE ESTIMATOR -- `hw.fully_trot`, the trot phase;
+#: the hold too since 2026-10-02, on request (`law.BalanceLaw.est_xy`).  The
+#: filter's world x/y and their rate, converted to the CoM, against the CoM
+#: x/y latched on the first sweep of each hold and each trot: station
+#: keeping, the stand and the trot IN place.  [UNTUNED; `--kp-xy` /
+#: `--kd-xy`; the MuJoCo numbers below are the trot's]
+#:
+#: A SLOW LOOP ON PURPOSE.  The estimate reaches the law one sweep late (the
+#: filter runs in `hw.stand.ESTIMATOR_SLOT`, after slot 0 has acted), 4 ms:
+#: 1.4 deg of phase at 1 Hz, 0.7 at this loop's 0.48 Hz, and a reason never
+#: to put the attitude loop on it.
+#:
+#: ITS x/y ARE LEG ODOMETRY, SO IT HOLDS THE ROBOT WHERE THE LEGS SAY IT IS.
+#: A planted foot that slides moves the trunk without moving the estimate.
+#: In MuJoCo (`hw.fully_trot` has the table) 9/6, 25/10, 50/14 and Kd alone
+#: were all stable and all held the FILTER's x/y; none held the true trunk:
+#: under a 3 N push the feet slid and the best took back 2 of 20 mm, and in
+#: a stance whose front feet slide the filter read the walk with the wrong
+#: sign and the loop made it worse.  9/6 is the gentlest that still closes.
+KP_XY_EST = 9.0         # 1/s^2   -> 0.48 Hz
+KD_XY_EST = 6.0         # 1/s     -> zeta 1.00
+#: m/s^2, the most horizontal acceleration that loop may ask for, as a norm:
+#: 5.9 N, a tenth of the weight and a fifth of what mu 0.5 lets four feet
+#: carry.  An AUTHORITY clamp, DOG5's yaw-error clamp in spirit: a wrong
+#: estimate can push the trunk this hard and no harder.
+XY_ACC_MAX = 1.0
+#: s, how old an estimate may be when the law reads it.  The normal age is
+#: one sweep, 4 ms; past this the x/y rows are zero for that sweep -- the
+#: flown law, `hw.fold_trot`'s -- and the refusal is counted.  DOG5's rule
+#: (`EKF_STALE_S`): a stale estimate driving real force is a fault.
+EST_MAX_AGE_S = 0.020
+#: s, the same for the accelerometer packet the estimate was made from.  The
+#: 0x40 stream is ~100 Hz on its own clock; the filter integrates whatever
+#: sample it was last handed, so a stalled stream is a velocity that walks.
+EST_ACC_MAX_AGE_S = 0.050
 
 
 # ===========================================================================
@@ -457,15 +499,28 @@ SETTLE_EVERY = 2                    # cycles  [DOG5 FLOWN]
 KP_JOINT_HOLD = 5.0                 # N*m/rad
 KD_JOINT_HOLD = 0.2                 # N*m*s/rad
 
-#: The swing apex above the foot's liftoff point, trunk frame.  [DOG5 FLOWN]
-SWING_HEIGHT = 0.040                # m
+#: The ABDUCTION joints' own gains in that layer once a pose is latched
+#: (HOLD and the trot), 2026-10-02, on request: lock abd in joint space,
+#: pitch and knee keep the two above, and the tracked rise keeps those on
+#: all three joints.  `--kp-joint-abd` / `--kd-joint-abd`.  Defaults are the
+#: layer as it was; no stiffer value has been checked yet.
+KP_JOINT_HOLD_ABD = KP_JOINT_HOLD   # N*m/rad
+KD_JOINT_HOLD_ABD = KD_JOINT_HOLD   # N*m*s/rad
+
+#: The swing apex above the resting foot, in the trunk frame.  20 mm since
+#: 2026-10-02, the operator's best fold trot (below); DOG5's was 40.
+SWING_HEIGHT = 0.020                # m
 
 #: Swing-foot Cartesian impedance, TRUNK frame, (x, y, z).  N/m and N s/m --
 #: FORCE gains on the foot, not the balance PD's acceleration gains.
-#: DOG5's, not cMPC's 500/20: those were tuned in MuJoCo against a
-#: feedforward this runner does not carry (see swing.py).  [DOG5 FLOWN]
-KP_SWING = np.array([140.0, 140.0, 180.0])
-KD_SWING = np.array([8.0, 8.0, 15.0])
+#: THE OPERATOR'S BEST, 2026-10-02, on the robot, every trot's default on
+#: request: `hw.fold_trot --period 0.6 --swing-height 20 --tau-slew 120
+#: --kp-swing 10 10 400 --kd-swing 5 5 40`, flown with no joint-layer damper
+#: on the swinging leg (`law.BalanceLaw.update`) -- "now the swing leg height
+#: is good".  Soft in x/y, stiff in z.  DOG5's flown 140/140/180 and 8/8/15
+#: until then.
+KP_SWING = np.array([10.0, 10.0, 400.0])
+KD_SWING = np.array([5.0, 5.0, 40.0])
 
 #: The JOINT swing (`--swing joint`), (abd, pitch, knee).  N*m/rad and
 #: N*m*s/rad.  The fold trot's until 2026-09-28, when it failed on it.
@@ -477,10 +532,18 @@ KD_SWING = np.array([8.0, 8.0, 15.0])
 KP_SWING_JOINT = np.array([30.0, 30.0, 30.0])
 KD_SWING_JOINT = np.array([0.8, 0.8, 0.8])
 
+#: The KNEE swing (`--swing knee`, 2026-10-02, `swing.py`), (abd, pitch,
+#: knee), N*m/rad and N*m*s/rad: abd and pitch held at their liftoff angles,
+#: the knee on its bump.  `--kp-swing-knee` / `--kd-swing-knee`.
+#: [DERIVED -- NOT FLOWN] Started from the joint swing's rotor numbers above.
+KP_SWING_KNEE = np.array([30.0, 30.0, 30.0])
+KD_SWING_KNEE = np.array([0.8, 0.8, 0.8])
+
 #: `safety.SafetyGate`'s slew for a trot.  The gate's default 5 N*m/s is the
 #: stand's and would take 0.35 s to follow one handover -- longer than the
-#: ramp it is following.  60 is what every DOG5 trot run used.  [DOG5 FLOWN]
-TAU_SLEW_TROT_NM_S = 60.0
+#: ramp it is following.  60 is what every DOG5 trot run used.  120 since
+#: 2026-10-02, the operator's best fold trot (`KP_SWING` above).
+TAU_SLEW_TROT_NM_S = 120.0
 
 
 def describe() -> str:
@@ -523,6 +586,14 @@ def describe() -> str:
            MU * WEIGHT * FOOT_RADIUS_XY, 0.5 * MU * WEIGHT * FOOT_RADIUS_XY),
         "    CoM x,y     kp %6.1f  kd %5.1f   -- OFF: nothing measures them"
         % (KP_XY, KD_XY),
+        "    CoM x,y     kp %6.1f  kd %5.1f   -> %.2f Hz, zeta %.2f -- "
+        "every trot's hold and trot (--est-xy), ON THE ESTIMATOR"
+        % (KP_XY_EST, KD_XY_EST, np.sqrt(KP_XY_EST) / (2 * np.pi),
+           KD_XY_EST / (2 * np.sqrt(KP_XY_EST))),
+        "                |a_xy| <= %.1f m/s^2 (%.1f N); estimate <= %.0f ms "
+        "old, its 0x40 <= %.0f ms, or the rows are zero"
+        % (XY_ACC_MAX, MASS * XY_ACC_MAX, 1e3 * EST_MAX_AGE_S,
+           1e3 * EST_ACC_MAX_AGE_S),
         "  saturation: kp_att on this inertia is %.2f N*m/rad in roll and"
         % (INERTIA_BODY[0, 0] * KP_ATT),
         "    %.2f in pitch, against a stance capacity of %.1f and %.1f N*m"

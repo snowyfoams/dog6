@@ -55,9 +55,18 @@ WHAT DOG6 COMMANDS
     Roll and pitch desired are zero after a flat calibration.  Of the three
     CoM axes only z is commanded; x and y are switched off at the gain, for
     the reason `config.KP_XY` gives.
+
+    EXCEPT WHEN AN x/y MEASUREMENT IS HANDED IN (`XyFeedback`).  `BodyState`
+    has no world x/y -- the legs and the IMU cannot give one -- so the x and
+    y rows of the PD read a second, optional argument, and only a trot with
+    `--est-xy` passes it (every trot's default since 2026-10-02; `hw.fully_trot`
+    flew it first): the state estimator's CoM x/y and rate
+    against the CoM x/y latched as that trot began (`law.BalanceLaw.est_xy`).
+    Without it the two rows are the zeros they have always been.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -74,8 +83,8 @@ from sim import coordinates as C     # noqa: E402
 
 from . import config as cfg          # noqa: E402
 
-__all__ = ["BalanceGains", "Wrench", "balance_wrench", "level_attitude",
-           "latched_attitude"]
+__all__ = ["BalanceGains", "Wrench", "XyFeedback", "balance_wrench",
+           "level_attitude", "latched_attitude"]
 
 
 @dataclass
@@ -113,11 +122,28 @@ class BalanceGains:
         return not (self.kp_att.any() or self.kd_att.any())
 
     def __str__(self) -> str:
+        xy = ("" if not (self.kp_pos[:2].any() or self.kd_pos[:2].any()) else
+              "  xy kp %.0f/%.0f kd %.1f/%.1f"
+              % (self.kp_pos[0], self.kp_pos[1], self.kd_pos[0],
+                 self.kd_pos[1]))
         return ("gains kp_z %.0f kd_z %.0f  roll kp %.0f kd %.1f  "
-                "pitch kp %.0f kd %.1f  kp_yaw %.0f kd_yaw %.0f"
+                "pitch kp %.0f kd %.1f  kp_yaw %.0f kd_yaw %.0f%s"
                 % (self.kp_pos[2], self.kd_pos[2], self.kp_att[0],
                    self.kd_att[0], self.kp_att[1], self.kd_att[1],
-                   self.kp_att[2], self.kd_att[2]))
+                   self.kp_att[2], self.kd_att[2], xy))
+
+
+class XyFeedback(NamedTuple):
+    """The horizontal measurement a `state.BodyState` does not carry.
+
+    The CoM's world x/y error and rate, from the state estimator -- see
+    `law.BalanceLaw.est_xy` for where they come from and when they exist.
+    WORLD frame, the run's (heading rezeroed at the handover), like every
+    other vector `balance_wrench` reads.
+    """
+
+    p_error: np.ndarray      # (2,) m, setpoint MINUS estimate
+    v: np.ndarray            # (2,) m/s, the estimate's rate; the setpoint's is 0
 
 
 class Wrench(NamedTuple):
@@ -185,7 +211,8 @@ def latched_attitude(roll_sp: float, pitch_sp: float,
 
 def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
                    omega_des=None, hold_attitude: bool = False,
-                   srb=None) -> Wrench:
+                   srb=None, xy: XyFeedback | None = None,
+                   xy_acc_max: float = cfg.XY_ACC_MAX) -> Wrench:
     """The PD of the module docstring.  A pure function -- no state, no clock.
 
     `state` is a `state.BodyState`, `com_cmd` a `reference.ComCommand`.
@@ -197,17 +224,31 @@ def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
     for its whole life).  Freezing the ERROR instead, and keeping the moment
     the last good packet asked for, would push on a world model that has
     stopped updating.
+
+    `xy` is the x/y measurement `state` does not have, or None.  None -- every
+    caller but a trot with `--est-xy` -- leaves the x and y rows exactly zero,
+    whatever the gains say.  Given, those rows are the same PD as z on it,
+    and the horizontal acceleration they ask for is clamped to `xy_acc_max`
+    as a norm: an authority bound on a loop whose input is an estimate.
     """
     R = state.R
 
     # -- translation ---------------------------------------------------
-    # Only z is commanded; the x and y entries of the gains are zero, so the
-    # zeros paired with them here are never read.  Written out in full anyway,
-    # because a 3-vector whose first two entries are structurally absent is
-    # how a later feedforward gets quietly dropped into the wrong slot.
+    # z is the height loop.  The x and y entries are zero unless an x/y
+    # measurement came in -- `XyFeedback`, the state estimator's -- and are
+    # written out in full anyway, because a 3-vector whose first two entries
+    # are structurally absent is how a later feedforward gets quietly dropped
+    # into the wrong slot.
     p_error = np.array([0.0, 0.0, com_cmd.p_cz - state.p_cz])
     v_error = np.array([0.0, 0.0, com_cmd.p_cz_dot - state.p_cz_dot])
+    if xy is not None:
+        p_error[:2] = xy.p_error
+        v_error[0], v_error[1] = -xy.v[0], -xy.v[1]
     acc_lin = gains.kp_pos * p_error + gains.kd_pos * v_error
+    if xy is not None:
+        a_xy = math.hypot(float(acc_lin[0]), float(acc_lin[1]))
+        if a_xy > xy_acc_max:
+            acc_lin[:2] *= xy_acc_max / a_xy
 
     # -- attitude ------------------------------------------------------
     # The exponential-map error on SO(3), never a difference of Euler angles.

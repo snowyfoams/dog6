@@ -1,10 +1,19 @@
-"""`hw.trot`, with `hw.state_estimator` READ OUT beside it.  Print only.
+"""`hw.trot`, with `hw.state_estimator` READ OUT beside it, and in the x/y of
+its hold and its trot.
 
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V -m hw.trot_esti --fake --auto 1 --no-imu      the whole path, no robot
     $V -m hw.trot_esti                               on the robot
-    $V -m hw.trot_esti --log trot_esti.npz           (the log is `hw.trot`'s;
-                                                      the filter is not in it)
+    $V -m hw.trot_esti --log trot_esti.npz           (the log is `hw.trot`'s,
+                                                      p_est / v_est / xy_des
+                                                      with the loop on)
+    $V -m hw.trot_esti --no-est-xy                   print only, as it was
+
+EVERY TROT CLOSES ITS x/y ON THIS FILTER SINCE 2026-10-02, ON REQUEST, AND
+ITS HOLD DOES TOO (the same day, on request).  `EstimatorFeed` below -- what `hw.fully_trot` flew first -- is in
+`trot.trot_options`, so `--est-xy` is every trot's default and `--no-est-xy`
+is the print-only tap the sections below describe.  `hw.fully_trot`'s
+docstring has the loop's account and what MuJoCo said it is worth.
 
 THE TROT IS `hw.trot`'S, UNCHANGED, AND IT IS IMPORTED RATHER THAN COPIED.
 Every constant, gain, trip, crouch and key comes from that module -- see its
@@ -144,6 +153,11 @@ THE CONTACT PHASES ARE THE GAIT'S, NOT FOUR FEET DOWN
     `tests/test_dog6_sources.py` pins the gap so it is a decision when the
     filter enters the loop rather than a surprise.
 
+    DECIDED 2026-10-01, WHEN IT DID (`hw.fully_trot`): MIT's stays.  Matched
+    to the load ramp (0.15) the estimate was worse in MuJoCo -- 5.3 mm off
+    the true trunk after 10 s of the fold trot against 2.0 at 0.20 -- because
+    a foot rolls and slides most at the two ends of its stance.
+
 IT COSTS AS MUCH AS THE LAW DOES, AND THAT IS WHY IT HAS ITS OWN SLOT
     MEASURED on the Pi, 2026-09-24: one `run_once` is 290 us (p95 301), and the
     tap around it is 350 us of a 333 us CAN slot.  The 28x28 solve in
@@ -157,10 +171,11 @@ IT COSTS AS MUCH AS THE LAW DOES, AND THAT IS WHY IT HAS ITS OWN SLOT
     With it there the run is 85 overruns against 59, and the worst gap is the
     same 6.2 ms.
 
-    THAT IS A TAP'S LUXURY AND NOT A CONTROLLER'S.  A law that fed on this
-    would need the estimate BEFORE it acts, which means slot 0, which does not
-    fit today.  The status line prints `cost mean/max us` every half second so
-    the number stays in front of whoever has to solve that.
+    THAT IS A TAP'S LUXURY AND NOT A FAST CONTROLLER'S.  A law that fed on this
+    the same sweep would need the estimate BEFORE it acts, which means slot 0,
+    which does not fit today.  `hw.fully_trot` feeds a slow one on it a sweep
+    late instead.  The status line prints `cost mean/max us` every half second
+    so the number stays in front of whoever has to solve that.
 
 WHAT IT IS NOT
     Not in the log: `--log` writes `hw.trot`'s columns.  Not in the law: no
@@ -188,12 +203,14 @@ from sim import params as P          # noqa: E402
 from . import stand as STAND         # noqa: E402
 from . import trot as TROT           # noqa: E402
 from . import velocity_estimator as VEL  # noqa: E402
+from .balance import config as BCFG  # noqa: E402
 from .balance import state as BSTATE  # noqa: E402
+from .balance.law import TrunkEstimate  # noqa: E402
 from .state_estimator import adapters as ADAPT  # noqa: E402
 from .state_estimator.estimator import (         # noqa: E402
     LinearKFPosVelEstimator, LKFParams)
 
-__all__ = ["EstimatorTap", "main", "ACC_WAIT_S", "DT_CLAMP"]
+__all__ = ["EstimatorTap", "EstimatorFeed", "main", "ACC_WAIT_S", "DT_CLAMP"]
 
 #: Seconds to wait, BEFORE arming, for the DETA10's first 0x40 packet.  The
 #: accelerometer is NaN until one arrives and the filter cannot run on that;
@@ -228,6 +245,9 @@ class EstimatorTap:
         self.dt_clamp = dt_clamp
         self.out = None               # the last LKFOutput
         self.body = None              # the sweep it was made from, rezeroed
+        #: That sweep's `now`, or None since the last reset.  A read-out has
+        #: no use for it; `hw.fully_trot.EstimatorFeed` ages the estimate by it.
+        self.t_out = None
         self.dt = float("nan")
         #: The 0x40 packet's own age at the last sweep.  Aged apart from the
         #: attitude on purpose: one stream arriving is no evidence about the
@@ -326,11 +346,13 @@ class EstimatorTap:
                 self.est.reset(body.R, body.x_b)
                 self.world = float(stand.yaw_offset)
                 self.t_prev = now
+                self.t_out = None
                 self.refusal = None
                 return self._reset_line()
             dt = float(np.clip(now - self.t_prev, *self.dt_clamp))
             self.out = ADAPT.run_once(src, legs, self.est, dt, P.FOOT_RADIUS,
                                       self._contact_phase(now, stand))
+            self.t_out = now
             self.dt = dt
             self.t_prev = now
             self.acc_age_s = float(orientation.acc_age_s)
@@ -438,14 +460,86 @@ class EstimatorTap:
                    1e3 * e[24:28].max()))
 
 
+class EstimatorFeed(EstimatorTap):
+    """`EstimatorTap`'s filter, stepped the same way, with an `estimate()`.
+
+    Built by `hw.stand.main` as `estimator(imu)`, run by `hw.stand.run` in
+    `ESTIMATOR_SLOT` exactly as the tap is, and asked for `estimate()` after
+    every update -- which `run` hands to `StandSequence.feed_estimate` when
+    the x/y loop is on (`--est-xy`, every trot's default since 2026-10-02;
+    `hw.fully_trot` flew it first and its docstring has the account).
+    Everything the tap prints, it prints, plus one line on what the x/y loop
+    is doing.  The one addition is `estimate()`: the last output as a
+    `balance.law.TrunkEstimate` -- the sweep it was MEASURED on, the world it
+    is in, its accelerometer's age -- or None until the first output after a
+    reset, or once broken.
+    """
+
+    def __init__(self, imu, params=None, dt_clamp=DT_CLAMP) -> None:
+        super().__init__(imu, params=params, dt_clamp=dt_clamp)
+        self.stand = None             # the live sequence, for the status line
+
+    def update(self, now: float, stand, body, orientation) -> str | None:
+        self.stand = stand
+        return super().update(now, stand, body, orientation)
+
+    def estimate(self) -> TrunkEstimate | None:
+        """What the law is fed: the last output, aged and framed, or None."""
+        if self.broken or self.out is None or self.t_out is None:
+            return None
+        return TrunkEstimate(t=float(self.t_out), p_w=self.out.p_w.copy(),
+                             v_w=self.out.v_w.copy(),
+                             yaw_offset=float(self.world),
+                             acc_age_s=float(self.acc_age_s))
+
+    def status(self) -> str:
+        """The tap's two lines, and the loop's.
+
+        `hw.stand.run` calls this OUTSIDE the update's guard, so the loop's
+        line is built under one of its own: a status line must not be able to
+        end a run any more than a read-out may.
+        """
+        if self.broken:
+            return super().status() + ("\nxy loop  OFF with the filter: every "
+                                       "hold and trot sweep flies the x/y-free "
+                                       "law")
+        try:
+            loop = self._loop_line()
+        except Exception as failure:                     # noqa: BLE001
+            loop = "xy loop  (status unavailable: %s)" % type(failure).__name__
+        return super().status() + "\n" + loop
+
+    def _loop_line(self) -> str:
+        stand = self.stand
+        out = getattr(stand, "out", None)
+        if stand is not None and not stand.balance.est_xy:
+            return "xy loop  OFF (--no-est-xy): the filter is printed, not fed"
+        if stand is None or stand.phase_name not in ("hold", "trot"):
+            return "xy loop  -- (the hold and the trot only)"
+        law = stand.balance
+        if out is None or not out.xy_on:
+            return "xy loop  REFUSED this sweep: %s -- the x/y rows are zero" % (
+                law.xy_refusal or "no estimate")
+        # The CoM the law closed on, against the latch -- the law's own sum.
+        p_c = out.estimate.p_w[:2] + (out.state.R @ law.srb.com_body)[:2]
+        err = 1e3 * (out.xy_des - p_c)
+        acc = out.wrench.acc_lin[:2]
+        return ("xy loop  ON  CoM err (%+5.1f, %+5.1f) mm from the latch  "
+                "a (%+.2f, %+.2f) m/s^2 = %.1f N  driven %d / refused %d"
+                % (err[0], err[1], acc[0], acc[1],
+                   BCFG.MASS * float(np.hypot(*acc)), law.xy_sweeps,
+                   law.xy_refused))
+
+
 def main(argv=None) -> int:
-    """`hw.trot.main`'s run, with `EstimatorTap` printing beside it."""
+    """`hw.trot.main`'s run, the filter printed beside it and, with
+    `--est-xy` (the default), closing the hold's and the trot's x/y."""
     return STAND.main(argv, crouch=TROT.CROUCH, only_law="srb",
                       tilt_stop=TROT.TILT_STOP_DEG,
                       track_stop=TROT.TRACK_STOP_DEG,
                       step_to=TROT.STEP_FOOT_XY,
                       step_period=TROT.STEP_PERIOD_S,
-                      velocity=False, estimator=EstimatorTap, terse=True,
+                      velocity=False, terse=True,
                       **TROT.trot_options(TROT.PERIOD_S))
 
 

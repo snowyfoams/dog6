@@ -7,6 +7,9 @@
     StandSequence.toggle_trot(now)    enter / leave the trot (`hw.stand`'s T)
     StandSequence.toggle_step(now)    step the feet to `step_to` or back (W)
     StandSequence.update(now, body)   -> (mode, values, trip), once per sweep
+    StandSequence.feed_estimate(est)  the state estimator's answer, when the
+                                      runner has one (a trot's `--est-xy`:
+                                      the hold's and the trot's x/y)
 
 THE TROT IS A SUB-STATE OF HOLD, NOT AN EIGHTH PHASE
     DOG5's TROT stage, ported: T from HOLD starts it, T during it LATCHES an
@@ -479,10 +482,17 @@ class StandSequence:
                                                            self.yaw_offset)
 
     @property
+    def home_xy(self):
+        """Where the feet belong for the park: the stand's sites when the
+        rise slides them there (`balance.stand_xy`), else the crouch's."""
+        home = self.balance.home_xy
+        return self.crouch.foot_xy if home is None else home
+
+    @property
     def feet_home(self) -> bool:
         """The feet are on the crouch's own sites -- PARK may run."""
         xy = self.balance.foot_xy
-        return xy is None or bool(np.allclose(xy, self.crouch.foot_xy,
+        return xy is None or bool(np.allclose(xy, self.home_xy,
                                               rtol=0.0, atol=1e-9))
 
     def toggle_step(self, now: float) -> str:
@@ -493,20 +503,23 @@ class StandSequence:
             return "W ignored: the feet step from HOLD, not %s" % self.phase_name
         if self.law != "srb":
             return "W ignored: only the SRB law can step"
-        target = self.crouch.foot_xy if not self.feet_home else self.step_to
+        target = self.home_xy if not self.feet_home else self.step_to
         return self._start_step(now, target, park_after=False)
 
     def _start_step(self, now: float, target, park_after: bool) -> str:
         # The feet are moving: the old joint target is a stance they are
         # leaving.  Re-latched when the step lands, at the new one.
         self.balance.release_joints()
+        # And the hold's x/y: the step flies x/y-free, and the HOLD it lands
+        # in latches a fresh one (`law.BalanceLaw.est_xy`).
+        self.balance.release_xy()
         self.balance.begin_step(target)
         self.step_gait.reset(now)
         self.stepping = True
         self.park_after_step = park_after
         self.t_phase = float(now)
         self.step_runs += 1
-        home = np.allclose(target, self.crouch.foot_xy, rtol=0.0, atol=1e-9)
+        home = np.allclose(target, self.home_xy, rtol=0.0, atol=1e-9)
         return ("STEP: feet %s, one %.2f s gait cycle.  The first foot lifts "
                 "in %.2f s.  %sX is an E-STOP."
                 % ("back to the %s crouch's sites" % self.crouch.name if home
@@ -532,6 +545,10 @@ class StandSequence:
             return "T ignored: the trot starts from HOLD, not %s" % self.phase_name
         if self.law != "srb":
             return "T ignored: only the SRB law can trot"
+        # A FRESH x/y SETPOINT PER TROT (`law.BalanceLaw.est_xy`): latched on
+        # this trot's first usable estimate, never carried over from the
+        # hold's or the last trot's.
+        self.balance.release_xy()
         self.gait.reset(now, half=bool(self.trot_swings) and self._half_next)
         if self.trot_swings:
             self._half_next = not self._half_next
@@ -597,6 +614,14 @@ class StandSequence:
         notice, self.notice = self.notice, None
         return notice
 
+    def feed_estimate(self, estimate) -> None:
+        """The runner's one door for the state estimator's answer -- a
+        `law.TrunkEstimate`, or None for a sweep that has none.  Every sweep
+        it has one, whatever the phase; whether anything ACTS on it, and
+        when, is the law's (`law.BalanceLaw.est_xy`: the hold's and the
+        trot's x/y only)."""
+        self.balance.feed_estimate(estimate)
+
     @property
     def finished(self) -> bool:
         return self.phase_name == "done"
@@ -625,7 +650,7 @@ class StandSequence:
         # crouch; from any other stance that slides the feet on the floor.
         if (self.phase_name == "hold" and self.law == "srb"
                 and self.step_gait is not None and not self.feet_home):
-            self.notice = self._start_step(now, self.crouch.foot_xy,
+            self.notice = self._start_step(now, self.home_xy,
                                            park_after=True)
             return None
         if self.phase_name in ("crouch", "park") and self.ramp_remaining(now) > 0:
@@ -744,7 +769,11 @@ class StandSequence:
             # THE JOINT TARGET IS FIXED HERE, ONCE: the angles on the sweep
             # the robot reaches HOLD.  Kept through the hold and every trot
             # -- not re-taken at T, which would carry any drift forward.
-            self.balance.hold_joints(q)
+            # When the rise was TRACKED the target is the law's own
+            # reference at the stand -- `balance.hold_reference` says why
+            # the measured pose is the wrong thing to freeze then.
+            self.balance.hold_joints(self.balance.hold_reference(q)
+                                     if self.balance.rise_track else q)
             name = self.phase_name
             elapsed = 0.0
             self.notice = (
@@ -755,6 +784,9 @@ class StandSequence:
         if name == "trot" and self.trot_exit and self._four_foot_window(self.gait, now):
             self.trotting = False
             self.trot_exit = False
+            # The HOLD latches its own x/y on this very sweep, where the trot
+            # ended -- it does not pull the trot's drift back.
+            self.balance.release_xy()
             self.t_phase = now
             self.hold.start(now)
             name = self.phase_name
@@ -795,7 +827,8 @@ class StandSequence:
             if self.law == "srb":
                 result = self._lift_srb(
                     now, body,
-                    {"trot": self.gait, "step": self.step_gait}.get(name))
+                    {"trot": self.gait, "step": self.step_gait}.get(name),
+                    xy_hold=(name in ("hold", "trot")))
             else:
                 # SINCE THE RISE, not since the phase -- see `t_lift`.
                 result = self._lift_per_leg(now, now - self.t_lift, q, q4, qd)
@@ -834,16 +867,20 @@ class StandSequence:
         return "position", self.q_des, None
 
     # -- the two lift laws -------------------------------------------------
-    def _lift_srb(self, now: float, body, gait=None):
+    def _lift_srb(self, now: float, body, gait=None, xy_hold: bool = False):
         """The SRB balance controller.  Five stages, once, at slot 0.
 
         The law returns a trip reason; the GATE still shapes the torque
         afterwards, so there is exactly one limiter per quantity.  A trip
         during the lift is a drop, which is why the law reports and this
         method -- and ultimately `run` -- decides.
+
+        `xy_hold` is True in the hold and the trot and nowhere else -- not
+        the rise, not the W step: it is the law's cue for the state
+        estimator's x/y, which only `est_xy` acts on.
         """
         self.out = self.balance.update(now, body, clock=time.perf_counter,
-                                       gait=gait)
+                                       gait=gait, xy_hold=xy_hold)
         self.h_cmd = BSTATE.height_to_origin(self.out.command.h)
         self.q_des = self.out.q_ref
         self.gravity = self.balance.gravity

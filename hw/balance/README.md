@@ -6,6 +6,8 @@ python -m hw.balance.config          every number, with its provenance
 python -m hw.stand --law srb         run it
 python -m hw.stand --law per-leg     run what it replaces
 python -m hw.fold_trot               the fold stance, then T trots in place
+python -m hw.fold2_trot              the same, knees out: front legs the rear mirrored
+python -m hw.fully_trot              hw.fold_trot, the trot's x/y closed on the Kalman filter
 python -m hw.trot                    the nominal crouch, then T trots in place
 ```
 
@@ -346,6 +348,38 @@ this.
 Offline, over two settle blocks with the swing tracked perfectly
 (`selftest` §12): no trip, peak 3.30 N·m (rear knee), Fz exactly the weight.
 The law costs p50 ~610 µs on the Pi against ~490 µs for the stand.
+
+## The state estimator in the hold's and the trot's x/y: `hw.fully_trot`
+
+`hw.fold_trot` with one channel closed (2026-10-01). While trotting, the PD's x
+and y rows (`config.KP_XY`, zero everywhere else because nothing measured
+them) read `hw.state_estimator`'s CoM x/y and rate, held at the x/y latched on
+the trot's first sweep: `law.BalanceLaw.est_xy`, gains `config.KP_XY_EST` /
+`KD_XY_EST` (9 /s², 6 /s, 0.48 Hz), `|a_xy| ≤ XY_ACC_MAX`. Height stays the
+legs', attitude the IMU's. Since 2026-10-02 (on request) every trot entry point
+has it, and HOLD reads it too: each HOLD latches its own x/y on its first
+usable sweep (after the rise, after a trot, after a W step), so it never pulls
+back the drift of the phase before it.
+
+```
+hw.stand.run    slot 0: law (reads the estimate)   ...   ESTIMATOR_SLOT: filter → stand.feed_estimate
+```
+
+The filter still runs in its own slot, so the law reads it one sweep late
+(4 ms). Any sweep whose estimate is older than 20 ms, made on a 0x40 packet
+older than 50 ms, in another world frame, not finite, or met by a stale IMU
+attitude gets the x/y rows at zero, which is the flown law, and the refusal is
+counted. `--kp-xy 0 --kd-xy 0`
+is the A/B. `selftest` §13 checks that the rise, the W step and every other
+entry point never read it, and that HOLD and each trot latch afresh.
+
+**What MuJoCo says it is worth:** the loop holds the *filter's* x/y, and the
+filter's x/y is leg odometry. In the sim the trot's drift came through planted
+feet sliding, which the filter cannot see. As built it was +0.5 mm/10 s with
+the loop off and +0.9 with it on. Under a 3 N push it was +20.6 → +18.1 mm.
+In the 145 mm stance whose front feet slide, the filter read the walk with the
+wrong sign and the loop made it 40 % worse. `hw.fully_trot`'s docstring has the
+table.
 
 ## What "level" means: the setpoint is latched, not assumed
 

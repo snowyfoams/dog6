@@ -5,6 +5,7 @@
     $V -m hw.swing_bench                                    on the robot, in the air
     $V -m hw.swing_bench --swing-ff --swing-height 20 --tau-slew 150 --log bench.npz
     $V -m hw.swing_bench --legs FL --swings 3 --swing-ff    one leg, three swings, stop
+    $V -m hw.swing_bench --posture fold                     the fold, legs parallel, 140 mm
 
 HANG THE ROBOT BEFORE YOU START.  Nothing in this file holds it up: there
 is no balance law, no height loop, no allocator and no IMU.  Each leg gets
@@ -16,8 +17,10 @@ read through the trunk's motion and the other three legs; here the FK of
 the swing leg IS the measurement.
 
     limp    zero torque; the legs hang.  Read q.               ENTER ->
-    pose    POSITION mode, a smoothstep to the lift pose over `--pose-s`.
-            The legs move to where a standing robot would have them.
+    pose    POSITION mode, a smoothstep to the bench's posture over
+            `--pose-s`.  The legs move to where a standing robot would have
+            them: `--posture lift`, the stand's lift pose (the default), or
+            `--posture fold`, see below.
     hold    TORQUE mode, entered by itself when the ramp arrives: every
             foot held at its resting site (the FK of the pose it is already
             in, so the handover moves nothing) by the swing PD at zero
@@ -67,6 +70,19 @@ WHAT IT SHARES WITH THE TROT, EXACTLY
     trot (the 2026-09-17 decision -- a 20 mm arc asks the knee for 8 rad/s
     against a 7 rad/s trip written for a stand); the peaks print at exit.
 
+THE POSTURES, `--posture`
+    lift    `config.NOMINAL_POSE`: the nominal stance at the lift height,
+            145 mm floor to trunk bottom.  What the bench has always held.
+    fold    `posture.FOLD`'s feet with the legs extended: each foot pinned at
+            the fold's hip-frame xy, as `law.ik_reference` pins it during the
+            rise, and the trunk `--height` (140 mm, `FOLD_HEIGHT`) above the
+            floor.  2026-10-01, on request: the fold with FRONT AND REAR
+            LEGS PARALLEL.  The rear foot sits 2 L1 behind the front's in its
+            own hip frame, which is the pitch hinge's own offset, so at one
+            height the IK gives every leg the same thigh and shin -- knee
+            equal, pitch half a turn apart.  `bench_pose` refuses a height
+            where that does not come out, or the feet are out of reach.
+
 WHAT IT IS NOT
     Not a stand: the "pose" is a position ramp, not the lift, and the hold
     carries no weight because there is none to carry.  Not a trot: no stance
@@ -99,6 +115,7 @@ from . import safety as SAFE         # noqa: E402
 from . import trot as TROT           # noqa: E402
 from .balance import config as BCFG  # noqa: E402
 from .balance import gait as GAIT    # noqa: E402
+from .balance import posture as POSE  # noqa: E402
 from .balance import sequence as SEQ  # noqa: E402
 from .balance import state as BSTATE  # noqa: E402
 from .balance import swing as SWING  # noqa: E402
@@ -106,10 +123,49 @@ from .balance import torque as TRQ   # noqa: E402
 from .stand import (GAP_ESTOP_S, QD_FILTER_HZ, RATE_HZ, STATUS_EVERY_SWEEPS,  # noqa: E402
                     STATUS_PERIOD_S, KeyPoller, _torque_lines)
 
-__all__ = ["SwingBench", "SwingReport", "run", "main", "POSE_S", "TAU_CAP"]
+__all__ = ["SwingBench", "SwingReport", "run", "main", "bench_pose", "POSE_S",
+           "TAU_CAP", "POSTURES", "FOLD_HEIGHT"]
 
-#: Seconds for the position-mode smoothstep from the hang to the lift pose.
+#: Seconds for the position-mode smoothstep from the hang to the posture.
 POSE_S = 2.0
+
+#: What "pose" ramps to and "hold" holds -- the docstring's THE POSTURES.
+POSTURES = ("lift", "fold")
+
+#: m, floor to trunk bottom, for `--posture fold`: the fold's legs extended
+#: to 140 mm.  The operator's number, 2026-10-01.  The lift is 145.
+FOLD_HEIGHT = 0.140
+
+
+def bench_pose(posture: str = "lift", height: float = FOLD_HEIGHT) -> np.ndarray:
+    """(4, 3) joints, rad: the pose the bench ramps to and holds.
+
+    "lift" is `config.NOMINAL_POSE`, exactly.  "fold" is `posture.FOLD`'s
+    feet pinned at their hip-frame xy with the trunk `height` above the
+    floor -- the stance `CrouchPose.srb` is pinned at, at another height --
+    and it REFUSES a pose whose front and rear legs are not parallel (knee
+    equal, abd equal, pitch half a turn apart) or whose feet the IK missed.
+    """
+    if posture == "lift":
+        return np.asarray(BCFG.NOMINAL_POSE, dtype=float).copy()
+    if posture != "fold":
+        raise ValueError("posture %r: one of %s" % (posture, POSTURES))
+    p = np.zeros((C.N_LEGS, 3))
+    p[:, :2] = POSE.FOLD.foot_xy
+    p[:, 2] = -(height + BCFG.TRUNK_BOTTOM_OFFSET - P.FOOT_RADIUS)
+    q = HK.all_leg_ik(p, q_seed=POSE.FOLD.q)
+    miss = np.abs(np.array([HK.foot_position_hip(i, q[i]) for i in range(C.N_LEGS)])
+                  - p).max()
+    if not miss < 1e-4:
+        raise ValueError("fold at %.0f mm: the IK misses the feet by %.1f mm -- out "
+                         "of reach" % (1e3 * height, 1e3 * miss))
+    front, rear = q[:2], q[2:]
+    turn = np.angle(np.exp(1j * (np.abs(front[:, 1] - rear[:, 1]) - np.pi)))
+    skew = max(np.abs(front[:, [0, 2]] - rear[:, [0, 2]]).max(), np.abs(turn).max())
+    if skew > np.radians(0.1):
+        raise ValueError("fold at %.0f mm: front and rear legs %.1f deg off parallel"
+                         % (1e3 * height, np.degrees(skew)))
+    return q
 
 #: The bench's default cap.  A 20 mm / 140 ms arc asks ~3.5 N*m and the legs
 #: carry nothing, so 4 is room to swing and not room to do damage.  The
@@ -118,8 +174,8 @@ TAU_CAP = 4.0
 
 PHASES = ("limp", "pose", "hold", "swing")
 PHASE_BLURB = {
-    "limp": "NO TORQUE -- the legs hang.  ENTER ramps them to the lift pose.",
-    "pose": "POSITION mode, smoothstep to the lift pose.  Hold follows by itself.",
+    "limp": "NO TORQUE -- the legs hang.  ENTER ramps them to the posture.",
+    "pose": "POSITION mode, smoothstep to the posture.  Hold follows by itself.",
     "hold": "TORQUE -- each foot held at its site by the swing PD + gravity.  "
             "ENTER swings; X stops.",
     "swing": "the gait clock runs; ENTER latches a stop at the next four-foot "
@@ -189,7 +245,8 @@ class SwingBench:
                  legs, swing: str = "cartesian", swing_height: float,
                  swing_ff: bool, kp_swing, kd_swing, pose_s: float = POSE_S,
                  swings: int = 0, swing_stop_deg: float = 30.0,
-                 ff_inertia=None) -> None:
+                 ff_inertia=None, posture: str = "lift",
+                 height: float = FOLD_HEIGHT) -> None:
         self.gate = gate
         self.gait = gait
         self.legs = np.zeros(C.N_LEGS, dtype=bool)
@@ -210,8 +267,9 @@ class SwingBench:
         self.swing_stop_deg = float(swing_stop_deg)
         self.trip = None
         self.q_arc = np.full((C.N_LEGS, 3), np.nan)   # the arc's IK, swinging legs
-        #: The lift pose and its feet: what "pose" ramps to and "hold" holds.
-        self.q_pose = np.asarray(BCFG.NOMINAL_POSE, dtype=float).copy()
+        #: The posture and its feet: what "pose" ramps to and "hold" holds.
+        self.posture = posture
+        self.q_pose = bench_pose(posture, height)
         self.rest = np.array([HK.foot_position(i, self.q_pose[i])
                               for i in range(C.N_LEGS)])
         self.phase = "limp"
@@ -238,8 +296,8 @@ class SwingBench:
             self.q_from = np.asarray(q, dtype=float).reshape(C.N_LEGS, 3).copy()
             self.max_dps = SEQ.ramp_motor_dps(self.q_from, self.q_pose, self.pose_s)
             self._go("pose", now)
-            return ("POSE: position ramp to the lift pose over %.1f s; the hold "
-                    "takes over by itself when it arrives." % self.pose_s)
+            return ("POSE: position ramp to the %s posture over %.1f s; the hold "
+                    "takes over by itself when it arrives." % (self.posture, self.pose_s))
         if self.phase == "pose":
             return "ENTER ignored: the pose ramp is still running"
         if self.phase == "hold":
@@ -320,13 +378,10 @@ class SwingBench:
                 self.tau_pd[sl] = pd
                 continue
             s = float(self.swing_s[i])
-            # THE ARC STARTS ON THE FOOT, latched at liftoff, in both modes
-            # -- as `law.update` does since 2026-09-28 (its swing block says
-            # why the resting site was a walk on the floor).
-            if not np.isfinite(self._lift_x[i, 0]):
-                self._lift_x[i] = body.x_b[i]
-                self._lift_q[i] = q4[i]
             if self.swing == "joint":
+                if not np.isfinite(self._lift_x[i, 0]):
+                    self._lift_x[i] = body.x_b[i]
+                    self._lift_q[i] = q4[i]
                 qj, qdj = SWING.joint_swing_reference(
                     i, self._lift_x[i], s, self.gait.swing_duration, self._lift_q[i],
                     height=self.swing_height)
@@ -335,7 +390,7 @@ class SwingBench:
                                                     height=self.swing_height)
                 pd = SWING.joint_swing_torque(body, i, qj, qdj)
             else:
-                p, v, a = SWING.swing_reference_pva(self._lift_x[i], s,
+                p, v, a = SWING.swing_reference_pva(self.rest[i], s,
                                                     self.gait.swing_duration,
                                                     height=self.swing_height)
                 pd = SWING.swing_torque(body, i, p, v, kp=self.kp_swing,
@@ -343,7 +398,7 @@ class SwingBench:
                 # THE ARC'S OWN IK, FOR THE GUARD AND THE REPORT ONLY -- no
                 # torque reads it.  191 us a leg, which this loop can afford.
                 qj, _ = SWING.joint_swing_reference(
-                    i, self._lift_x[i], s, self.gait.swing_duration, q4[i],
+                    i, self.rest[i], s, self.gait.swing_duration, q4[i],
                     height=self.swing_height)
             self.q_arc[i] = qj
             dev = np.degrees(np.abs(q4[i] - qj))
@@ -465,7 +520,10 @@ def analyse(L, after_s: float = 0.3) -> str:
     out += _run_health(L, t, tau_cmd, tau_meas, swing_s)
     n = 0
     fits = []                      # (pitch, knee) effective inertia per swing, from tau_meas
-    links = np.diag(LD.mass_matrix(0, np.asarray(BCFG.NOMINAL_POSE, float)[0], armature=False))
+    # the links at the pose the bench HELD -- a log from before `--posture`
+    # has no q_pose and held the lift pose
+    held = L["q_pose"][0] if "q_pose" in L.files else np.asarray(BCFG.NOMINAL_POSE, float)
+    links = np.diag(LD.mass_matrix(0, held[0], armature=False))
     for leg in range(C.N_LEGS):
         up = swing_s[:, leg] > 0.0
         edges = np.flatnonzero(np.diff(up.astype(int)))
@@ -747,6 +805,7 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
                             tau_req=bench.tau.copy(), tau_cmd=tau_sent.copy(),
                             tau_ff=bench.tau_ff.copy(), tau_pd=bench.tau_pd.copy(),
                             tau_meas=tau_meas, q_arc=bench.q_arc.copy(),
+                            q_pose=bench.q_pose,
                             errors=np.asarray([errors.get(mid, 0) or 0 for mid in ids]),
                             temps=temps, cap=bench.gate.cap_now(now))
             else:
@@ -804,7 +863,13 @@ def main(argv=None) -> int:
     ap.add_argument("--overspeed-trip", action="store_true",
                     help="stop on the 7 rad/s joint-speed trip (off, as in the trot)")
     ap.add_argument("--pose-s", type=float, default=POSE_S,
-                    help="the position ramp from the hang to the lift pose, s")
+                    help="the position ramp from the hang to the posture, s")
+    ap.add_argument("--posture", choices=POSTURES, default="lift",
+                    help="lift: config.NOMINAL_POSE, 145 mm.  fold: posture.FOLD's "
+                         "feet, front and rear legs parallel, at --height")
+    ap.add_argument("--height", type=float, default=None, metavar="MM",
+                    help="floor to trunk bottom for --posture fold (default %.0f)"
+                         % (1e3 * FOLD_HEIGHT))
     ap.add_argument("--rate", type=float, default=RATE_HZ)
     ap.add_argument("--bitrate", type=int, default=1_000_000)
     ap.add_argument("--arm-timeout", type=float, default=30.0)
@@ -851,6 +916,10 @@ def main(argv=None) -> int:
         return 0
     if args.auto is not None and not args.fake:
         ap.error("--auto is only allowed with --fake")
+    if args.height is not None and args.posture != "fold":
+        ap.error("--height is the fold's; the lift posture is config.NOMINAL_POSE "
+                 "at %.0f mm" % (1e3 * BCFG.H_LIFT))
+    height = FOLD_HEIGHT if args.height is None else 1e-3 * args.height
 
     try:
         gait = GAIT.TrotGait(period=args.period, duty=args.duty, ramp=args.contact_ramp,
@@ -866,13 +935,18 @@ def main(argv=None) -> int:
     except (RuntimeError, ValueError) as refusal:
         print("[bench] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
         return 2
-    bench = SwingBench(gate, gait, legs=[C.LEGS.index(name) for name in args.legs],
-                       swing=args.swing, swing_height=1e-3 * args.swing_height,
-                       swing_ff=args.swing_ff, kp_swing=args.kp_swing,
-                       kd_swing=args.kd_swing, pose_s=args.pose_s, swings=args.swings,
-                       swing_stop_deg=args.swing_stop,
-                       ff_inertia=(None if args.ff_armature is None
-                                   else SWING.feedforward_inertia(args.ff_armature)))
+    try:
+        bench = SwingBench(gate, gait, legs=[C.LEGS.index(name) for name in args.legs],
+                           swing=args.swing, swing_height=1e-3 * args.swing_height,
+                           swing_ff=args.swing_ff, kp_swing=args.kp_swing,
+                           kd_swing=args.kd_swing, pose_s=args.pose_s, swings=args.swings,
+                           swing_stop_deg=args.swing_stop,
+                           ff_inertia=(None if args.ff_armature is None
+                                       else SWING.feedforward_inertia(args.ff_armature)),
+                           posture=args.posture, height=height)
+    except ValueError as refusal:
+        print("[bench] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
+        return 2
 
     # -- the banner ---------------------------------------------------------------
     print("DOG6 swing bench on %s -- HANG THE ROBOT UP FIRST: nothing here holds it"
@@ -883,6 +957,12 @@ def main(argv=None) -> int:
           "swing-stop %s"
           % (args.tau_cap, args.tau_slew, "ON" if args.overspeed_trip else "OFF",
              "OFF" if args.swing_stop <= 0 else "%.0f deg off the arc's IK" % args.swing_stop))
+    print("  posture %s: %s  feet at %s mm, trunk frame"
+          % (args.posture,
+             "config.NOMINAL_POSE, %.0f mm" % (1e3 * BCFG.H_LIFT) if args.posture == "lift"
+             else "posture.FOLD's feet, front and rear legs parallel, %.0f mm" % (1e3 * height),
+             "  ".join("%s %+.0f/%+.0f/%+.0f" % (C.LEGS[i], *(1e3 * bench.rest[i]))
+                       for i in range(C.N_LEGS))))
     print("  legs %s   %s" % (" ".join(args.legs), gait))
     demand = SWING.swing_demand(0, bench.rest[0], gait.swing_duration,
                                 1e-3 * args.swing_height, bench.q_pose[0])

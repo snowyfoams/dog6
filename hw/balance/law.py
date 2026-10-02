@@ -44,9 +44,20 @@ THE FOUR TRIPS IT CAN RAISE, AND THE ONE IT DELIBERATELY DOES NOT
     which is the behaviour a robot with no attitude sensor has anyway, and is
     what the per-leg law did for its entire life.  `LawOutput.imu_held` says
     it happened and the runner prints it once.
+
+    A STALE OR MISSING ESTIMATE IS NOT ONE EITHER.  With `est_xy` (every
+    trot's `--est-xy`, on by default since 2026-10-02; `hw.fully_trot` flew it
+    first) the hold's and the trot's x/y rows read the state estimator; any
+    sweep
+    whose estimate cannot be used -- none fed, too old, another world frame,
+    non-finite, a stale accelerometer behind it, a stale attitude this sweep
+    -- gets the x/y rows at zero,
+    which is exactly the law every other trot flies, and the refusal is
+    counted for the report.  DOG5's per-tick fallback to the flown source.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -71,7 +82,8 @@ from . import state as STATE         # noqa: E402
 from . import swing as SWING         # noqa: E402
 from . import torque as TRQ          # noqa: E402
 
-__all__ = ["BalanceLaw", "LawOutput", "Timing", "ik_reference"]
+__all__ = ["BalanceLaw", "LawOutput", "Timing", "TrunkEstimate",
+           "ik_reference"]
 
 
 def _wrap_pi(a: float) -> float:
@@ -150,6 +162,29 @@ class Timing:
                    "  (+%d dropped)" % self.dropped if self.dropped else ""))
 
 
+@dataclass(frozen=True)
+class TrunkEstimate:
+    """The state estimator's answer as the law reads it.  WORLD frame.
+
+    Built by whatever runs the filter (`hw.trot_esti.EstimatorFeed`) and
+    handed in through `BalanceLaw.feed_estimate`; this package does not
+    import the filter and does not care which one it is.  Every field the law
+    needs to decide whether to BELIEVE it is here beside the numbers: when it
+    was measured, in which world, and how old its accelerometer was.
+    """
+
+    #: s, the `now` of the sweep whose measurement the estimate was made
+    #: from -- NOT when the arithmetic ran.  The law ages it against its own.
+    t: float
+    p_w: np.ndarray          # (3,) m, trunk ORIGIN, the run's world
+    v_w: np.ndarray          # (3,) m/s, the same point's velocity
+    #: rad, the heading the world frame was pinned to (`yaw_offset`).  An
+    #: estimate made in another world is refused, never rotated.
+    yaw_offset: float
+    #: s, the age of the 0x40 packet the filter integrated on that sweep.
+    acc_age_s: float = 0.0
+
+
 @dataclass
 class LawOutput:
     """One sweep's result.  Everything the log needs, and nothing derived."""
@@ -173,6 +208,14 @@ class LawOutput:
     #: has `swing_ff` and the leg is swinging.  Logged so a run can say what
     #: the feedforward did, apart from what the PD did.
     tau_ff: np.ndarray | None = None
+    #: The state estimator, when one is fed (`BalanceLaw.est_xy`): the
+    #: estimate this sweep READ, believed or not, and its age; the CoM x/y
+    #: setpoint, None until a hold or a trot latches one; and whether the
+    #: x/y rows were driven by it this sweep -- False is the flown law.
+    estimate: TrunkEstimate | None = None
+    est_age_s: float = float("nan")
+    xy_des: np.ndarray | None = None     # (2,) m, CoM, WORLD
+    xy_on: bool = False
 
 
 @dataclass
@@ -218,11 +261,11 @@ class BalanceLaw:
     #: is the same z-only arc through the IK, abd held, joint PD, which the
     #: fold trot flew until then.  See swing.py.
     swing: str = "cartesian"
-    #: m, the swing apex above the foot's liftoff point.  `config.SWING_HEIGHT`
-    #: (40 mm, DOG5's) unless the entry point says otherwise --
-    #: `--swing-height`.  It is the one number that scales the whole swing
-    #: demand (speed, torque, slew) linearly, so it is the first thing to
-    #: lower for a short swing.
+    #: m, the swing apex above the resting foot.  `config.SWING_HEIGHT` (20 mm
+    #: since 2026-10-02, DOG5's 40 before) unless the entry point says
+    #: otherwise -- `--swing-height`.  It
+    #: is the one number that scales the whole swing demand (speed, torque,
+    #: slew) linearly, so it is the first thing to lower for a short swing.
     swing_height: float = cfg.SWING_HEIGHT
     #: The swing's INERTIAL feedforward, `swing.swing_feedforward`: tau +=
     #: M0 J^+ (a_ref - Jdot qd_ref) on each swing leg, open loop, both modes.
@@ -235,7 +278,8 @@ class BalanceLaw:
     #: from a DOG6-measured armature (`--ff-armature`); swing.py says why.
     ff_inertia: np.ndarray | None = None
     #: The Cartesian swing PD's (x, y, z) gains, N/m and N s/m; None is
-    #: `config.KP_SWING` / `KD_SWING`, DOG5's 140/140/180 and 8/8/15.  WITH
+    #: `config.KP_SWING` / `KD_SWING`: the operator's 10/10/400 and 5/5/40
+    #: since 2026-10-02, DOG5's 140/140/180 and 8/8/15 before.  WITH
     #: THE FEEDFORWARD ON, Kp IS NOT THE LIFT ANY MORE AND STIFFENING IT
     #: HURTS: a Cartesian PD without Lambda couples a z force into x through
     #: M^-1 J^T -- one leg in its own dynamics, Kp_z 180 -> 800 took the x
@@ -244,6 +288,11 @@ class BalanceLaw:
     #: `--kd-swing`.
     kp_swing: np.ndarray | None = None
     kd_swing: np.ndarray | None = None
+    #: The KNEE swing's joint PD (`swing == "knee"`), (abd, pitch, knee),
+    #: N*m/rad and N*m*s/rad; None is `config.KP_SWING_KNEE` /
+    #: `KD_SWING_KNEE`.  `--kp-swing-knee`, `--kd-swing-knee`.
+    kp_swing_knee: np.ndarray | None = None
+    kd_swing_knee: np.ndarray | None = None
     #: THE STANCE XY SPRING, 2026-09-25, on request: each PLANTED foot pulled
     #: toward its resting site in the TRUNK frame, x and y only, N/m and
     #: N s/m per leg, on top of the SRB torque and the joint layer.  With the
@@ -257,28 +306,163 @@ class BalanceLaw:
     kp_stance_xy: float = 0.0
     kd_stance_xy: float = 0.0
     #: The joint-space layer, `config.KP_JOINT_HOLD`: live only while
-    #: `hold_joints` has latched a pose.  OFF (0 / 0) unless the entry point
-    #: passes gains -- the trot entry points do, the plain stand does not.
+    #: `hold_joints` has latched a pose -- or, with `rise_track`, from the
+    #: first torque sweep.  OFF (0 / 0) unless the entry point passes gains
+    #: -- the trot entry points do, the plain stand does not.
     kp_joint: float = 0.0
     kd_joint: float = 0.0
+    #: The ABDUCTION joints' own gains in that layer once a pose is LATCHED
+    #: (HOLD and the trot), 2026-10-02, on request: lock abd, pitch and knee
+    #: keep `kp_joint` / `kd_joint`.  None is `kp_joint` / `kd_joint`, the
+    #: layer as it was.  The tracked rise (`rise_track`) is not touched: it
+    #: keeps the scalar gains on all three joints.  `config.KP_JOINT_HOLD_ABD`.
+    kp_joint_abd: float | None = None
+    kd_joint_abd: float | None = None
+    #: THE SWING ARC LEVELED IN ROLL, 2026-10-02, on request ("把roll融入到
+    #: foot trajectory").  Off, the arc and its resting site live in the
+    #: trunk frame and tilt with the trunk: rolled 1 deg, the fold stand's
+    #: (160 mm) swing foot lands 1.1 mm above the floor on the high side and
+    #: aims 1.1 mm into it on the low side.  On, they are taken about the
+    #: TRUNK ORIGIN in the trunk frame with the roll removed -- roll from
+    #: this run's level, `sp_roll` -- and turned back into the trunk frame
+    #: every sweep (`swing.roll_level`), so the foot lands on the floor
+    #: whatever the roll.  Pitch untouched.  Cartesian swing only.
+    #:
+    #: THE STANCE LATCH DOES NOT FOLLOW IT.  `q_hold` stays HOLD's, level, so
+    #: a leg landing on a rolled trunk is pulled toward the level stance --
+    #: that pull is the joint layer's roll stiffness.  Built first with a
+    #: re-latch on every touchdown (the leg's `q_hold` := the IK of the
+    #: leveled site): in MuJoCo, `hw.fold_trot`, the layer then held the roll
+    #: each stance started at, calm roll rms 0.6 -> 1.5-1.6 deg, and 1 s
+    #: after an 8 N side push 2-3 deg against 0.2-0.3.  Removed the same day
+    #: on the operator's call.  The arc alone: roll as without it (0.63-0.69).
+    swing_roll: bool = False
+    #: THE RISE TRACKED, 2026-10-01.  While no pose is latched (the rise, and
+    #: a foot step) the joint layer's target is `q_ref` -- the IK at the
+    #: commanded height with the feet pinned at `foot_xy`, the posture's own
+    #: path -- so the legs are held on it until HOLD latches the measured
+    #: pose as before.  OFF by default; `hw.fold_trot` turns it on.
+    #:
+    #: WHY.  The SRB law commands height and attitude and nothing holds the
+    #: trunk's x over the feet (`config.KP_XY`).  In a fore-aft symmetric
+    #: stance that costs nothing: every x effect of one leg is cancelled by
+    #: its mirror.  In the PARALLEL fold (`posture.FOLD`, every knee behind
+    #: its hip) all four legs push the same way as they extend, and the trunk
+    #: walks forward through the rise.  The operator saw it on 2026-10-01:
+    #: trunk forward, front legs compressed, rear not parallel.  In MuJoCo
+    #: with this law, from the fold crouch, no joint friction, no model
+    #: error: +95 mm over the 3 s rise, legs at +43/-54 deg from vertical
+    #: against the designed +-16; the same for a 6 or 12 s rise; the same
+    #: with the true CoM every sweep; the mirrored fold and NOMINAL: 0.3 mm.
+    #: With this on, under knee contact, the 1 s cap ramp, 0.1 N*m friction,
+    #: a 40 Hz qd filter and two sweeps of latency: +10 mm, legs +17.7/-17.6,
+    #: pitch 0.0, at most 1.1 N*m from the layer.  The Cartesian stance xy
+    #: spring held as well in that sim and SHOOK on the robot the same day
+    #: (unexplained); this is the joint-space PD every trot already flies.
+    #:
+    #: The reference is a LEVEL trunk, so with the dynamic setpoint latched
+    #: off level the layer and the attitude loop disagree by that tilt; the
+    #: fold flies the fixed setpoint.  The tracking trip's `track_stop_deg`
+    #: still reads the same `q_ref`.
+    rise_track: bool = False
+    #: THE SLANTED RISE, 2026-10-01: (4, 2) HIP-frame foot sites the STAND
+    #: holds, when they are not the crouch's.  None (every entry point but
+    #: `hw.fold_trot`) is a straight rise on the crouch's feet.  Given, the
+    #: IK reference's sites slide from `foot_xy` (the crouch's) to these as
+    #: the commanded height passes from `slide_from_h` to `h_lift` -- a
+    #: smoothstep in HEIGHT, not in time -- and the tracked joint layer
+    #: carries the trunk OVER the planted feet: no foot leaves the floor.
+    #: Needs `rise_track`.
+    #:
+    #: WHY A SLIDE AND NOT A STEP.  The fold's stand wants the thigh swept
+    #: and the shin upright (the operator, 2026-10-01: "the big leg is so
+    #: straight"), which puts the feet BEHIND the pitch hinges; the crouch
+    #: cannot have them there -- the front knee motor folds up into the
+    #: trunk at every crouch height below ~150 mm -- so the feet differ
+    #: between the two.  Moving them at height was tried first, in MuJoCo:
+    #: a diagonal-pair step tips the trunk about the supporting diagonal
+    #: (this stance's CoM is 19 mm off both), the rear swing foot never
+    #: leaves the floor (5-17 N on it mid-swing) and lands 70-86 mm short;
+    #: a one-foot-at-a-time step fares no better (three-foot margin -6 mm
+    #: on the second swing for every order) and would need a crawl with
+    #: body shifts.  Sliding the sites through the rise moves the trunk 85
+    #: mm forward over four planted feet: pitch within 0.2 deg, the stand
+    #: within 0.4 mm of its sites, the trot there stays in place (+1 mm in
+    #: 3 s against -41 for the old stance), the park slides the feet 18 mm.
+    #:
+    #: WHY FROM A HEIGHT AND NOT FROM THE START.  The front knee has to stay
+    #: BELOW the trunk's underside the whole way: for the fold that bounds
+    #: the sites from below at each height (a knee axis 67 mm under the hip
+    #: axis), and sliding from 110 mm keeps it 3 mm clear in the sim, where
+    #: a slide over the whole rise puts the knee 5 mm into the trunk at
+    #: 100 mm.  `posture.py` has the clearance arithmetic.
+    stand_xy: np.ndarray | None = None
+    #: m, the commanded height the slide starts at; None is the crouch's h0
+    #: (the whole rise).  `hw.fold_trot` passes 0.110.
+    slide_from_h: float | None = None
+    #: THE STATE ESTIMATOR IN THE LOOP, 2026-10-01 -- `hw.fully_trot`; the
+    #: HOLD too since 2026-10-02, on request.  While the sequence says HOLD or
+    #: TROT (`update(..., xy_hold=True)`), the x and y rows of the PD read the
+    #: estimate fed by `feed_estimate` instead of the zeros every other law
+    #: has: the CoM's world x/y against the CoM x/y LATCHED on the first sweep
+    #: of that hold or trot that has a usable estimate, and its rate against
+    #: zero, on `gains.kp_pos[:2]` / `kd_pos[:2]` (`config.KP_XY_EST`).  That
+    #: is station keeping: the stand and the trot IN PLACE, by the filter's
+    #: account.  Each HOLD and each trot latches its own (`release_xy`): a
+    #: hold does not pull back the trot before it, nor the W step's walk.
+    #:
+    #: WHAT IT DOES NOT TOUCH.  Height stays the legs' (`state.on_stance`) and
+    #: attitude the IMU's: both are measured, and replacing a measured signal
+    #: with a filtered one needs a reason (DOG5's EkfFeedback rule).  x/y have
+    #: no other source.  The rise and the W step never read it.
+    #:
+    #: False (every other entry point): an estimate fed in is kept for the log
+    #: and moves nothing.
+    est_xy: bool = False
+    #: s, the oldest estimate (`TrunkEstimate.t` against `now`) the x/y rows
+    #: may use, and the oldest accelerometer packet behind it.
+    est_max_age_s: float = cfg.EST_MAX_AGE_S
+    est_acc_max_age_s: float = cfg.EST_ACC_MAX_AGE_S
+    #: m/s^2, the authority clamp on the x/y rows (`controller.balance_wrench`).
+    xy_acc_max: float = cfg.XY_ACC_MAX
 
     def __post_init__(self) -> None:
         if self.swing not in SWING.SWING_MODES:
             raise ValueError("swing %r: one of %s"
                              % (self.swing, ", ".join(SWING.SWING_MODES)))
+        if self.swing_roll and self.swing != "cartesian":
+            raise ValueError("swing_roll levels the Cartesian arc; the joint "
+                             "swing latches its own at liftoff")
         # OWN COPY: the foot step moves it leg by leg, and it usually arrives
         # as a posture's array.
         if self.foot_xy is not None:
             self.foot_xy = np.array(self.foot_xy, dtype=float)
+        if self.stand_xy is not None:
+            if self.foot_xy is None:
+                self.foot_xy = np.array(ST.FOOT_XY, dtype=float)
+            if not self.rise_track:
+                raise ValueError("stand_xy needs rise_track: only the tracked "
+                                 "joint layer carries the trunk over the feet")
+            self.stand_xy = np.array(self.stand_xy, dtype=float).reshape(
+                C.N_LEGS, 2)
+        #: The crouch's sites, kept for the slide; `foot_xy` is what moves.
+        self._crouch_xy = (None if self.foot_xy is None
+                           else self.foot_xy.copy())
         #: The foot step's destination, (4, 2) HIP frame, or None.  See
         #: `begin_step`.
         self.foot_xy_to: np.ndarray | None = None
         self._swinging = np.zeros(C.N_LEGS, dtype=bool)
-        #: THE LIFTOFF LATCH, (4, 3) each, NaN while the leg is down: the
-        #: measured trunk-frame foot and joints on the first swinging sweep.
-        #: The arc starts here in both modes; see the swing block in `update`.
+        #: The joint swing's LIFTOFF LATCH, (4, 3) each, NaN while the leg is
+        #: down: the measured trunk-frame foot and joints on the first
+        #: swinging sweep.  See the swing block in `update`.
         self._lift_x = np.full((C.N_LEGS, 3), np.nan)
         self._lift_q = np.full((C.N_LEGS, 3), np.nan)
+        #: The knee swing's signed amplitude per leg, rad, planned at liftoff
+        #: (`swing.knee_swing_amplitude`), NaN while the leg is down; and the
+        #: swings it refused (the leg then holds where it lifted).
+        self._knee_amp = np.full(C.N_LEGS, np.nan)
+        self.knee_refused = 0
+        self.knee_refusal = ""
         #: (12,) the joint layer's stance target, or None while it is off.
         self.q_hold: np.ndarray | None = None
         if self.srb is None:
@@ -325,6 +509,18 @@ class BalanceLaw:
         self.tau_peak = 0.0
         self.imu_held_sweeps = 0
         self._sweep = 0
+        #: The last `TrunkEstimate` fed in, or None.  See `est_xy`.
+        self.estimate: TrunkEstimate | None = None
+        #: (2,) m, the CoM x/y the trot holds, WORLD; None outside a trot and
+        #: until its first usable estimate.  `release_xy` clears it.
+        self.xy_des: np.ndarray | None = None
+        #: The x/y loop's own account, for the exit report: trot sweeps it
+        #: drove, trot sweeps it refused and the last reason, and its peaks.
+        self.xy_sweeps = 0
+        self.xy_refused = 0
+        self.xy_refusal: str | None = None
+        self.xy_err_peak = 0.0
+        self.xy_acc_peak = 0.0
 
     # -- the setpoint, latched at ZERO TORQUE ----------------------------
     def latch_setpoint(self, state) -> tuple | None:
@@ -473,22 +669,22 @@ class BalanceLaw:
         """Move the feet to `foot_xy_to` (4, 2, HIP frame) with the gait.
 
         Drive `update` with a gait clock from here.  Every leg that swings
-        lands on its `foot_xy_to` site instead of where it left (the arc
-        still STARTS on the foot, latched at liftoff), and `foot_xy` -- what
-        the tracking reference and the stance xy spring read -- takes the
-        new site AT TOUCHDOWN, leg by leg.  One gait cycle moves all four;
-        `step_landed` says when.
+        lands on its `foot_xy_to` site instead of where it left, and
+        `foot_xy` -- what the tracking reference and the next arc start from
+        -- takes the new site AT TOUCHDOWN, leg by leg.  One gait cycle moves
+        all four; `step_landed` says when.
 
         THE SRB MODEL STAYS PINNED.  `srb` and `state.read`'s must be the
         same object or the CoM offset stops cancelling, and the runner reads
         the posture's.  For WIDE -> under the hips that is c^b z 7 mm off and
         x exactly 0 either way (a symmetric stance), so no pitch moment.
 
-        REFUSED with the joint swing: that one lifts in z and nothing else.
+        REFUSED with the joint swing: that one lifts in z and nothing else;
+        and with the knee swing, which lands where it lifted.
         """
-        if self.swing == "joint":
-            raise ValueError("the joint swing only lifts in z; a foot step "
-                             "needs swing='cartesian'")
+        if self.swing in ("joint", "knee"):
+            raise ValueError("the %s swing lands where it lifted; a foot "
+                             "step needs swing='cartesian'" % self.swing)
         if self.foot_xy is None:
             self.foot_xy = np.array(ST.FOOT_XY, dtype=float)
         self.foot_xy_to = np.array(foot_xy_to, dtype=float).reshape(
@@ -522,6 +718,42 @@ class BalanceLaw:
                                            self.sp_pitch + dpitch,
                                            self.sp_yaw + dyaw)
 
+    # -- the slanted rise -------------------------------------------------
+    @property
+    def home_xy(self) -> np.ndarray | None:
+        """The stand's sites -- where the feet are 'home' for the park:
+        `stand_xy` when the rise slides, else the crouch's `foot_xy`."""
+        return self._crouch_xy if self.stand_xy is None else self.stand_xy
+
+    def _slide_feet(self, h_cmd: float) -> None:
+        """`foot_xy` := the crouch's sites carried toward `stand_xy` by a
+        smoothstep in the commanded height, EXACTLY `stand_xy` once the ramp
+        has arrived.  Called only while no pose is latched and no step is
+        running -- the rise."""
+        h_from = self.h0 if self.slide_from_h is None else float(self.slide_from_h)
+        span = float(self.h_lift) - h_from
+        # ARRIVED is a test on the HEIGHT, not on the fraction: the fraction
+        # rounds to 0.999... at the top and the sites would then miss the
+        # stand's by an ulp, which `feet_home`'s exact compare would read as
+        # "away" and ENTER would step the feet to where they already are.
+        if float(h_cmd) >= float(self.h_lift) - 1e-9 or span <= 1e-9:
+            self.foot_xy[:] = self.stand_xy
+        else:
+            s = float(np.clip((float(h_cmd) - h_from) / span, 0.0, 1.0))
+            self.foot_xy[:] = (self._crouch_xy
+                               + ST.smoothstep(s) * (self.stand_xy - self._crouch_xy))
+
+    def hold_reference(self, q) -> np.ndarray:
+        """(12,) the IK at `h_lift` with the feet on the stand's sites --
+        what `hold_joints` should latch when the rise was TRACKED, so the
+        layer's target and the swing's resting sites are one stance by
+        construction.  Latching the MEASURED pose instead froze whatever lag
+        the trunk had when the ramp arrived (12-22 mm in the sim) and the
+        trot then walked on the disagreement.  `q` seeds the IK branch."""
+        if self.stand_xy is not None:
+            self.foot_xy[:] = self.stand_xy
+        return C.flat(ik_reference(self.h_lift, C.unflat(q), self.foot_xy))
+
     # -- the trot's joint-space layer ------------------------------------
     def hold_joints(self, q) -> None:
         """Latch `q` (12,) as the posture the joint layer holds.  `sequence`
@@ -532,8 +764,85 @@ class BalanceLaw:
     def release_joints(self) -> None:
         self.q_hold = None
 
+    def _roll_from_level(self, state) -> tuple[float, float]:
+        """(roll from this run's level, its rate), rad and rad/s, from R and
+        the gyro: ZYX roll, the Euler rate from the body rates."""
+        R = state.R
+        roll = math.atan2(R[2, 1], R[2, 2])
+        pitch = -math.asin(max(-1.0, min(1.0, R[2, 0])))
+        w = state.omega_b
+        rate = w[0] + math.tan(pitch) * (math.sin(roll) * w[1]
+                                         + math.cos(roll) * w[2])
+        return roll - self.sp_roll, rate
+
+    # -- the state estimator (est_xy, hw.fully_trot) ----------------------
+    def feed_estimate(self, estimate: TrunkEstimate | None) -> None:
+        """The filter's latest answer, every sweep it has one.  Read by the
+        NEXT `update` -- the filter runs after slot 0 has acted, so what the
+        law reads is one sweep old, and `est_max_age_s` is what bounds it."""
+        if estimate is not None:
+            self.estimate = estimate
+
+    def release_xy(self) -> None:
+        """Forget the x/y setpoint; the next hold or trot sweep with a usable
+        estimate latches a fresh one.  `sequence` calls it as a trot starts,
+        as it ends and as a W step starts, so neither a trot nor a hold ever
+        inherits the position of the phase before it."""
+        self.xy_des = None
+
+    def _xy_feedback(self, now: float, state):
+        """(`controller.XyFeedback` or None, why not or None) for this sweep.
+
+        THE CoM, NOT THE TRUNK ORIGIN.  The filter tracks the origin; the PD
+        regulates the CoM, as the z row does, and the two differ by R c^b --
+        whose rate is omega x R c^b, the trunk's own sway, which would
+        otherwise reach the x/y damper as a velocity the CoM does not have.
+        Converted with THIS sweep's R and omega: the estimate is 4 ms older
+        than both, which at a trot's few deg/s is a hundredth of a mm.
+        """
+        est = self.estimate
+        if est is None:
+            return None, "no estimate fed yet"
+        age = float(now) - float(est.t)
+        if not 0.0 <= age <= self.est_max_age_s:
+            return None, ("estimate %.0f ms old (limit %.0f)"
+                          % (1e3 * age, 1e3 * self.est_max_age_s))
+        if float(est.yaw_offset) != float(self.yaw_offset):
+            return None, ("estimate in the world at heading %+.1f deg, the "
+                          "law's is %+.1f" % (np.degrees(est.yaw_offset),
+                                             np.degrees(self.yaw_offset)))
+        if not float(est.acc_age_s) <= self.est_acc_max_age_s:
+            return None, ("its accelerometer packet was %.0f ms old (limit "
+                          "%.0f)" % (1e3 * est.acc_age_s,
+                                     1e3 * self.est_acc_max_age_s))
+        if state.imu_stale:
+            # The attitude half is frozen this sweep (`imu_held`), and the
+            # filter's x/y are legs rotated by that same stale R.
+            return None, ("the IMU attitude is %.0f ms old -- the R the "
+                          "filter's x/y are rotated by" % (1e3 * state.imu_age_s))
+        # SCALARS, AND THE CROSS PRODUCT WRITTEN OUT -- `state.on_stance`'s
+        # reason: this is slot-0 arithmetic, and `np.cross` plus a numpy call
+        # per element cost the Pi 83 us a sweep where this costs a few.
+        px, py = float(est.p_w[0]), float(est.p_w[1])
+        vx, vy = float(est.v_w[0]), float(est.v_w[1])
+        if not (math.isfinite(px) and math.isfinite(py)
+                and math.isfinite(vx) and math.isfinite(vy)):
+            return None, "the estimate is not finite"
+        c = state.R @ self.srb.com_body                  # R c^b, WORLD
+        w = state.omega_w
+        p_c = np.array([px + c[0], py + c[1]])
+        v_c = np.array([vx + w[1] * c[2] - w[2] * c[1],  # (omega x R c^b)_x
+                        vy + w[2] * c[0] - w[0] * c[2]])  # (omega x R c^b)_y
+        if self.xy_des is None:
+            # LATCHED, ON THE FIRST USABLE SWEEP OF THE HOLD OR THE TROT: zero
+            # error on the sweep the loop closes, so closing it cannot step
+            # the wrench.
+            self.xy_des = p_c
+        return CTRL.XyFeedback(p_error=self.xy_des - p_c, v=v_c), None
+
     # -- the sweep -------------------------------------------------------
-    def update(self, now: float, state, clock=None, gait=None) -> LawOutput:
+    def update(self, now: float, state, clock=None, gait=None,
+               xy_hold: bool = False) -> LawOutput:
         """Stages 1-5 for one sweep.  `state` is a `state.BodyState`.
 
         `gait` is a `gait.TrotGait` while the robot trots, None while it
@@ -542,6 +851,10 @@ class BalanceLaw:
         impedance on top of its own weight, and the residual trip only counts
         sweeps with all four feet at full weight.  The wrench, the gains and
         the reference are the stand's, unchanged.
+
+        `xy_hold` is the sequence saying THIS IS THE HOLD OR THE TROT.  With
+        `est_xy` it puts the state estimator on the x/y rows (`est_xy` says
+        how); without `est_xy` it changes nothing.
         """
         if self.ramp is None:
             raise RuntimeError("BalanceLaw.arm() has not been called")
@@ -554,14 +867,34 @@ class BalanceLaw:
 
         # -- the reference -------------------------------------------------
         command = self.ramp.at(float(now) - self.t0)
+        if (self.stand_xy is not None and self.q_hold is None
+                and self.foot_xy_to is None):
+            self._slide_feet(command.h)          # the slanted rise
         com_cmd = REF.com_command(command, state.R, self.srb)
 
         # -- stage 3 -------------------------------------------------------
         held = bool(state.imu_stale)
         if held:
             self.imu_held_sweeps += 1
+        # THE ESTIMATOR'S x/y, IN THE HOLD AND THE TROT ONLY -- `est_xy`.  A
+        # sweep whose estimate is unusable gets None: the x/y rows are zero,
+        # the flown law.
+        xy = None
+        if self.est_xy and xy_hold:
+            xy, refusal = self._xy_feedback(now, state)
+            if xy is None:
+                self.xy_refused += 1
+                self.xy_refusal = refusal
+            else:
+                self.xy_sweeps += 1
+                self.xy_err_peak = max(self.xy_err_peak, math.hypot(
+                    float(xy.p_error[0]), float(xy.p_error[1])))
         wrench = CTRL.balance_wrench(state, com_cmd, self.R_des, self.gains,
-                                     hold_attitude=held, srb=self.srb)
+                                     hold_attitude=held, srb=self.srb,
+                                     xy=xy, xy_acc_max=self.xy_acc_max)
+        if xy is not None:
+            self.xy_acc_peak = max(self.xy_acc_peak, math.hypot(
+                float(wrench.acc_lin[0]), float(wrench.acc_lin[1])))
 
         # -- stage 4 -------------------------------------------------------
         weight = None if clock_now is None else clock_now.weight
@@ -595,54 +928,77 @@ class BalanceLaw:
             swing_s = clock_now.swing_s
             p_swing = np.full((C.N_LEGS, 3), np.nan)
             if swinging.any():
-                # THE ARC STARTS WHERE THE FOOT IS, LATCHED AT LIFTOFF, AND IN
-                # PLACE IT LANDS THERE TOO -- not at `foot_xy` and the
-                # commanded height.  In BOTH modes since 2026-09-28.
-                #   The joint swing had it from 2026-09-17, when the first
-                # hardware run kicked hard: at 30 N*m/rad 10 mm of foot offset
-                # is 5 N*m on the knee, and a foot that slid, a pitched trunk
-                # (2 deg x 215 mm = 7.5 mm) or a trunk off the command all
-                # make that offset.  In MuJoCo with the runner's one-sweep
-                # delay and 40 Hz velocity filter, 8 mm of z offset demanded
-                # 94 N*m; latched, 1.0 N*m.
-                #   The Cartesian swing gets it after the fold trot WALKED in
-                # x on 2026-09-28, at 2 mm of apex as at 40, rpy held (the
-                # operator's report).  A resting site the feet do not stand
-                # on is a step every swing: the joint layer holds the angles
-                # latched at HOLD, so if the trunk reached HOLD with the feet
-                # m ahead of the site, each swing lands its foot m behind the
-                # layer's target and the layer then moves the trunk after it.
-                # Two pairs taking turns, quasi-static, the arithmetic goes
-                # 1/2, 3/4, 5/8, 11/16 ... -> 2/3 m of trunk a half cycle, in
-                # the direction opposite to m, for as long as the two fixed
-                # points disagree.  One fixed point cannot walk.  A step
-                # (`foot_xy_to`) still lands on its destination.  Nothing
-                # here reads a world position: a trunk that moves during the
-                # swing still carries the foot with it.
-                land = (None if self.foot_xy_to is None
+                rest = SWING.rest_feet_b(command.h, self.foot_xy)
+                land = (rest if self.foot_xy_to is None
                         else SWING.rest_feet_b(command.h, self.foot_xy_to))
                 q4 = C.unflat(state.q)
+                level = (self._roll_from_level(state) if self.swing_roll
+                         else None)
                 for i in np.flatnonzero(swinging):
-                    if not np.isfinite(self._lift_x[i, 0]):
-                        self._lift_x[i] = state.x_b[i]
-                        self._lift_q[i] = q4[i]
                     p, v, a = SWING.swing_reference_pva(
-                        self._lift_x[i], float(swing_s[i]),
-                        gait.swing_duration, height=self.swing_height,
-                        land_b=None if land is None else land[i])
+                        rest[i], float(swing_s[i]), gait.swing_duration,
+                        height=self.swing_height, land_b=land[i])
+                    if level is not None:            # `swing_roll`
+                        p, v, a = SWING.roll_level(p, v, a, *level)
                     p_swing[i] = p
                     if self.swing == "joint":
                         # z only, abd held: no step destination to go to.
+                        # THE ARC STARTS WHERE THE FOOT IS, LATCHED AT LIFTOFF
+                        # -- not at `foot_xy` and a height.  The first hardware
+                        # run, 2026-09-17, kicked hard: at 30 N*m/rad 10 mm
+                        # of foot offset is 5 N*m on the knee, and a foot that
+                        # slid, a pitched trunk (2 deg x 215 mm = 7.5 mm) or
+                        # a trunk off the command all make that offset.  In
+                        # MuJoCo with the runner's one-sweep delay and 40 Hz
+                        # velocity filter, 8 mm of z offset demanded 94 N*m;
+                        # latched, 1.0 N*m.  The foot lands where it lifted.
+                        if not np.isfinite(self._lift_x[i, 0]):
+                            self._lift_x[i] = state.x_b[i]
+                            self._lift_q[i] = q4[i]
                         qj, qdj = SWING.joint_swing_reference(
                             i, self._lift_x[i], float(swing_s[i]),
                             gait.swing_duration, self._lift_q[i],
                             height=self.swing_height)
+                        p_swing[i], v, a = SWING.swing_reference_pva(
+                            self._lift_x[i], float(swing_s[i]),
+                            gait.swing_duration, height=self.swing_height)
                         tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
                             state, i, qj, qdj)
+                    elif self.swing == "knee":
+                        # THE SHIN ALONE, IN THE KNEE FRAME -- swing.py, "THE
+                        # KNEE SWING".  Latched at liftoff as the joint swing
+                        # is: abd and pitch held there, the knee on its bump,
+                        # signed toward the CoM, the foot back where it lifted.
+                        if not np.isfinite(self._lift_x[i, 0]):
+                            self._lift_x[i] = state.x_b[i]
+                            self._lift_q[i] = q4[i]
+                            try:
+                                self._knee_amp[i] = SWING.knee_swing_amplitude(
+                                    i, q4[i], self.swing_height)
+                            except ValueError as refusal:
+                                self._knee_amp[i] = 0.0  # no lift: held
+                                self.knee_refused += 1
+                                self.knee_refusal = str(refusal)
+                        qj, qdj, qddj = SWING.knee_swing_reference(
+                            self._lift_q[i], float(self._knee_amp[i]),
+                            float(swing_s[i]), gait.swing_duration)
+                        p_swing[i] = HK.foot_position(i, qj)
+                        tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
+                            state, i, qj, qdj,
+                            kp=(cfg.KP_SWING_KNEE if self.kp_swing_knee is None
+                                else self.kp_swing_knee),
+                            kd=(cfg.KD_SWING_KNEE if self.kd_swing_knee is None
+                                else self.kd_swing_knee))
                     else:
                         tau[3 * i:3 * i + 3] += SWING.swing_torque(
                             state, i, p, v, kp=self.kp_swing, kd=self.kd_swing)
-                    if self.swing_ff:
+                    if self.swing_ff and self.swing == "knee":
+                        # M0 qdd_ref: the bump's own acceleration, knee only.
+                        ff = (SWING.JOINT_INERTIA_M0 if self.ff_inertia is None
+                              else self.ff_inertia) @ qddj
+                        tau[3 * i:3 * i + 3] += ff
+                        tau_ff[3 * i:3 * i + 3] = ff
+                    elif self.swing_ff:
                         # THE ARC'S OWN INERTIAL TORQUE, OPEN LOOP -- swing.py,
                         # "THE INERTIAL TERM IS BACK".  At the MEASURED q: the
                         # reference's is a 191 us IK away in the Cartesian
@@ -662,9 +1018,11 @@ class BalanceLaw:
                     q_ref[i] = q4[i]
             self._lift_x[~swinging] = np.nan
             self._lift_q[~swinging] = np.nan
+            self._knee_amp[~swinging] = np.nan
         else:
             self._lift_x[:] = np.nan
             self._lift_q[:] = np.nan
+            self._knee_amp[:] = np.nan
 
         # -- the stance xy spring ------------------------------------------
         if self.kp_stance_xy > 0.0 or self.kd_stance_xy > 0.0:
@@ -695,7 +1053,23 @@ class BalanceLaw:
         # without it.  The bench never had it, so a swing tuned hung up is
         # now the swing the trot flies.
         if self.q_hold is not None:
-            hold = C.unflat(self.kp_joint * (self.q_hold - state.q)
+            kp = np.full(C.N_JOINTS, self.kp_joint)
+            kd = np.full(C.N_JOINTS, self.kd_joint)
+            if self.kp_joint_abd is not None:        # abd, every leg
+                kp[0::3] = self.kp_joint_abd
+            if self.kd_joint_abd is not None:
+                kd[0::3] = self.kd_joint_abd
+            hold = C.unflat(kp * (self.q_hold - state.q)
+                            - kd * np.asarray(state.qd))
+            if clock_now is not None:
+                hold[~clock_now.contact] = 0.0
+            tau += C.flat(hold)
+        elif self.rise_track and (self.kp_joint > 0.0 or self.kd_joint > 0.0):
+            # NO POSE LATCHED YET -- the rise, or a foot step: the target is
+            # the IK reference, the posture's own path at the commanded
+            # height (`rise_track` says why).  A stepping leg gets none of
+            # it, as above.
+            hold = C.unflat(self.kp_joint * (C.flat(q_ref) - state.q)
                             - self.kd_joint * np.asarray(state.qd))
             if clock_now is not None:
                 hold[~clock_now.contact] = 0.0
@@ -715,12 +1089,18 @@ class BalanceLaw:
 
         if started is not None:
             self.timing.add(clock() - started)
+        est = self.estimate
         return LawOutput(tau=tau, command=command, com_cmd=com_cmd,
                          wrench=wrench, allocation=allocation,
                          q_ref=C.flat(q_ref), imu_held=held, trip=trip,
                          state=state,
                          contact=weight, swing_s=swing_s, p_swing=p_swing,
-                         tau_ff=tau_ff)
+                         tau_ff=tau_ff, estimate=est,
+                         est_age_s=(float("nan") if est is None
+                                    else float(now) - float(est.t)),
+                         xy_des=(None if self.xy_des is None
+                                 else self.xy_des.copy()),
+                         xy_on=xy is not None)
 
     def _trip(self, state, allocation, q_ref,
               monitor_residual: bool = True) -> str | None:
@@ -765,4 +1145,13 @@ class BalanceLaw:
             % ("%+.1f deg at the handover, then world x -- yaw since is "
                "drift off it" % np.degrees(self.yaw_offset) if self.armed
                else "never latched -- the run did not reach the rise"),
-        ])
+        ] + ([] if not self.est_xy else [
+            "  x/y on the estimator  %d hold/trot sweeps driven, %d refused (flown "
+            "law those sweeps)%s" % (self.xy_sweeps, self.xy_refused,
+                                     "" if self.xy_refusal is None
+                                     else "; last refusal: " + self.xy_refusal),
+            "                  peak |CoM xy error| %.1f mm, peak |a_xy| %.2f "
+            "m/s^2 (%.1f N; clamp %.1f m/s^2)"
+            % (1e3 * self.xy_err_peak, self.xy_acc_peak,
+               cfg.MASS * self.xy_acc_peak, self.xy_acc_max),
+        ]))
