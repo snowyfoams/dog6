@@ -403,6 +403,30 @@ CONTACT_WEIGHT = np.ones(4)
 #: parts in ten thousand.  [UNTUNED]
 LAMBDA = 1.0e-6
 
+#: ---- the QP allocator, eq (4), `qp_allocation.py` -- OPT-IN -------------
+#:     F* = argmin (AF - b_d)^T S (AF - b_d) + alpha ||F||^2 + beta ||F - F_prev||^2
+#:          s.t.   C F <= d
+#: S is diag(QP_S_FORCE x3, QP_S_MOMENT x3).  The moment rows are in N*m
+#: against force rows in N; 1/l^2 with l the 65 mm roll lever prices 1 N*m
+#: of moment error at the 15.4 N of force it would take at that lever to
+#: make it up.  Raise QP_S_MOMENT to spend force accuracy on attitude when
+#: the stance cannot have both.  [UNTUNED]
+QP_S_FORCE = 1.0
+QP_S_MOMENT = 1.0 / 0.065 ** 2      # ~237
+#: alpha, on ||F||^2: picks the smallest point of the internal-force null
+#: space and keeps the Hessian definite.  Against S's 1 per N^2 it costs a
+#: 15 N foot 0.2 -- a tie-breaker, not a bias.  [UNTUNED]
+QP_ALPHA = 1.0e-3
+#: beta, on ||F - F_prev||^2: the low-pass on the load share.  Unconstrained,
+#: internal forces decay by beta / (alpha + beta) per sweep -- 0.91 here, ~10
+#: sweeps, 40 ms -- while the wrench-tracking part sees ~0.003, so the body
+#: still gets its wrench in one sweep.  0 switches it off.  [UNTUNED]
+QP_BETA = 1.0e-2
+#: OSQP's iteration cap and tolerance.  The cap is what bounds the solve in
+#: the 333 us slot; past it the iterate is used and `max_iter_hits` counts.
+QP_MAX_ITER = 200
+QP_EPS = 1.0e-6
+
 
 # ===========================================================================
 # the trips  (state.py, allocation.py, and hw.stand)

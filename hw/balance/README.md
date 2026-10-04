@@ -421,6 +421,53 @@ Two details that are not cosmetic:
 `SETPOINT_DYNAMIC = False` falls back to the config statics and reproduces
 exactly what DOG5 flew before 2026-08-28.
 
+## The QP allocator, eq (4): `qp_allocation.py`, opt-in
+
+`allocation.py` solves `A f = b_d` exactly and projects onto the cone
+afterwards, foot by foot; what the projection removes is lost. The QP is the
+other formulation, the review's eq (4):
+
+```
+F* = argmin  (A F − b_d)ᵀ S (A F − b_d) + α‖F‖² + β‖F − F*_prev‖²
+     s.t.    C F ≤ d
+```
+
+The equality is a weighted penalty, the pyramid and the `fz` box are hard
+rows inside the solve, so a foot on its cone hands its share to a foot with
+room. `S` prices N·m against N (`1/0.065²`: 1 N·m costs what 15.4 N at the
+roll lever would), `α` picks the smallest point of the internal-force null
+space, `β` is a low-pass on the load *share*: unconstrained, internal forces
+decay by `β/(α+β)` per sweep (0.91, ~10 sweeps) while the wrench-tracking
+part sees ~0.003, so the body still gets its wrench in one sweep. OSQP,
+set up once, `(Px, q, u)` updated and warm-started every sweep. The
+constraint set contains `(0, 0, c·fz_min)` for every foot, so it is never
+empty; the one failure mode is the iteration cap, counted.
+
+`BalanceLaw(allocator=qp_allocation.QPAllocator())` swaps it in; the
+default stays least squares. `python -m hw.balance.qp_allocation` prints the
+comparison. Measured at the lift stance, offline, on the dev machine where
+least squares itself takes 104 µs (34 on the laptop the file quotes):
+
+| case | LS residual | QP residual | note |
+|---|---|---|---|
+| hold mg | 0 | 0.01 N | identical split, cone inactive |
+| Fy 25 N + Mx 2 N·m, reachable | **4.1 N**, 0.58 N·m | 0.03 N, 0 | LS clips the light feet; QP moves f_y to the heavy ones, peak +0.6 N |
+| Fy 40 N + Mx 5 N·m, past capacity | 11.1 N, 1.59 N·m | 10.0 N, **0** | S decides what is sacrificed: force, not attitude |
+| Mx 40 N·m, absurd | sum fz 233 N | sum fz 233 N | both spend `fz_max`; `S_FORCE` is the QP's knob, the stand path has no total-force rescale |
+
+| per sweep, 2000 sweeps pushed about | p50 | p95 | max |
+|---|---|---|---|
+| QP, warm | 167 µs | 260 µs | 476 µs |
+| least squares | 104 µs | 173 µs | 377 µs |
+| OSQP iterations | 25 | 50 | 100 |
+
+Half the QP's time is the solver (`update` 22 µs, `solve` 32 µs); the rest
+is the same grasp-map and cost assembly least squares pays. Worst `C F − d`
+over the run is exactly 0: feasible on every sweep. Whether the extra
+~60 µs fits the 333 µs CAN slot on the Pi is **unmeasured**; the Pi carries
+neither osqp nor scipy today, which is why the module is opt-in and the
+selftest skips its section there.
+
 ## What is still open
 
 - **The setpoint statics are DOG5's, unverified on DOG6.**

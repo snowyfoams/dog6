@@ -252,6 +252,13 @@ class BalanceLaw:
     #: The sustained-residual trip, `allocation.ResidualMonitor`.  False turns
     #: it OFF -- `hw.stand --no-limits` -- and keeps the peaks for the report.
     residual_trip: bool = True
+    #: Stage 4's solver.  None is `allocation.allocate`, the weighted least
+    #: squares every stand and trot has flown.  `qp_allocation.QPAllocator()`
+    #: is eq (4): the cone inside the solve, a beta low-pass on the load
+    #: share, OSQP.  Anything with `allocate(r_w, b_d, mu=, contact=)`
+    #: returning an `allocation.Allocation` fits; the QP holds F*_prev, so
+    #: it is one instance per law, not a function.
+    allocator: object | None = None
     #: The pinned c^b and I^b, `posture.CrouchPose.srb`.  None is the nominal
     #: `config.SRB`.  It reaches BOTH the reference and the measurement from
     #: here, which is what keeps the CoM offset cancelling in the z error.
@@ -898,8 +905,10 @@ class BalanceLaw:
 
         # -- stage 4 -------------------------------------------------------
         weight = None if clock_now is None else clock_now.weight
-        allocation = ALLOC.allocate(state.r_w, wrench.b_d, mu=self.mu,
-                                    contact=weight)
+        allocate = (ALLOC.allocate if self.allocator is None
+                    else self.allocator.allocate)
+        allocation = allocate(state.r_w, wrench.b_d, mu=self.mu,
+                              contact=weight)
 
         # -- stage 5 -------------------------------------------------------
         # Sub-rated when asked: `gravity_legs_per_sweep` legs are refreshed,

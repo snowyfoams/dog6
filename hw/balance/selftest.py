@@ -59,6 +59,7 @@ from . import controller as CTRL     # noqa: E402
 from . import law as LAW             # noqa: E402
 from . import reference as REF       # noqa: E402
 from . import posture as POSE        # noqa: E402
+from . import qp_allocation as QPA   # noqa: E402
 from . import sequence as SEQ        # noqa: E402
 from . import state as STATE         # noqa: E402
 from . import torque as TRQ          # noqa: E402
@@ -456,6 +457,99 @@ def main() -> int:
           "%d sweeps" % cfg.RESIDUAL_STREAK)
     check("...and one good sweep resets it",
           ALLOC.ResidualMonitor().reason(result) is None)
+
+    # =====================================================================
+    print("\n6b. the QP allocator, eq (4): opt-in, osqp")
+    # =====================================================================
+    if not QPA.available():
+        print("  --    osqp/scipy not installed here: the QP section is skipped "
+              "(the Pi does not carry them; see requirements.txt)")
+    else:
+        c_mat, d_vec = QPA.constraints()
+        qp_hold = QPA.QPAllocator(beta=0.0).allocate(square.r_w, b_hold)
+        close("holding mg, the QP agrees with least squares", qp_hold.fz,
+              result.fz, 0.05, " N")
+        close("...and its residual is zero", qp_hold.residual, np.zeros(6), 0.05)
+
+        # the property the QP exists for: a wrench least squares LOSES to its
+        # projection, the QP delivers by moving load to the feet with room
+        b_side = np.array([0.0, 25.0, cfg.WEIGHT, 2.0, 0.0, 0.0])
+        ls_side = ALLOC.allocate(square.r_w, b_side)
+        qp_side = QPA.QPAllocator(beta=0.0).allocate(square.r_w, b_side)
+        check("a reachable wrench the LS projection clips, the QP delivers",
+              ls_side.residual_force > 3.0 and qp_side.residual_force < 0.2,
+              "force residual LS %.2f N, QP %.2f N"
+              % (ls_side.residual_force, qp_side.residual_force))
+        check("...with the light feet ON the cone, the heavy ones carrying "
+              "the rest", qp_side.clipped.any()
+              and not qp_side.clipped.all(),
+              "active %s" % qp_side.clipped.astype(int))
+
+        # feasibility: C F <= d holds on every row, including past capacity
+        worst = -np.inf
+        for b in (b_hold, b_side, b_huge,
+                  np.array([30.0, 0.0, cfg.WEIGHT, 0.0, 0.0, 0.0])):
+            f = QPA.QPAllocator(beta=0.0).allocate(square.r_w, b).f_w
+            worst = max(worst, float((c_mat @ f.reshape(-1) - d_vec).max()))
+        check("C F <= d on every row of every case (feasible by construction)",
+              worst <= 1e-9, "worst C F - d %+.1e" % worst)
+        qp_huge = QPA.QPAllocator(beta=0.0).allocate(square.r_w, b_huge)
+        check("an impossible moment leaves a residual the QP reports too, "
+              "with the feet on their bounds",
+              qp_huge.residual_moment > 1.0 and qp_huge.clipped.all(),
+              "residual %.1f N / %.2f N*m, active %s"
+              % (qp_huge.residual_force, qp_huge.residual_moment,
+                 qp_huge.clipped.astype(int)))
+        check("...and BOTH formulations spend fz_max chasing it: the stand path "
+              "has no total-force rescale, S_FORCE is the QP's knob",
+              qp_huge.fz.sum() > 2 * cfg.WEIGHT and hard.fz.sum() > 2 * cfg.WEIGHT,
+              "sum fz QP %.0f N, LS %.0f N on a %.1f N robot"
+              % (qp_huge.fz.sum(), hard.fz.sum(), cfg.WEIGHT))
+
+        # a swinging foot is pinned to zero by its [0, 0] box
+        pair = QPA.QPAllocator(beta=0.0).allocate(square.r_w, b_hold,
+                                                 contact=[1, 0, 0, 1])
+        check("a foot at contact weight 0 gets exactly zero force",
+              bool(np.all(pair.f_w[[1, 2]] == 0.0))
+              and abs(pair.fz.sum() - cfg.WEIGHT) < 0.1,
+              "fz %s" % np.round(pair.fz, 2))
+
+        # beta: the low-pass acts on the share, not on the wrench
+        smooth = QPA.QPAllocator()
+        smooth.allocate(square.r_w, b_hold)
+        first = smooth.allocate(square.r_w, b_side)
+        check("with beta on, the FIRST sweep after a step already carries "
+              "the wrench", first.residual_force < 1.0,
+              "residual %.2f N, beta %.0e" % (first.residual_force, cfg.QP_BETA))
+        close("...and the share converges to the beta-free solution",
+              [smooth.allocate(square.r_w, b_side).f_w for _ in range(40)][-1],
+              qp_side.f_w, 0.05, " N")
+        fresh = QPA.QPAllocator(); fresh.reset()
+        check("reset() forgets F_prev", bool(np.all(fresh.f_prev == 0.0)))
+
+        # it drops into the law unchanged
+        laws = [LAW.BalanceLaw(track_stop_deg=0.0),
+                LAW.BalanceLaw(track_stop_deg=0.0, allocator=QPA.QPAllocator())]
+        outs = []
+        for law_k in laws:
+            law_k.arm(0.0, state_at(cfg.H_CROUCH))
+            outs.append(law_k.update(0.5, state_at(0.05)))
+        check("BalanceLaw(allocator=QPAllocator()) runs a sweep",
+              outs[1].trip is None and np.all(np.isfinite(outs[1].tau)),
+              "status '%s' in %d iterations"
+              % (laws[1].allocator.last_status, laws[1].allocator.last_iterations))
+        close("...and inside the cone it lands on least squares' load split",
+              outs[1].allocation.fz, outs[0].allocation.fz, 0.1, " N")
+
+        # the cost, bounded: iterations capped, every status a solve
+        bench = QPA.benchmark(square.r_w, sweeps=500)
+        check("500 warm sweeps: no max-iter hit, no fallback, C F <= d throughout",
+              bench["max_iter_hits"] == 0 and bench["fallbacks"] == 0
+              and bench["violation"] <= 1e-9,
+              "QP p50 %.0f p95 %.0f us (LS %.0f / %.0f), iterations p95 %d"
+              % (np.percentile(bench["qp_us"], 50), np.percentile(bench["qp_us"], 95),
+                 np.percentile(bench["ls_us"], 50), np.percentile(bench["ls_us"], 95),
+                 np.percentile(bench["iters"], 95)))
 
     # =====================================================================
     print("\n7. stage 5: the sign, the rotation, and the closed form")
