@@ -36,8 +36,12 @@ box ships at 0.10 / 0.05 m/s and 20 °/s.
 default allocator — stand, rise, hold, trot, walk (section 5.1): in place
 it is the least squares to 0.05° of tilt, pushed it delivers more of the
 wrench, and its worst case is capped at ~1.5 ms.  And `hw.fold2_walk` walks
-the knees-out FOLD2 with the same walk (section 7): its CoM is on both trot
-diagonals, and every case run on it is calmer than on the fold.
+the knees-out FOLD2 with the same walk (section 7).  Its CoM is on both trot
+diagonals, and it is the better walker: six phases a case, in place to
+0.15 m/s forward, 0.10 sideways, 40 °/s and 0.10 m/s with a 20 °/s turn all
+under 8° of tilt, none tipped — 0.20 m/s forward is its edge (4 of 6 to
+the stop) — and none of the hardware unknowns tipped it, the unfitted
+lighter rotor included.
 
 ![envelope](fig/fig_envelope.png)
 
@@ -586,15 +590,92 @@ of the study (1.5°).
 
 ### 7.2 Across the gait phase
 
-Six phases a case and the hardware unknowns at three (`--f2repeats`): in
-the follow-up to this commit, when the runs finish.
+Six phases a case, the command 0, 100, … 500 ms into the clock, the shipped
+walk unchanged (`--f2repeats`):
+
+| case | runs | tipped >15° | tilt stop | max tilt (median) | true (vx, vy, r), stood | peak τ | slip |
+|---|---|---|---|---|---|---|---|
+| in place | 6 | 0 | 0 | 1.0° (1.0°) | — | 3.5 N·m | 8 mm/s |
+| forward 0.05 | 6 | 0 | 0 | 1.6° (1.5°) | +0.056, +0.000, +0.0 | 3.9 N·m | 12 mm/s |
+| forward 0.10 | 6 | 0 | 0 | 3.3° (3.0°) | +0.110, +0.001, +0.0 | 5.0 N·m | 22 mm/s |
+| forward 0.15 | 6 | 0 | 0 | 6.7° (5.9°) | +0.167, +0.002, +0.1 | 6.3 N·m | 36 mm/s |
+| **forward 0.20** | 6 | **4** | **4** | 46.3° (45.1°) | +0.220, +0.014, +0.2 | 9.0 N·m | 45 mm/s |
+| back 0.10 | 6 | 0 | 0 | 3.2° (2.9°) | −0.111, −0.000, +0.0 | 5.0 N·m | 22 mm/s |
+| left 0.05 | 6 | 0 | 0 | 2.9° (2.1°) | +0.000, +0.056, +0.0 | 3.7 N·m | 13 mm/s |
+| right 0.05 | 6 | 0 | 0 | 2.9° (2.2°) | +0.000, −0.056, +0.0 | 3.8 N·m | 13 mm/s |
+| left 0.08 | 6 | 0 | 0 | 3.4° (3.1°) | +0.000, +0.089, +0.0 | 3.8 N·m | 17 mm/s |
+| left 0.10 | 6 | 0 | 0 | 3.9° (3.6°) | +0.000, +0.110, +0.0 | 3.8 N·m | 19 mm/s |
+| turn +20 °/s | 6 | 0 | 0 | 1.2° (1.0°) | +0.000, −0.000, +20.0 | 3.8 N·m | 15 mm/s |
+| turn −20 °/s | 6 | 0 | 0 | 1.1° (1.0°) | +0.000, +0.001, −20.0 | 3.8 N·m | 15 mm/s |
+| turn +40 °/s | 6 | 0 | 0 | 4.3° (3.7°) | +0.001, +0.000, +40.0 | 5.0 N·m | 26 mm/s |
+| 0.10 fwd + 20 °/s | 6 | 0 | 0 | 7.7° (6.8°) | +0.106, +0.001, +20.0 | 6.0 N·m | 26 mm/s |
+
+Beside the fold's shipped walk (section 6.5), the same cases and phases:
+
+| case | FOLD tipped / runs, worst tilt | FOLD2 tipped / runs, worst tilt |
+|---|---|---|
+| in place | 0 / 6, 3.7° | 0 / 6, 1.0° |
+| forward 0.05 | 0 / 6, 5.2° | 0 / 6, 1.6° |
+| forward 0.10 | 0 / 6, 6.6° | 0 / 6, 3.3° |
+| forward 0.15 | 3 / 6, 46.9° | 0 / 6, 6.7° |
+| forward 0.20 | — | 4 / 6, 46.3° |
+| back 0.10 | 0 / 6, 4.0° | 0 / 6, 3.2° |
+| left 0.05 | 0 / 6, 5.4° | 0 / 6, 2.9° |
+| right 0.05 | 0 / 6, 4.7° | 0 / 6, 2.9° |
+| left 0.08 | 0 / 6, 5.9° | 0 / 6, 3.4° |
+| left 0.10 | — | 0 / 6, 3.9° |
+| turn +20 °/s | 0 / 6, 4.2° | 0 / 6, 1.2° |
+| turn −20 °/s | 0 / 6, 4.3° | 0 / 6, 1.1° |
+| turn +40 °/s | 0 / 6, 5.8° | 0 / 6, 4.3° |
+| 0.10 fwd + 20 °/s | 0 / 6, 9.5° | 0 / 6, 7.7° |
+
+Every case the fold walks, FOLD2 walks at a quarter (in place, turning at
+20 °/s) to four fifths (back 0.10, the combined 0.10 + 20 °/s) of the
+fold's worst tilt; 0.15 m/s forward, which tipped the fold in 3 of 6
+phases, is 6 of 6 at 6.7° worst; 0.10 m/s sideways is 6 of 6 at 3.9°.  The edge is 0.20 m/s
+forward: 4 of 6 to the tilt stop, at the 9 N·m clip — section 4's
+torque-rate budget, which the CoM does not move.  The x/y velocity comes
+out ~10 % over the command here too (0.110 for 0.10): the estimator's
+under-read of section 6.7, not the posture's.
+
+### 7.3 The hardware unknowns
+
+Three phases each, as section 6.6:
+
+| variant | case | runs | tipped >15° | tilt stop | max tilt (median) | true (vx, vy, r), stood | peak τ |
+|---|---|---|---|---|---|---|---|
+| friction + IMU 15 ms | fwd10 | 3 | 0 | 0 | 3.3° (3.0°) | +0.109, +0.000, −0.0 | 5.0 N·m |
+| friction + IMU 15 ms | lat05 | 3 | 0 | 0 | 2.8° (2.7°) | +0.000, +0.063, +0.0 | 3.7 N·m |
+| friction + IMU 15 ms | yaw20 | 3 | 0 | 0 | 2.1° (2.1°) | +0.001, +0.004, +20.0 | 3.8 N·m |
+| floor μ 0.5 | fwd10 | 3 | 0 | 0 | 3.2° (3.0°) | +0.111, +0.000, +0.0 | 5.0 N·m |
+| floor μ 0.5 | lat05 | 3 | 0 | 0 | 3.1° (2.2°) | +0.000, +0.057, −0.1 | 3.7 N·m |
+| floor μ 0.5 | yaw20 | 3 | 0 | 0 | 1.2° (1.2°) | +0.000, +0.000, +20.0 | 3.9 N·m |
+| rotor 0.6, M0 DOG5's | inplace | 3 | 0 | 0 | 1.0° (1.0°) | — | 3.3 N·m |
+| rotor 0.6, M0 DOG5's | fwd10 | 3 | 0 | 0 | 4.1° (4.0°) | +0.107, +0.002, −0.1 | 4.4 N·m |
+| rotor 0.6, M0 DOG5's | lat05 | 3 | 0 | 0 | 3.2° (3.1°) | +0.000, +0.058, −0.0 | 3.6 N·m |
+| rotor 0.6, M0 DOG5's | yaw20 | 3 | 0 | 0 | 1.0° (1.0°) | +0.000, +0.001, +19.9 | 3.8 N·m |
+| rotor 0.6, M0 fitted | inplace | 3 | 0 | 0 | 0.9° (0.9°) | — | 2.6 N·m |
+| rotor 0.6, M0 fitted | fwd10 | 3 | 0 | 0 | 2.0° (1.5°) | +0.112, +0.000, −0.0 | 3.4 N·m |
+| rotor 0.6, M0 fitted | lat05 | 3 | 0 | 0 | 3.2° (2.2°) | +0.000, +0.055, −0.0 | 2.6 N·m |
+| rotor 0.6, M0 fitted | yaw20 | 3 | 0 | 0 | 1.0° (1.0°) | −0.000, +0.001, +20.0 | 2.7 N·m |
+
+None tipped.  The rotor that tipped the fold once in three with DOG5's M0
+(section 6.6) costs FOLD2 under a degree at 0.10 m/s (4.1° against 3.3°),
+and fitted it is calmer than the model's own (2.0°, peak torque 3.4 N·m).
+The fitted armature is still the first thing to do on the robot — it is a
+gain — but on FOLD2 the walk does not hang on it.
 
 ## 8. Feasibility
 
-**In MuJoCo: yes, inside the envelope of section 6.5**, every case at every
-phase tried under 10° of tilt, peak torque 3.7–6.2 N·m against the 9 N·m clip,
-the commanded yaw rate tracked to 0.2 °/s.  **0.15 m/s forward: no** — it is
-past the swing's torque-rate budget (section 4) and the diagonal's roll.
+**In MuJoCo: yes, inside the envelopes of sections 6.5 and 7.2.**  The fold
+(`hw.fold_walk`): every case at every phase tried under 10° of tilt, peak
+torque 3.7–6.2 N·m against the 9 N·m clip, the commanded yaw rate tracked
+to 0.2 °/s; **0.15 m/s forward: no** — past the swing's torque-rate budget
+(section 4) and the diagonal's roll.  FOLD2 (`hw.fold2_walk`): wider and
+calmer — **0.15 m/s forward and 0.10 sideways: yes**, everything under 8°;
+**0.20 m/s forward: no**.  If one stance is to walk first on the robot, the
+simulation says FOLD2.  Both under the QP, which section 5.1 shows is the
+least squares wherever the cone does not bind.
 
 **On the robot: plausible, on three conditions.**
 
@@ -607,12 +688,15 @@ past the swing's torque-rate budget (section 4) and the diagonal's roll.
    is 1/1.7 of DOG5's, the demand is that much lower than here.
 3. **The Pi's sweep time** (section 6.8).
 
-A first flight, each step only if the last was clean: `hw.fold_walk --fake
---auto 1 --no-imu` (the whole path, no robot); on the robot, T and trot in
-place with the walk attached (this is *not* `hw.fold_trot`'s trot in place:
-duty 0.70, no settle, the task-space swing); Q / E once (10 °/s); W once
-(0.05 m/s), SPACE, S once; A / D once (0.05 m/s); then a second press.
-SPACE, a cycle or two in place, T, ENTER to park.
+A first flight, each step only if the last was clean: `hw.fold2_walk
+--fake --auto 1 --no-imu` (the whole path, no robot); on the robot, T and
+trot in place with the walk attached (this is *not* `hw.fold2_trot`'s trot
+in place: duty 0.70, no settle, the task-space swing); Q / E once
+(10 °/s); W once (0.05 m/s), SPACE, S once; A / D once (0.05 m/s); then a
+second press.  SPACE, a cycle or two in place, T, ENTER to park.  The keys'
+box is the same 0.10 / 0.05 m/s and 20 °/s on both stances; on FOLD2
+`--v-max 0.15 0.10 --yaw-rate-max 40` is still inside what MuJoCo walked,
+once the first flights are clean.  The same order on `hw.fold_walk`.
 
 **What would widen it**, roughly in order of cost: the measured armature
 (lower demand, condition 1); the gate's slew for the swinging legs only

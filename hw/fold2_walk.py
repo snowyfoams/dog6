@@ -26,7 +26,16 @@ WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
     line is zero here.  The swing leg is the same leg mirrored -- the foot
     is the same 0.31 / 0.36 / 5.8 kg in x / y / z (Lambda at the hold), so
     the torque-rate budget of doc/walk section 4 is the fold's to the digit.
-    doc/walk/README.md section 7 has FOLD2's envelope in MuJoCo.
+
+    WHAT MUJOCO SAYS (doc/walk/README.md section 7): the better walker.  Six
+    gait phases a case: in place, 0.05-0.15 m/s forward, 0.10 back, 0.05 /
+    0.08 / 0.10 sideways, 20 and 40 deg/s turns and 0.10 m/s with a 20 deg/s
+    turn, none tipped, all under 8 deg (the fold tipped 3 of 6 at 0.15 m/s
+    forward); 0.20 m/s forward is the edge, 4 of 6 to the tilt stop.  Joint
+    friction with a late IMU, a mu 0.5 floor, DOG6's lighter rotor with
+    DOG5's M0 or a fitted one: none tipped.  The keys' box is the fold's,
+    0.10 / 0.05 m/s and 20 deg/s, for the first flights; `--v-max 0.15 0.10
+    --yaw-rate-max 40` is inside what MuJoCo walked.
 
 THE ARMATURE IS THE SWING'S GAIN, here as in `hw.fold_walk`: fit it with
 `hw.swing_bench --analyse` and pass `--ff-armature` before walking.
