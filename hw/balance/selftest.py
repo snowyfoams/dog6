@@ -2288,6 +2288,444 @@ def main() -> int:
           "x/y on the estimator" in report and "refused" in report)
 
     # =====================================================================
+    print("\n14. walking (hw.fold_walk): keys, reference, QP, footstep, "
+          "swing, one reference")
+    # =====================================================================
+    from . import footstep as WFOOT
+    from . import keys as WKEYS
+    from . import qp as WQP
+    from . import swing_control as WSC
+    from . import trajectory as WTRAJ
+    from . import walk as WWALK
+    from .. import fold_walk as FW
+
+    # -- keys.py: sim.cmpc.run's mapping ------------------------------------
+    keys = WKEYS.WalkKeys()
+    one = {}
+    for ch in "wsadqe":
+        keys.stop()
+        keys.press(ch)
+        one[ch] = (keys.command.vx, keys.command.vy, keys.command.yaw_rate)
+    v1, y1 = cfg.WALK_V_STEP, cfg.WALK_YAW_STEP
+    close("keys: W/S x, A/D y, Q/E yaw -- one step each, nothing else moves",
+          [one[ch] for ch in "wsadqe"],
+          [(v1, 0, 0), (-v1, 0, 0), (0, v1, 0), (0, -v1, 0), (0, 0, y1),
+           (0, 0, -y1)], 1e-15)
+    keys.stop()
+    for _ in range(50):
+        keys.press("W"), keys.press("a"), keys.press("E")
+    close("...upper case too, accumulating into the hardware box and no "
+          "further", [keys.command.vx, keys.command.vy, keys.command.yaw_rate],
+          [cfg.WALK_VX_MAX, cfg.WALK_VY_MAX, -cfg.WALK_YAW_RATE_MAX], 1e-12)
+    wide = WKEYS.WalkKeys(v_step=0.1, vx_max=1.0)   # 0.1 is not a binary
+    for ch in "wwwsss":                               # fraction: 0.1 x 3 - 0.1
+        wide.press(ch)                                # x 3 is 2.8e-17 in floats
+    check("...three W and three S are exactly zero, not 1e-17",
+          wide.command.vx == 0.0)
+    keys.press("q")
+    keys.press(" ")
+    check("...SPACE stops all three",
+          keys.command.vx == keys.command.vy == keys.command.yaw_rate == 0.0)
+    check("...T, X, ENTER stay hw.stand's: not owned, and press says None",
+          not any(keys.owns(ch) for ch in ("t", "T", "x", "X", "\n", "\r",
+                                           None))
+          and keys.press("t") is None)
+
+    # -- trajectory.py: cMPC's generator, slewed, clipped, leashed ----------
+    zero = WTRAJ.Command(vx=0.0, vy=0.0, yaw_rate=0.0)
+    wref = WTRAJ.WalkReference()
+    p_a, yaw_a = np.array([0.3, -0.2]), np.radians(90.0)
+    wref.reset(p_a, yaw_a)
+    s0 = wref.update(0.0, zero)
+    check("reference: reset ON the robot -- the first sweep has no error",
+          np.array_equal(s0.p, p_a) and s0.yaw == yaw_a and not s0.v.any()
+          and not s0.a.any())
+    fwd = WTRAJ.Command(vx=0.10, vy=0.0, yaw_rate=0.0)
+    run = [wref.update(0.004 * k, fwd) for k in range(1, 151)]
+    k_half = int(round(0.5 * 0.10 / cfg.WALK_ACC_MAX / 0.004))
+    close("...a key's step is a ramp at WALK_ACC_MAX, and its rate is fed "
+          "forward as a", [run[k_half - 1].command.vx,
+                           float(np.linalg.norm(run[k_half - 1].a))],
+          [cfg.WALK_ACC_MAX * 0.004 * k_half, cfg.WALK_ACC_MAX], 1e-12)
+    close("...turned by the REFERENCE heading: body x at 90 deg is world +y",
+          run[-1].v, [0.0, 0.10], 1e-12, " m/s")
+    dist = 0.004 * sum(r.command.vx for r in run)
+    close("...and integrated: the position is the slewed velocity's sum",
+          run[-1].p - p_a, [0.0, dist], 1e-12, " m")
+    wref.reset(np.zeros(2), 0.0)
+    turn = WTRAJ.Command(vx=0.10, vy=0.0, yaw_rate=np.radians(20.0))
+    s_t = [wref.update(0.004 * k, turn) for k in range(0, 501)][-1]
+    close("...turning at 20 deg/s, a = r x v: the velocity carried round "
+          "with the heading", s_t.a,
+          s_t.yaw_rate * np.array([-s_t.v[1], s_t.v[0]]), 1e-12, " m/s^2")
+    wref.reset(np.zeros(2), 0.0)
+    fast = WTRAJ.Command(vx=0.50, vy=0.0, yaw_rate=0.0)
+    for k in range(0, 751):
+        s_l = wref.update(0.004 * k, fast, np.zeros(2), 0.0)
+    check("...0.5 m/s asked: clipped to the hardware box before cMPC sees it",
+          s_l.command.vx == cfg.WALK_VX_MAX, "%.2f m/s" % s_l.command.vx)
+    close("...and a robot that does not follow is not chased: the leash "
+          "holds the reference WALK_LEASH ahead", np.linalg.norm(s_l.p),
+          cfg.WALK_LEASH, 1e-12, " m")
+    check("...and says so, and counts", s_l.leashed and wref.leash_sweeps > 0)
+    wref.reset(np.zeros(2), 2.0 * np.pi + 0.5)
+    s_y = wref.update(0.0, zero, None, 0.5 + np.radians(30.0))
+    close("...the yaw leash compares on the CIRCLE and keeps the reference's "
+          "own turn", s_y.yaw,
+          2.0 * np.pi + 0.5 + np.radians(30.0) - cfg.WALK_YAW_LEASH, 1e-12,
+          " rad")
+    wref.reset(np.zeros(2), 0.0)
+    wref.update(0.0, zero)
+    wref.command = fwd                              # past the slew
+    s_late = wref.update(1.0, fwd)                  # a sweep 1 s late
+    close("...a sweep 1 s late integrates DT_MAX and no more", s_late.p[0],
+          0.10 * WTRAJ.DT_MAX, 1e-15, " m")
+
+    # -- qp.py: the cone inside the problem ---------------------------------
+    qpa = WQP.QpAllocator()
+    trim = np.array([0.0, 0.0, cfg.WEIGHT, 0.3, -0.2, 0.05])
+    a_q = qpa.allocate(at_fold.r_w, trim)
+    a_l = ALLOC.allocate(at_fold.r_w, trim, mu=cfg.MU)
+    close("QP: with every face slack it IS the least squares, to alpha's "
+          "regularisation (0.02 N of 57.7)", a_q.f_w, a_l.f_w, 2e-2, " N")
+    check("...found on the fast path, one 12x12 solve, no iteration",
+          qpa.last_iter == 0 and not a_q.clipped.any())
+    a_d = qpa.allocate(at_fold.r_w, trim,
+                       contact=np.array([1.0, 0.0, 0.0, 1.0]))
+    check("...a swinging foot is not in the problem: exactly zero force",
+          not a_d.f_w[[1, 2]].any())
+    a_r = qpa.allocate(at_fold.r_w, trim,
+                       contact=np.array([1.0, 0.5 * WQP.W_PLANTED_MIN, 1.0,
+                                         1.0]))
+    check("...nor one ramped below W_PLANTED_MIN, the box that collapses "
+          "onto fz = 0", not a_r.f_w[1].any())
+    push = np.array([0.0, 27.0, cfg.WEIGHT, 0.0, 0.0, 0.0])
+    a_q = qpa.allocate(at_fold.r_w, push)
+    a_l = ALLOC.allocate(at_fold.r_w, push, mu=cfg.MU)
+    f = a_q.f_w
+    check("...a 27 N push puts feet on the cone: every foot on or inside "
+          "its pyramid and box",
+          qpa.last_iter > 0
+          and bool(np.all(np.abs(f[:, :2]) <= cfg.MU * f[:, 2:3] + 1e-9))
+          and bool(np.all(f[:, 2] >= cfg.FZ_MIN - 1e-9))
+          and bool(np.all(f[:, 2] <= cfg.FZ_MAX + 1e-9)),
+          "%d iterations" % qpa.last_iter)
+    check("...and delivers more of the wrench than the least squares' clip",
+          np.linalg.norm(a_q.residual) < np.linalg.norm(a_l.residual),
+          "|residual| %.3f against %.3f" % (np.linalg.norm(a_q.residual),
+                                            np.linalg.norm(a_l.residual)))
+    # A CERTIFICATE, NOT A COMPARISON: x feasible, and the gradient a
+    # non-negative combination of the working rows -- KKT, which for a
+    # convex QP is optimality.
+    stat_w = lam_w = viol_w = 0.0
+    capped0 = qpa.capped
+    for k in range(400):
+        r_k = at_fold.r_w + rng.normal(0.0, 0.01, (4, 3))
+        b_k = (np.array([0.0, 0.0, cfg.WEIGHT, 0.0, 0.0, 0.0])
+               + rng.normal(0.0, 1.0, 6) * [12.0, 12.0, 10.0, 1.5, 1.5, 0.5])
+        c_k = (None, np.array([1.0, 0.0, 0.0, 1.0]),
+               np.array([0.0, 1.0, 1.0, 0.0]), rng.random(4))[k % 4]
+        out_k = qpa.allocate(r_k, b_k, contact=c_k)
+        w_k = np.ones(4) if c_k is None else c_k
+        legs = np.flatnonzero(w_k >= WQP.W_PLANTED_MIN)
+        H, g, _A, Cm, dvec, _lo, _hi = qpa._build(r_k, b_k, legs, w_k)
+        x = out_k.f_w[legs].reshape(-1)
+        slot = {int(leg): j for j, leg in enumerate(legs)}
+        work = [WQP.ROWS_PER_FOOT * slot[leg] + row
+                for leg, row in sorted(qpa.active)]
+        grad = H @ x + g
+        if work:
+            lam = np.linalg.lstsq(Cm[work].T, -grad, rcond=None)[0]
+            grad = grad + Cm[work].T @ lam
+            lam_w = min(lam_w, float(lam.min()))
+        stat_w = max(stat_w, float(np.abs(grad).max()))
+        viol_w = max(viol_w, float((Cm @ x - dvec).max()))
+    check("...KKT on 400 random wrenches, stances and ramps: stationary, "
+          "multipliers >= 0, feasible, never capped",
+          stat_w < 1e-6 and lam_w > -1e-6 and viol_w <= 1e-9
+          and qpa.capped == capped0,
+          "stationarity %.1e, min lambda %.1e, violation %.1e, worst %d it"
+          % (stat_w, lam_w, viol_w, qpa.iter_max_seen))
+
+    # -- footstep.py: eq (33), the arc in the world -------------------------
+    sites = SWING.rest_feet_b(cfg.H_LIFT, fold.foot_xy)[:, :2]
+    t_st, t_sw = 0.42, 0.18                          # duty 0.70 at 0.6 s
+    fp = WFOOT.FootstepPlanner(sites, t_stance=t_st, t_swing=t_sw,
+                               height=0.02, kv=cfg.STEP_KV,
+                               step_max=cfg.STEP_MAX_XY)
+    v_w = np.array([0.10, 0.0])
+    tr = WFOOT.TrunkXY(p=np.array([1.0, 2.0]), v=v_w, yaw=0.0, yaw_rate=0.0,
+                       measured=True)
+    rs = WTRAJ.RefSample(p=np.zeros(2), v=v_w, a=np.zeros(2), yaw=0.0,
+                         yaw_rate=0.0, command=zero, leashed=False)
+    land = fp.foothold(0, 0.25, tr, rs)
+    close("footstep: eq (33) -- the site where the trunk will be at "
+          "touchdown, plus v T_st / 2", land,
+          tr.p + v_w * 0.75 * t_sw + sites[0] + 0.5 * t_st * v_w, 1e-15, " m")
+    quick = tr._replace(v=np.array([0.15, 0.0]))
+    close("...a trunk 0.05 m/s FASTER than the reference steps kv x 0.05 "
+          "further, Raibert's term",
+          fp.foothold(0, 0.25, quick, rs) - land,
+          [(0.5 * t_st + cfg.STEP_KV) * 0.05, 0.0], 1e-15, " m")
+    n_cl = fp.clamped
+    wild = fp.foothold(0, 0.25, tr._replace(v=np.array([2.0, -2.0])),
+                       rs._replace(v=np.zeros(2)))
+    close("...a wild velocity is clamped to STEP_MAX_XY about the site",
+          np.abs(wild - tr.p - sites[0]), cfg.STEP_MAX_XY, 1e-12, " m")
+    check("...and counted", fp.clamped == n_cl + 1)
+    r_t = 0.5
+    spun = fp.foothold(2, 0.25, tr._replace(v=np.zeros(2), yaw=0.3,
+                                            yaw_rate=r_t),
+                       rs._replace(v=np.zeros(2), yaw_rate=r_t))
+    ang = 0.3 + r_t * 0.75 * t_sw + 0.5 * r_t * t_st
+    close("...turning in place: the site turned to mid-stance (pYawCorrected)",
+          spun, tr.p + C.rot_z(ang)[:2, :2] @ sites[2], 1e-15, " m")
+    fp.release(0)
+    x_lift = np.array([sites[0, 0] - 0.02, sites[0, 1] + 0.004, -0.165])
+    a0 = fp.plan(0, 0.0, tr, rs, x_lift, -0.165)
+    close("...the arc starts where the foot IS, latched at liftoff",
+          a0.p, x_lift, 1e-15, " m")
+    close("...at GROUND speed: zero in the world is -v in the trunk",
+          a0.v[:2], -v_w, 1e-15, " m/s")
+    tr_end = tr._replace(p=tr.p + v_w * t_sw)
+    a1 = fp.plan(0, 1.0, tr_end, rs, x_lift, -0.165)
+    close("...and lands on the foothold, at ground speed, at rest height",
+          np.r_[tr_end.p + a1.p[:2], a1.v[:2], a1.p[2]],
+          np.r_[a1.land_w, -v_w, -0.165], 1e-12)
+    close("...the apex is swing_height above rest at mid-swing",
+          fp.plan(0, 0.5, tr._replace(p=tr.p + 0.5 * v_w * t_sw), rs,
+                  x_lift, -0.165).p[2], -0.165 + 0.02, 1e-15, " m")
+    # The rates against finite differences, along two paths on which the
+    # foothold stands still: a straight walk at the reference speed, and a
+    # turn in place.  -omega x p_b is in v_b, Coriolis and centripetal in a_b.
+    fd_v = fd_a = 0.0
+    for v_k, r_k in ((np.array([0.12, -0.04]), 0.0),
+                     (np.zeros(2), 0.6)):
+        fpk = WFOOT.FootstepPlanner(sites, t_stance=t_st, t_swing=t_sw,
+                                    height=0.02, kv=cfg.STEP_KV,
+                                    step_max=cfg.STEP_MAX_XY)
+        p0k, y0k = np.array([0.4, -0.1]), 0.2
+        rsk = WTRAJ.RefSample(p=np.zeros(2), v=v_k, a=np.zeros(2), yaw=0.0,
+                              yaw_rate=r_k, command=zero, leashed=False)
+
+        def _at(t, fpk=fpk, v_k=v_k, r_k=r_k, p0k=p0k, y0k=y0k, rsk=rsk):
+            trk = WFOOT.TrunkXY(p=p0k + v_k * t, v=v_k, yaw=y0k + r_k * t,
+                                yaw_rate=r_k, measured=True)
+            return fpk.plan(1, 0.1 + t / t_sw, trk, rsk, x_lift, -0.165)
+        _at(-0.1 * t_sw)                              # latch the liftoff
+        for t in (0.02, 0.05, 0.09, 0.13):
+            h = 1e-4
+            mid, lo, hi = _at(t), _at(t - h), _at(t + h)
+            fd_v = max(fd_v, float(np.abs((hi.p - lo.p) / (2 * h)
+                                          - mid.v).max()))
+            fd_a = max(fd_a, float(np.abs((hi.p - 2 * mid.p + lo.p) / h ** 2
+                                          - mid.a).max()))
+    check("...v and a are the derivatives of p in the TRUNK frame, walking "
+          "and turning (finite differences)", fd_v < 1e-5 and fd_a < 1e-3,
+          "worst %.1e m/s, %.1e m/s^2" % (fd_v, fd_a))
+    from sim.cmpc.swing import SwingTrajectory
+    arc_w = 0.0
+    for s in np.linspace(0.0, 1.0, 23):
+        mine = fp.plan(0, float(s), tr, rs, x_lift, -0.165)
+        lift = np.r_[mine.lift_w, 0.0]
+        ref_xy = SwingTrajectory(lift, np.r_[mine.land_w, 0.0], height=0.0,
+                                 duration=t_sw).at(float(s))
+        ref_z = SwingTrajectory(np.r_[0.0, 0.0, -0.165],
+                                np.r_[0.0, 0.0, -0.165], height=0.02,
+                                duration=t_sw).at(float(s))
+        arc_w = max(arc_w, float(np.abs(tr.p + mine.p[:2]
+                                        - ref_xy[0][:2]).max()),
+                    abs(mine.p[2] - ref_z[0][2]), abs(mine.a[2] - ref_z[2][2]))
+    check("...and its scalar arcs ARE sim.cmpc.swing.SwingTrajectory's",
+          arc_w < 1e-12, "worst %.1e" % arc_w)
+
+    # -- swing_control.py ---------------------------------------------------
+    sw_state = replace(at_fold, qd=np.full(C.N_JOINTS, 1.5))
+    qd0 = C.unflat(sw_state.qd)[0]
+    v0 = sw_state.jac[0] @ qd0
+    on_arc = WFOOT.SwingRef(p=sw_state.x_b[0].copy(), v=v0,
+                            a=np.array([0.5, -0.3, 4.0]), land_w=None,
+                            lift_w=None)
+    tau_o, ff_o = WSC.swing_osc_torque(sw_state, 0, on_arc)
+    close("swing (osc): ON the arc, the torque is the feedforward alone",
+          tau_o, ff_o, 1e-12, " N*m")
+    e_p, e_v = np.array([0.01, -0.005, 0.02]), np.array([0.1, 0.0, -0.2])
+    off = on_arc._replace(p=on_arc.p + e_p, v=on_arc.v + e_v)
+    tau_e, ff_e = WSC.swing_osc_torque(sw_state, 0, off)
+    wn, zt = cfg.WN_SWING_OSC, cfg.ZETA_SWING_OSC
+    close("...off it, J M0^-1 (tau - tau_ff) is the commanded acceleration "
+          "wn^2 e + 2 zeta wn e_dot",
+          sw_state.jac[0] @ np.linalg.solve(SWING.JOINT_INERTIA_M0,
+                                            tau_e - ff_e),
+          wn * wn * e_p + 2.0 * zt * wn * e_v, 1e-9, " m/s^2")
+    tau_i, ff_i = WSC.swing_control_torque(sw_state, 0, off)
+    close("swing (impedance): J^T (Kp e + Kd e_dot), no feedforward unless "
+          "asked", np.r_[tau_i, ff_i],
+          np.r_[sw_state.jac[0].T @ (cfg.KP_SWING_WALK * e_p
+                                     + cfg.KD_SWING_WALK * e_v),
+                np.zeros(3)], 1e-12, " N*m")
+
+    # -- walk.py: one reference, every target from it -----------------------
+    def _walk_law(swing_law="osc", alloc="qp"):
+        plan = WWALK.WalkPlan(swing_law=swing_law)
+        law = LAW.BalanceLaw(gains=_xy_gains(), foot_xy=fold.foot_xy.copy(),
+                             dynamic_setpoint=False, srb=fold.srb,
+                             track_stop_deg=0.0, est_xy=True,
+                             kp_joint=cfg.KP_JOINT_HOLD,
+                             kd_joint=cfg.KD_JOINT_HOLD, alloc=alloc,
+                             walk=plan)
+        law.arm(0.0, at_fold)
+        law.ramp = REF.Quintic.ramp(cfg.H_LIFT, cfg.H_LIFT, 1.0)
+        law.hold_joints(at_fold.q)
+        return law, plan
+    try:
+        LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb, swing="joint",
+                       walk=WWALK.WalkPlan())
+        refused = False
+    except ValueError:
+        refused = True
+    check("walk: refused on a swing that cannot place a foot in x/y "
+          "(--swing joint)", refused)
+    wl, wp = _walk_law()
+    wl.feed_estimate(_est(0.996))
+    out_h = wl.update(1.0, at_fold, xy_hold=True)
+    check("...attached and NOT engaged before the trot: the HOLD is the "
+          "flown one (no reference on the output)",
+          not wp.engaged and out_h.ref is None)
+    tg = GAIT.TrotGait()
+    tg.reset(1.004)
+    wl.feed_estimate(_est(1.0))
+    out_w = wl.update(1.004, at_fold, gait=tg, xy_hold=True)
+    check("...engaged on the trot's first sweep, the four anchors on the "
+          "HOLD sites", wp.engaged and out_w.ref is not None
+          and bool(np.isfinite(wp.anchor_w).all()) and wp.steps == 0)
+    q_e, qd_e = wp.hold_targets(wl, at_fold, out_w.ref)
+    close("...on that sweep the stance targets ARE q_hold: no step in the "
+          "joint layer", q_e, C.unflat(wl.q_hold), 1e-9, " rad")
+    check("...and the x/y rows close on zero error at zero rate: no step "
+          "in the wrench", out_w.xy_on
+          and float(np.abs(out_w.wrench.b_d[:2]).max()) < 1e-9
+          and not qd_e.any())
+    # A TRUNK EXACTLY ON THE REFERENCE GETS NO JOINT TORQUE -- position and
+    # rate, the rate built by differencing the reference's own motion, not
+    # from walk.py's formula.
+    ref_m = out_w.ref._replace(p=out_w.ref.p + [0.012, -0.006],
+                               yaw=out_w.ref.yaw + np.radians(5.0),
+                               v=np.array([0.10, 0.02]), yaw_rate=0.2)
+
+    def _feet(ref_k):
+        p_org, _ = wp._origin_ref(wl, ref_k)
+        Rk = C.rot_z(float(ref_k.yaw))[:2, :2]
+        xy = (wp.anchor_w - p_org[None, :]) @ Rk
+        return np.c_[xy, wp.z_rest]
+    dt_m = 1e-6
+    x_m = _feet(ref_m)
+    xd_m = (_feet(ref_m._replace(p=ref_m.p + ref_m.v * dt_m,
+                                 yaw=ref_m.yaw + ref_m.yaw_rate * dt_m))
+            - _feet(ref_m._replace(p=ref_m.p - ref_m.v * dt_m,
+                                   yaw=ref_m.yaw - ref_m.yaw_rate * dt_m))
+            ) / (2.0 * dt_m)
+    q_m = np.array([HK.leg_ik(i, x_m[i] - np.asarray(P.HIP_OFFSET[i]),
+                              q_seed=C.unflat(at_fold.q)[i])
+                    for i in range(C.N_LEGS)])
+    R_m = C.rot_z(float(ref_m.yaw))
+    o_m = IMU.TrunkOrientation(R=R_m, omega_b=np.array([0.0, 0.0, 0.2]),
+                               roll=0.0, pitch=0.0, yaw=float(ref_m.yaw),
+                               age_s=0.0)
+    st_q = STATE.read(C.flat(q_m), np.zeros(C.N_JOINTS), o_m, srb=fold.srb)
+    qd_m = np.array([np.linalg.solve(st_q.jac[i], xd_m[i])
+                     for i in range(C.N_LEGS)])
+    st_m = STATE.read(C.flat(q_m), C.flat(qd_m), o_m, srb=fold.srb)
+    q_t, qd_t = wp.hold_targets(wl, st_m, ref_m)
+    close("...a trunk exactly ON the reference, 12 mm and 5 deg on, gets no "
+          "joint spring", q_t, q_m, 1e-9, " rad")
+    close("...and walking it at the reference's v and r, no joint damper "
+          "(target rate against a difference of the reference's motion)",
+          qd_t, qd_m, 1e-6, " rad/s")
+    both = np.array([True, False, False, True])
+    q_p, qd_p = wp.hold_targets(wl, st_m, ref_m, both)
+    check("...and a swinging leg costs no IK: its rows are q and zero",
+          np.array_equal(q_p[[1, 2]], C.unflat(st_m.q)[[1, 2]])
+          and not qd_p[[1, 2]].any()
+          and np.allclose(q_p[[0, 3]], q_t[[0, 3]], 0.0, 1e-15))
+    far = ref_m._replace(p=ref_m.p + [0.08, 0.0])
+    q_f, _ = wp.hold_targets(wl, st_m, far)
+    reach = max(float(np.linalg.norm(
+        HK.foot_position(i, q_f[i])[:2] - st_m.x_b[i, :2]))
+        for i in range(C.N_LEGS))
+    close("...a reference 80 mm off pulls each leg's target only "
+          "HOLD_XY_ERR_MAX away", reach, cfg.HOLD_XY_ERR_MAX, 1e-9, " m")
+    before = wp.anchor_w.copy()
+    wp._planted = both.copy()
+    est_td = _est(1.0, p=[0.05, 0.02, 0.2])
+    wp.contacts(wl, at_fold, out_w.ref, np.ones(4, dtype=bool), est_td)
+    feet_w = (est_td.p_w[None, :] + at_fold.x_b @ at_fold.R.T)[:, :2]
+    close("...a foot that lands is anchored where the filter puts it, "
+          "p_hat + R x_b", wp.anchor_w[[1, 2]], feet_w[[1, 2]], 1e-15, " m")
+    check("...and the feet that stayed down keep theirs",
+          np.array_equal(wp.anchor_w[[0, 3]], before[[0, 3]]))
+    # Two cycles through the law at zero command on the static fixture.
+    wl2, wp2 = _walk_law()
+    tg2 = GAIT.TrotGait()
+    tg2.reset(1.0)
+    t = 1.0
+    trips2, moved, swing_f, fin = set(), 0.0, 0.0, True
+    p_first = None
+    while t < 1.0 + 2.0 * tg2.period:
+        wl2.feed_estimate(_est(t - 0.004))
+        o2 = wl2.update(t, at_fold, gait=tg2, xy_hold=True)
+        if o2.trip:
+            trips2.add(o2.trip)
+        if p_first is None:
+            p_first = o2.ref.p.copy()
+        moved = max(moved, float(np.abs(o2.ref.p - p_first).max()),
+                    abs(o2.ref.yaw - out_w.ref.yaw))
+        off_legs = o2.contact <= 0.0
+        if off_legs.any():
+            swing_f = max(swing_f,
+                          float(np.abs(o2.allocation.f_w[off_legs]).max()))
+        fin &= bool(np.all(np.isfinite(o2.tau)))
+        t += 0.004
+    check("...two cycles at zero command: the reference stands still, no "
+          "trip, every torque finite", moved == 0.0 and not trips2 and fin,
+          "; ".join(sorted(trips2))[:60])
+    check("...the QP gives every swinging foot exactly zero force",
+          swing_f == 0.0)
+    rep = wl2.report()
+    check("...and the exit report has the QP and the walk",
+          "qp allocator" in rep and "touchdowns anchored" in rep)
+    # hw.fold_walk builds the plan the way doc/walk flew it.
+    import argparse
+    opts = FW.walk_options()
+    clock = opts["gait"]
+    check("hw.fold_walk: hw.fold_trot's stand and trot, the walking hook, "
+          "the QP", opts["alloc"] == "qp"
+          and isinstance(opts["hook"], FW.WalkHook)
+          and opts["crouch"] is POSE.FOLD)
+    check("...on the walk's clock: hw.fold_trot's period at WALK_DUTY, the "
+          "contact ramp inside its four-foot window",
+          clock.period == FT.PERIOD_S and clock.duty == cfg.WALK_DUTY
+          and clock.ramp == cfg.WALK_CONTACT_RAMP
+          and cfg.WALK_CONTACT_RAMP < (cfg.WALK_DUTY - 0.5)
+          / (2.0 * cfg.WALK_DUTY),
+          "%.2f s, duty %.2f, %.0f ms of swing, ramp %.3f"
+          % (clock.period, clock.duty, 1e3 * clock.swing_duration,
+             clock.ramp))
+    ap_w = argparse.ArgumentParser()
+    opts["hook"].add_arguments(ap_w)
+    a_w = ap_w.parse_args([])
+    a_w.ff_armature, a_w.swing_ff = None, False
+    opts["hook"].configure(a_w)
+    built = opts["hook"].law_kwargs(a_w)["walk"]
+    check("...and the plan its flags build is the walk doc/walk flew: the "
+          "task-space swing at WN_SWING_OSC",
+          built.swing_law == cfg.WALK_SWING_LAW == "osc"
+          and np.array_equal(built.wn_swing, cfg.WN_SWING_OSC)
+          and built.zeta_swing == cfg.ZETA_SWING_OSC
+          and built.reference.vx_max == cfg.WALK_VX_MAX,
+          "wn %s rad/s" % np.array2string(built.wn_swing, precision=0))
+
+    # =====================================================================
     print("\n" + "=" * 78)
     if _FAILURES:
         print("FAILED %d of %d" % (len(_FAILURES), len(_FAILURES) + _PASSES))

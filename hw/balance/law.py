@@ -77,9 +77,11 @@ from .. import kinematics as HK      # noqa: E402
 from . import allocation as ALLOC    # noqa: E402
 from . import config as cfg          # noqa: E402
 from . import controller as CTRL     # noqa: E402
+from . import qp as QP               # noqa: E402
 from . import reference as REF       # noqa: E402
 from . import state as STATE         # noqa: E402
 from . import swing as SWING         # noqa: E402
+from . import swing_control as SC    # noqa: E402
 from . import torque as TRQ          # noqa: E402
 
 __all__ = ["BalanceLaw", "LawOutput", "Timing", "TrunkEstimate",
@@ -216,6 +218,11 @@ class LawOutput:
     est_age_s: float = float("nan")
     xy_des: np.ndarray | None = None     # (2,) m, CoM, WORLD
     xy_on: bool = False
+    #: The walk's reference this sweep (`trajectory.RefSample`), None when
+    #: not walking; and each swinging foot's planned touchdown, WORLD x/y,
+    #: NaN for a foot that is down.
+    ref: object = None
+    land_w: np.ndarray | None = None     # (4, 2)
 
 
 @dataclass
@@ -425,11 +432,30 @@ class BalanceLaw:
     est_acc_max_age_s: float = cfg.EST_ACC_MAX_AGE_S
     #: m/s^2, the authority clamp on the x/y rows (`controller.balance_wrench`).
     xy_acc_max: float = cfg.XY_ACC_MAX
+    #: THE FORCE ALLOCATOR, 2026-10-04.  "wls" is `allocation.allocate`, the
+    #: least squares every entry point flew until now; "qp" is
+    #: `qp.QpAllocator`, the cone and the contact ramp's box inside the
+    #: problem instead of clipped on afterwards (`--alloc`; `hw.fold_walk`'s
+    #: default).  qp.py says where the two differ and where they cannot.
+    alloc: str = "wls"
+    #: WALKING, 2026-10-04: a `walk.WalkPlan`, or None -- every entry point
+    #: but `hw.fold_walk`, for which nothing below changes.  Attached, it
+    #: engages on the first trot sweep and from then on owns the x/y rows'
+    #: reference, the heading, the joint layer's targets and the swing
+    #: (walk.py: one reference, every target taken from it).
+    walk: object | None = None
 
     def __post_init__(self) -> None:
         if self.swing not in SWING.SWING_MODES:
             raise ValueError("swing %r: one of %s"
                              % (self.swing, ", ".join(SWING.SWING_MODES)))
+        if self.alloc not in ("wls", "qp"):
+            raise ValueError("alloc %r: 'wls' or 'qp'" % (self.alloc,))
+        if self.walk is not None and self.swing != "cartesian":
+            raise ValueError("walking places the foot in x/y; the %s swing "
+                             "lifts in z alone" % self.swing)
+        #: The QP allocator (qp.py), when `alloc` asks for it.
+        self.qp = QP.QpAllocator(mu=self.mu) if self.alloc == "qp" else None
         if self.swing_roll and self.swing != "cartesian":
             raise ValueError("swing_roll levels the Cartesian arc; the joint "
                              "swing latches its own at liftoff")
@@ -790,16 +816,9 @@ class BalanceLaw:
         inherits the position of the phase before it."""
         self.xy_des = None
 
-    def _xy_feedback(self, now: float, state):
-        """(`controller.XyFeedback` or None, why not or None) for this sweep.
-
-        THE CoM, NOT THE TRUNK ORIGIN.  The filter tracks the origin; the PD
-        regulates the CoM, as the z row does, and the two differ by R c^b --
-        whose rate is omega x R c^b, the trunk's own sway, which would
-        otherwise reach the x/y damper as a velocity the CoM does not have.
-        Converted with THIS sweep's R and omega: the estimate is 4 ms older
-        than both, which at a trot's few deg/s is a hundredth of a mm.
-        """
+    def _estimate_ok(self, now: float, state):
+        """(the fed `TrunkEstimate`, None) if it may be used this sweep, else
+        (None, why not).  The x/y rows and the walk ask the same question."""
         est = self.estimate
         if est is None:
             return None, "no estimate fed yet"
@@ -820,19 +839,47 @@ class BalanceLaw:
             # filter's x/y are legs rotated by that same stale R.
             return None, ("the IMU attitude is %.0f ms old -- the R the "
                           "filter's x/y are rotated by" % (1e3 * state.imu_age_s))
+        if not (math.isfinite(float(est.p_w[0])) and math.isfinite(float(est.p_w[1]))
+                and math.isfinite(float(est.v_w[0]))
+                and math.isfinite(float(est.v_w[1]))):
+            return None, "the estimate is not finite"
+        return est, None
+
+    def _xy_feedback(self, now: float, state, ref=None, est=None,
+                     refusal=None):
+        """(`controller.XyFeedback` or None, why not or None) for this sweep.
+
+        THE CoM, NOT THE TRUNK ORIGIN.  The filter tracks the origin; the PD
+        regulates the CoM, as the z row does, and the two differ by R c^b --
+        whose rate is omega x R c^b, the trunk's own sway, which would
+        otherwise reach the x/y damper as a velocity the CoM does not have.
+        Converted with THIS sweep's R and omega: the estimate is 4 ms older
+        than both, which at a trot's few deg/s is a hundredth of a mm.
+
+        `ref` is the walk's reference (`trajectory.RefSample`) or None.  Given,
+        the setpoint is the REFERENCE's CoM x/y and its rate the reference's,
+        every sweep -- no latch: the walk owns the setpoint (walk.py).  `est`
+        and `refusal` are `_estimate_ok`'s answer if the caller already has
+        it; None asks again.
+        """
+        if est is None and refusal is None:
+            est, refusal = self._estimate_ok(now, state)
+        if est is None:
+            return None, refusal
         # SCALARS, AND THE CROSS PRODUCT WRITTEN OUT -- `state.on_stance`'s
         # reason: this is slot-0 arithmetic, and `np.cross` plus a numpy call
         # per element cost the Pi 83 us a sweep where this costs a few.
         px, py = float(est.p_w[0]), float(est.p_w[1])
         vx, vy = float(est.v_w[0]), float(est.v_w[1])
-        if not (math.isfinite(px) and math.isfinite(py)
-                and math.isfinite(vx) and math.isfinite(vy)):
-            return None, "the estimate is not finite"
         c = state.R @ self.srb.com_body                  # R c^b, WORLD
         w = state.omega_w
         p_c = np.array([px + c[0], py + c[1]])
         v_c = np.array([vx + w[1] * c[2] - w[2] * c[1],  # (omega x R c^b)_x
                         vy + w[2] * c[0] - w[0] * c[2]])  # (omega x R c^b)_y
+        if ref is not None:
+            self.xy_des = np.asarray(ref.p, dtype=float).copy()
+            return CTRL.XyFeedback(p_error=self.xy_des - p_c, v=v_c,
+                                   v_des=np.asarray(ref.v, dtype=float)), None
         if self.xy_des is None:
             # LATCHED, ON THE FIRST USABLE SWEEP OF THE HOLD OR THE TROT: zero
             # error on the sweep the loop closes, so closing it cannot step
@@ -872,6 +919,25 @@ class BalanceLaw:
             self._slide_feet(command.h)          # the slanted rise
         com_cmd = REF.com_command(command, state.R, self.srb)
 
+        # -- the walk's reference (walk.py) ---------------------------------
+        # None until the first trot sweep of a law that walks: the stand, the
+        # rise and the first HOLD are the flown ones.  From then on the
+        # heading, the x/y rows, the joint layer and the swing all take their
+        # target from this one sample.
+        ref = est = est_refusal = None
+        omega_des = None
+        if self.walk is not None or self.est_xy:
+            est, est_refusal = self._estimate_ok(now, state)
+        if self.walk is not None:
+            ref = self.walk.step(now, self, state, gait, clock_now, est)
+        if ref is not None:
+            self.att_offset[2] = float(ref.yaw)
+            self.R_des = CTRL.latched_attitude(
+                self.sp_roll + self.att_offset[0],
+                self.sp_pitch + self.att_offset[1],
+                self.sp_yaw + float(ref.yaw))
+            omega_des = np.array([0.0, 0.0, float(ref.yaw_rate)])
+
         # -- stage 3 -------------------------------------------------------
         held = bool(state.imu_stale)
         if held:
@@ -881,7 +947,7 @@ class BalanceLaw:
         # the flown law.
         xy = None
         if self.est_xy and xy_hold:
-            xy, refusal = self._xy_feedback(now, state)
+            xy, refusal = self._xy_feedback(now, state, ref, est, est_refusal)
             if xy is None:
                 self.xy_refused += 1
                 self.xy_refusal = refusal
@@ -889,17 +955,27 @@ class BalanceLaw:
                 self.xy_sweeps += 1
                 self.xy_err_peak = max(self.xy_err_peak, math.hypot(
                     float(xy.p_error[0]), float(xy.p_error[1])))
+        # The reference's own acceleration rides on the x/y rows only while
+        # they are closed: with the estimate refused they are zero, the flown
+        # law, and an open-loop push would be neither.
         wrench = CTRL.balance_wrench(state, com_cmd, self.R_des, self.gains,
+                                     omega_des=omega_des,
                                      hold_attitude=held, srb=self.srb,
-                                     xy=xy, xy_acc_max=self.xy_acc_max)
+                                     xy=xy, xy_acc_max=self.xy_acc_max,
+                                     acc_ff=(None if ref is None or xy is None
+                                             else ref.a))
         if xy is not None:
             self.xy_acc_peak = max(self.xy_acc_peak, math.hypot(
                 float(wrench.acc_lin[0]), float(wrench.acc_lin[1])))
 
         # -- stage 4 -------------------------------------------------------
         weight = None if clock_now is None else clock_now.weight
-        allocation = ALLOC.allocate(state.r_w, wrench.b_d, mu=self.mu,
-                                    contact=weight)
+        if self.qp is not None:
+            allocation = self.qp.allocate(state.r_w, wrench.b_d,
+                                          contact=weight)
+        else:
+            allocation = ALLOC.allocate(state.r_w, wrench.b_d, mu=self.mu,
+                                        contact=weight)
 
         # -- stage 5 -------------------------------------------------------
         # Sub-rated when asked: `gravity_legs_per_sweep` legs are refreshed,
@@ -916,9 +992,42 @@ class BalanceLaw:
 
         # -- the swing legs ------------------------------------------------
         q_ref = ik_reference(command.h, C.unflat(state.q), self.foot_xy)
-        swing_s = p_swing = None
+        swing_s = p_swing = land_w = None
         tau_ff = np.zeros(C.N_JOINTS)
-        if clock_now is not None:
+        if ref is not None:
+            # TOUCHDOWNS: a landed foot is anchored where it landed, and every
+            # foot that is down forgets its swing plan.
+            self.walk.contacts(self, state, ref,
+                               np.ones(C.N_LEGS, dtype=bool) if clock_now is None
+                               else clock_now.contact, est)
+        if clock_now is not None and ref is not None:
+            # WALKING: the foothold and arc of footstep.py, the swing law of
+            # swing_control.py (walk.swing_law).  The tracking reference
+            # follows a swinging leg, as below.
+            swinging = ~clock_now.contact
+            swing_s = clock_now.swing_s
+            p_swing = np.full((C.N_LEGS, 3), np.nan)
+            land_w = np.full((C.N_LEGS, 2), np.nan)
+            q4 = C.unflat(state.q)
+            for i in np.flatnonzero(swinging):
+                sref = self.walk.swing_ref(int(i), float(swing_s[i]), self,
+                                           state, ref, est)
+                p_swing[i] = sref.p
+                land_w[i] = sref.land_w
+                if self.walk.swing_law == "osc":
+                    t_sw, t_ff = SC.swing_osc_torque(
+                        state, int(i), sref, wn=self.walk.wn_swing,
+                        zeta=self.walk.zeta_swing,
+                        inertia=self.walk.ff_inertia)
+                else:
+                    t_sw, t_ff = SC.swing_control_torque(
+                        state, int(i), sref, kp=self.walk.kp_swing,
+                        kd=self.walk.kd_swing, ff=self.walk.swing_ff,
+                        inertia=self.walk.ff_inertia)
+                tau[3 * i:3 * i + 3] += t_sw
+                tau_ff[3 * i:3 * i + 3] = t_ff
+                q_ref[i] = q4[i]
+        elif clock_now is not None:
             swinging = ~clock_now.contact
             if self.foot_xy_to is not None:
                 # TOUCHDOWN: the leg now stands on the step's destination.
@@ -1059,8 +1168,19 @@ class BalanceLaw:
                 kp[0::3] = self.kp_joint_abd
             if self.kd_joint_abd is not None:
                 kd[0::3] = self.kd_joint_abd
-            hold = C.unflat(kp * (self.q_hold - state.q)
-                            - kd * np.asarray(state.qd))
+            if ref is not None:
+                # WALKING: the target is where the reference trunk sees each
+                # planted foot's anchor, and its rate the anchor's motion in
+                # that trunk -- so the damper drags only the error, not the
+                # walk (walk.py).  Equal to q_hold on the engaging sweep.
+                q_t, qd_t = self.walk.hold_targets(
+                    self, state, ref,
+                    None if clock_now is None else clock_now.contact)
+                hold = C.unflat(kp * (C.flat(q_t) - state.q)
+                                + kd * (C.flat(qd_t) - np.asarray(state.qd)))
+            else:
+                hold = C.unflat(kp * (self.q_hold - state.q)
+                                - kd * np.asarray(state.qd))
             if clock_now is not None:
                 hold[~clock_now.contact] = 0.0
             tau += C.flat(hold)
@@ -1100,7 +1220,7 @@ class BalanceLaw:
                                     else float(now) - float(est.t)),
                          xy_des=(None if self.xy_des is None
                                  else self.xy_des.copy()),
-                         xy_on=xy is not None)
+                         xy_on=xy is not None, ref=ref, land_w=land_w)
 
     def _trip(self, state, allocation, q_ref,
               monitor_residual: bool = True) -> str | None:
@@ -1154,4 +1274,5 @@ class BalanceLaw:
             "m/s^2 (%.1f N; clamp %.1f m/s^2)"
             % (1e3 * self.xy_err_peak, self.xy_acc_peak,
                cfg.MASS * self.xy_acc_peak, self.xy_acc_max),
-        ]))
+        ]) + ([] if self.qp is None else ["  " + self.qp.report()])
+            + ([] if self.walk is None else [self.walk.report()]))

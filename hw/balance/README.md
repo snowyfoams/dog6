@@ -1,7 +1,7 @@
 # `hw.balance` — the stand's balance controller
 
 ```
-python -m hw.balance.selftest       188 checks, no robot, no IMU, no simulator
+python -m hw.balance.selftest       372 checks, no robot, no IMU, no simulator
 python -m hw.balance.config          every number, with its provenance
 python -m hw.stand --law srb         run it
 python -m hw.stand --law per-leg     run what it replaces
@@ -9,6 +9,7 @@ python -m hw.fold_trot               the fold stance, then T trots in place
 python -m hw.fold2_trot              the same, knees out: front legs the rear mirrored
 python -m hw.fully_trot              hw.fold_trot, the trot's x/y closed on the Kalman filter
 python -m hw.trot                    the nominal crouch, then T trots in place
+python -m hw.fold_walk               hw.fold_trot, then WASD/QE walk it while trotting
 ```
 
 Implements the design note in [`doc/dog6_stand_control.tex`](../../doc): an
@@ -60,6 +61,12 @@ and `r_w` are never spelled the same way.
 | `allocation.py` | stage 4. Pure transmission — no trunk feedback at all |
 | `torque.py` | stage 5, plus the tilt-aware leg-gravity term |
 | `law.py` | the five chained; one call per sweep. `sequence.py` owns *when*, this owns *what* |
+| `qp.py` | stage 4 as a QP (`--alloc qp`): the pyramid and the contact box *inside* the problem, a dense primal active set from the projected unconstrained optimum |
+| `trajectory.py` | walking: `sim.cmpc.trajectory`'s reference generator, the command slewed, clipped to the hardware box and leashed to the filter |
+| `keys.py` | walking: W/S x, A/D y, Q/E yaw, SPACE stop |
+| `footstep.py` | walking: eq (33) + Raibert's term for the foothold; the arc in the world (x/y) and the trunk (z) |
+| `swing_control.py` | walking: the swing leg's law — task-space computed torque, or the Cartesian impedance |
+| `walk.py` | walking: ONE reference, and every target taken from it — x/y rows, heading, the joint layer's world-anchored stance targets, the footholds. [doc/walk](../../doc/walk/README.md) |
 | `selftest.py` | gates the lot offline |
 
 ## Three things that are exactly zero error at the identity

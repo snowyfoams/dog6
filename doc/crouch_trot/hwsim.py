@@ -260,6 +260,10 @@ class HwParams:
     prime_gate: bool = False
     #: produced torque = kt_scale * commanded (a torque-constant error).
     kt_scale: float = 1.0
+    #: the plant's reflected rotor = armature_scale * the model's (DOG5's
+    #: `params.ARMATURE`).  The bench's swing-ff run read DOG6's as ~1/1.7
+    #: of it (`hw.balance.swing.feedforward_inertia`), never measured.
+    armature_scale: float = 1.0
 
 
 class HwSim:
@@ -280,6 +284,8 @@ class HwSim:
             m.dof_frictionloss[6:] = self.hw.frictionloss
         if self.hw.joint_damping is not None:
             m.dof_damping[6:] = self.hw.joint_damping
+        if self.hw.armature_scale != 1.0:
+            m.dof_armature[6:] *= self.hw.armature_scale
         if self.hw.trunk_mass_add:
             m0 = m.body_mass[self.trunk]
             m.body_ipos[self.trunk] *= m0 / (m0 + self.hw.trunk_mass_add)

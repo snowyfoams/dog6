@@ -629,7 +629,11 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 return "operator X"
             if pressed in ("t", "T"):
                 print("\n   " + stand.toggle_trot(now), flush=True)
-            if pressed in ("w", "W"):
+            # A hook that OWNS a key gets it alone: `hw.fold_walk`'s W is
+            # forward, not the foot step.
+            owned = (hook is not None and pressed is not None
+                     and getattr(hook, "owns", lambda ch: False)(pressed))
+            if pressed in ("w", "W") and not owned:
                 print("\n   " + stand.toggle_step(now), flush=True)
             if hook is not None and pressed is not None:
                 said = hook.key(pressed, now, stand)
@@ -817,8 +821,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 if estimator is not None:
                     for line in estimator.status().splitlines():
                         print("          " + line, flush=True)
-                if (hook is not None and stand.phase_name == "hold"
-                        and not terse):
+                if (hook is not None and not terse
+                        and stand.phase_name in ("hold", "trot")):
                     print("          " + hook.status(now, stand), flush=True)
                 if (stand.phase_name in ("rise", "hold", "trot", "step")
                         and not terse):
@@ -882,7 +886,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          terse: bool = False, limits: bool = True,
          rise_track: bool = False, height: float = None,
          stand_xy=None, slide_from: float = None,
-         est_xy: bool = None) -> int:
+         est_xy: bool = None, alloc: str = "wls") -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -932,6 +936,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     (2026-10-02).  It needs a gait and an `estimator` whose objects also have
     `estimate()` (`hw.trot_esti.EstimatorFeed`); with the loop on `run` is
     called with `feed`, and with `--no-est-xy` the filter only prints.
+    `alloc` is `--alloc`'s default for an entry point with a gait: "wls",
+    the least squares every trot flew, or "qp" (`law.BalanceLaw.alloc`,
+    `hw.fold_walk`'s).  A hook with `law_kwargs(args)` hands the law more
+    keyword arguments -- `hw.fold_walk`'s walk plan.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -1123,6 +1131,12 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           help="T steps the gait by HAND, half a cycle a "
                                "press: one diagonal lifts and lands, HOLD by "
                                "itself, and the next T swings the other one")
+        trot.add_argument("--alloc", choices=("wls", "qp"), default=alloc,
+                          help="the force allocator in the hold and the trot: "
+                               "'wls' the least squares, the cone clipped on "
+                               "afterwards (every trot until 2026-10-04); "
+                               "'qp' the cone inside the problem "
+                               "(hw.balance.qp)")
         if step_to is not None:
             trot.add_argument("--step-period", type=float,
                               default=(gait.period if step_period is None
@@ -1399,6 +1413,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               **({} if not slide else dict(
                                   stand_xy=np.asarray(stand_xy, float),
                                   slide_from_h=slide_from)),
+                              **({} if gait is None else dict(
+                                  alloc=args.alloc)),
+                              **({} if hook is None
+                                 or not hasattr(hook, "law_kwargs")
+                                 else hook.law_kwargs(args)),
                               est_xy=xy_loop)
     stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
                           gait=gait, step_to=step_to, step_gait=step_gait,
@@ -1425,6 +1444,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
               % (gait, "\n       HALF GAIT: each T is one diagonal's swing, alternating "
                  "press by press -- no clock hands over"
                  if args.half_gait else ""))
+        if getattr(hook, "replaces_swing", False):
+            print("       (the trot's own swing, below, is REPLACED from the "
+                  "first trot sweep by the hook's -- its banner says which)")
         if swing == "joint":
             print("       swing apex %.0f mm straight up, NO placement; JOINT "
                   "PD, abd held: Kp %s N*m/rad Kd %s N*m*s/rad"

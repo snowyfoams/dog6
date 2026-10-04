@@ -546,6 +546,125 @@ KD_SWING_KNEE = np.array([0.8, 0.8, 0.8])
 TAU_SLEW_TROT_NM_S = 120.0
 
 
+# ===========================================================================
+# walking  (trajectory.py, keys.py, qp.py, footstep.py, swing_control.py,
+#           walk.py -- the `hw.fold_walk` entry point, 2026-10-04)
+# ===========================================================================
+# THE STRUCTURE IS `sim.cmpc`'S: the operator's body-axis velocity is
+# integrated into an x, y, yaw reference (`sim.cmpc.trajectory`, imported),
+# the swing foot lands on eq (33) plus a velocity-feedback term, and the arc
+# is cMPC's own quintic in the WORLD so the foot meets the ground at ground
+# speed.  The law under it is still the SRB PD with no horizon, so every
+# number below is [SIM-TUNED] in doc/walk/walksim.py's MuJoCo harness (the
+# repo's own sequence, law, gait and gate) and NOTHING here has flown.
+
+#: One W/S/A/D press, m/s; one Q/E press, rad/s.  Half the simulator's
+#: (`sim.cmpc.config.V_STEP`, `YAW_RATE_STEP`): the hardware law has no
+#: horizon to plan a velocity change into, so it gets smaller ones.
+WALK_V_STEP = 0.05
+WALK_YAW_STEP = float(np.radians(10.0))
+
+#: What the keys may accumulate to: inside what MuJoCo walked, not what the
+#: robot might.  [SIM-TUNED] doc/walk/README.md has the sweep: with the
+#: shipped walk, six gait phases a case, 0.10 m/s forward or back, 0.05 and
+#: 0.08 m/s sideways, 20 and 40 deg/s turns and 0.10 m/s with a 20 deg/s turn
+#: all stayed under 10 deg of tilt; 0.15 m/s forward tipped 3 of 6 (2 to the
+#: tilt stop).  The box is the first flights', below the 0.08 / 40 that also
+#: passed; --v-max and --yaw-rate-max open it.
+WALK_VX_MAX = 0.10                  # m/s
+WALK_VY_MAX = 0.05                  # m/s
+WALK_YAW_RATE_MAX = float(np.radians(20.0))   # rad/s
+
+#: The command is SLEWED toward what the keys ask, never stepped: a step in
+#: v_ref is a step in the x/y rows' velocity error and in the footholds.
+WALK_ACC_MAX = 0.5                  # m/s^2
+WALK_YAW_ACC_MAX = float(np.radians(90.0))    # rad/s^2
+
+#: THE LEASH -- MIT's `max_pos_error` (ConvexMPCLocomotion.cpp, 0.1 m on
+#: Cheetah 3).  The integrated reference is kept within this of where the
+#: filter has the CoM, so a robot that falls behind is never chased by a
+#: setpoint running away from it; it bounds what the x/y rows AND the
+#: world-anchored stance targets can ask.  DOG6 is a third of Cheetah's size.
+WALK_LEASH = 0.03                   # m
+WALK_YAW_LEASH = float(np.radians(10.0))      # rad
+
+#: The foothold, eq (33) with Raibert's feedback term:
+#:   p_land = site(t_td) + v_hat T_st / 2 + STEP_KV (v_hat - v_ref)
+#: STEP_KV is MIT's 0.03 s by default (`pfx_rel`); the capture point would
+#: be sqrt(h/g) = 0.14 s.  STEP_MAX bounds the landing's distance from the
+#: stance's own neutral site, trunk x / y.  [SIM-TUNED]
+STEP_KV = 0.03                      # s
+STEP_MAX_XY = (0.06, 0.04)          # m
+
+#: The swing foot's Cartesian impedance while WALKING, trunk frame.  The trot
+#: in place's 10 N/m in x/y (`KP_SWING`) is too soft to carry a foot across
+#: a stride: at 0.1 m/s it must move 48 mm in 120 ms, ~6 N peak on the 0.32 kg
+#: the foot weighs in x, against the 0.1 N 10 N/m makes of 10 mm.  z keeps
+#: the operator's 400 / 40.  [SIM-TUNED]
+KP_SWING_WALK = np.array([150.0, 150.0, 400.0])
+KD_SWING_WALK = np.array([6.0, 6.0, 40.0])
+
+#: The walk's TASK-SPACE COMPUTED TORQUE swing (swing_control.swing_osc_torque):
+#: acceleration gains, so a bandwidth per axis whatever the foot's apparent
+#: mass.  wn rad/s per axis (x, y, z), zeta.  [SIM-TUNED]
+#: Z IS THE EXPENSIVE AXIS.  The foot is 0.31 / 0.36 kg in x / y and 5.8 kg
+#: in z (the reflected rotor through a short z lever), so z bandwidth is
+#: torque RATE, which the gate slews at 120 N*m/s: at 25/25/30 the swing's
+#: request peaked at 12-15 N*m and the gate passed a triangle of it, the foot
+#: rising 80 mm for a 20 mm apex (doc/walk/README.md, fig_swing_slew).
+#: 25/25/20 against 25/25/30, six gait phases a case in MuJoCo: a 40 deg/s
+#: turn fell 1 of 6 against 5, 0.08 m/s sideways 0 of 5 against 2, 0.10 m/s
+#: forward tipped past 15 deg 1 of 6 (no tilt stop) against 2 of 6 to the
+#: stop.  Softer z (15) or stiffer x/y (35) were both worse.
+WN_SWING_OSC = np.array([25.0, 25.0, 20.0])
+ZETA_SWING_OSC = 0.7
+
+#: THE WALK'S SWING LAW AND CLOCK, `hw.fold_walk`'s defaults.  [SIM-TUNED]
+#: doc/walk/README.md has the runs; in short: at the trot's duty 0.80 (120 ms
+#: of swing) no swing law walked 0.1 m/s in MuJoCo, and the reason is the
+#: z axis -- the reflected rotor makes the foot 5.8 kg in z (0.3 in x), so
+#: the 20 mm arc's own feedforward asks ~300 N*m/s of a knee the gate slews
+#: at 120 (TAU_SLEW_TROT_NM_S).  0.70 gives the swing 180 ms; the contact
+#: ramp has to fit the four-foot window, (duty - 0.5) / (2 duty) of stance,
+#: and takes 90 % of it.
+WALK_SWING_LAW = "osc"
+WALK_DUTY = 0.70
+WALK_CONTACT_RAMP = 0.9 * (WALK_DUTY - 0.5) / (2.0 * WALK_DUTY)
+#: NO SETTLE WHILE WALKING.  DOG5's re-level freezes the gait clock 0.2 s
+#: every 2 cycles with the four feet down -- and the reference does not
+#: freeze: at 0.1 m/s the trunk moves 20 mm over planted feet, the stance
+#: outlasts the T_st the footholds were planned for, and the next swing
+#: starts 20 mm behind.  Six gait phases a case in MuJoCo, the settle off
+#: against on: 0.10 m/s forward never past 6.6 deg (against 17.9), 0.10 m/s
+#: with a 20 deg/s turn 0 of 6 tipped (against 4), a 40 deg/s turn 0 of 6
+#: (against 1 to the tilt stop), peak torque 3.8-6.2 N*m (against 4.2-8.7).
+WALK_SETTLE_S = 0.0
+
+#: The walking stance targets are WORLD-anchored (walk.py): each planted
+#: foot's target is where the reference trunk sees it.  Per leg, the xy part
+#: of (target - measured) is clamped to this -- K_c,xx * 20 mm is 2.8 N a leg
+#: at the fold stand's Kp 5 -- so an estimate gone wrong pulls no harder.
+HOLD_XY_ERR_MAX = 0.020             # m
+
+#: THE QP ALLOCATOR (qp.py) -- the cost it trades:
+#:   1/2 |A f - b_d|^2_S + 1/2 alpha f' W f + 1/2 beta |f - f_prev|^2
+#: S = I weighs a newton like a newton-metre, which is the metric the least
+#: squares (`allocation.py`) resolves an unreachable wrench in -- so on a
+#: diagonal pair the QP gives up the same part of the moment the flown law
+#: did, and differs from it in WHERE the cone is enforced: inside the
+#: optimisation, not by clipping and rescaling afterwards.  alpha W is the
+#: soft cone (W is allocation's (10, 10, 1)); small, so the wrench is
+#: tracked to ~0.1 N.  beta 0: the gate's slew already smooths.  [UNTUNED]
+QP_S = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+QP_ALPHA = 1.0e-4
+QP_BETA = 0.0
+#: Active-set iterations a sweep may take; the cap returns the last FEASIBLE
+#: iterate.  Most sweeps take none (no face touched: the unconstrained
+#: optimum is the answer); the slowest of a MuJoCo walk took 13, and 400
+#: random wrenches in `selftest` 23.
+QP_MAX_ITER = 30
+
+
 def describe() -> str:
     return "\n".join([
         "DOG6 balance controller configuration",
@@ -627,6 +746,25 @@ def describe() -> str:
         % (KP_SWING_JOINT, KD_SWING_JOINT),
         "    joint hold layer     Kp %.1f N*m/rad  Kd %.2f N*m*s/rad   every "
         "leg, q latched on reaching HOLD" % (KP_JOINT_HOLD, KD_JOINT_HOLD),
+        "  walking (hw.fold_walk)  [SIM-TUNED, NOT FLOWN]",
+        "    keys        +-%.2f m/s, +-%.0f deg/s a press; box vx %.2f vy %.2f "
+        "m/s, yaw %.0f deg/s"
+        % (WALK_V_STEP, np.degrees(WALK_YAW_STEP), WALK_VX_MAX, WALK_VY_MAX,
+           np.degrees(WALK_YAW_RATE_MAX)),
+        "    reference   slew %.2f m/s^2, %.0f deg/s^2; leash %.0f mm, %.0f deg"
+        % (WALK_ACC_MAX, np.degrees(WALK_YAW_ACC_MAX), 1e3 * WALK_LEASH,
+           np.degrees(WALK_YAW_LEASH)),
+        "    foothold    eq (33) + %.2f s (v_hat - v_ref), within %s mm of "
+        "the site" % (STEP_KV, tuple(int(1e3 * x) for x in STEP_MAX_XY)),
+        "    swing       %s: wn %s rad/s zeta %.2f   (impedance: Kp %s Kd %s)"
+        % (WALK_SWING_LAW, WN_SWING_OSC, ZETA_SWING_OSC, KP_SWING_WALK,
+           KD_SWING_WALK),
+        "    clock       duty %.2f, ramp %.3f, settle %.2f s   stance "
+        "targets world-anchored, |xy err| <= %.0f mm"
+        % (WALK_DUTY, WALK_CONTACT_RAMP, WALK_SETTLE_S,
+           1e3 * HOLD_XY_ERR_MAX),
+        "    QP          S %s  alpha %.0e  beta %.0e  cap %d iterations"
+        % (QP_S, QP_ALPHA, QP_BETA, QP_MAX_ITER),
     ])
 
 

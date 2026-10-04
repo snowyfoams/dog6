@@ -143,7 +143,10 @@ class XyFeedback(NamedTuple):
     """
 
     p_error: np.ndarray      # (2,) m, setpoint MINUS estimate
-    v: np.ndarray            # (2,) m/s, the estimate's rate; the setpoint's is 0
+    v: np.ndarray            # (2,) m/s, the estimate's rate
+    #: (2,) m/s, the setpoint's own rate: the walk's v_ref (walk.py).  None
+    #: is a setpoint at rest -- every hold and trot in place.
+    v_des: np.ndarray | None = None
 
 
 class Wrench(NamedTuple):
@@ -212,7 +215,8 @@ def latched_attitude(roll_sp: float, pitch_sp: float,
 def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
                    omega_des=None, hold_attitude: bool = False,
                    srb=None, xy: XyFeedback | None = None,
-                   xy_acc_max: float = cfg.XY_ACC_MAX) -> Wrench:
+                   xy_acc_max: float = cfg.XY_ACC_MAX,
+                   acc_ff=None) -> Wrench:
     """The PD of the module docstring.  A pure function -- no state, no clock.
 
     `state` is a `state.BodyState`, `com_cmd` a `reference.ComCommand`.
@@ -230,6 +234,11 @@ def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
     whatever the gains say.  Given, those rows are the same PD as z on it,
     and the horizontal acceleration they ask for is clamped to `xy_acc_max`
     as a norm: an authority bound on a loop whose input is an estimate.
+
+    `acc_ff` (2,) is the walk's reference acceleration (trajectory.py: the
+    command's slew and the turn's r x v), added to the x/y rows AFTER the
+    clamp -- it is the reference's, bounded where it is made, not a reading
+    of the estimate.  None everywhere but a walk.
     """
     R = state.R
 
@@ -244,11 +253,17 @@ def balance_wrench(state, com_cmd, R_des, gains: BalanceGains, *,
     if xy is not None:
         p_error[:2] = xy.p_error
         v_error[0], v_error[1] = -xy.v[0], -xy.v[1]
+        if xy.v_des is not None:
+            v_error[0] += float(xy.v_des[0])
+            v_error[1] += float(xy.v_des[1])
     acc_lin = gains.kp_pos * p_error + gains.kd_pos * v_error
     if xy is not None:
         a_xy = math.hypot(float(acc_lin[0]), float(acc_lin[1]))
         if a_xy > xy_acc_max:
             acc_lin[:2] *= xy_acc_max / a_xy
+    if acc_ff is not None:
+        acc_lin[0] += float(acc_ff[0])
+        acc_lin[1] += float(acc_ff[1])
 
     # -- attitude ------------------------------------------------------
     # The exponential-map error on SO(3), never a difference of Euler angles.

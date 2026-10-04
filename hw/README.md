@@ -120,6 +120,7 @@ the table for the length of a `with` block.
 | `swing_bench.py` | yes, **robot hung up** | the swing leg on its own: position ramp to the lift pose, torque hold of every foot at its site (swing PD + gravity, no balance law, no IMU), ENTER runs the gait clock and the legs in `--legs` follow the arc — `hw.trot`'s swing law and flags exactly. One line per swing from the FK: apex asked vs reached, x/y excursion, touchdown speed, tau_ff / PD / slew-clip peaks. `--log FILE.npz`, `--fake --auto 1 --swings 4` |
 | `stand.py` | yes | `sim.stand`'s limp → settle → crouch → lift → park on the robot. Driver 0xA4 for position, `SafetyGate` for the lift, every motor re-sent inside the 50 ms input-lost window. Both lift laws, `--law srb` / `--law per-leg`. `--fake` runs it against `fake_bus` |
 | `wide_trot.py` | yes | `hw.fold_trot`'s run from `posture.WIDE` at 160 mm, the stance xy spring on, 0.5 s / 20 mm — the stand posture the 2026-10-01 simulation study (`doc/trot_posture/`) found best for the trot in place; `--track 95 / 105` for the feet further out |
+| `fold_walk.py` | yes | `hw.fold_trot` steered from the keyboard while trotting: W/S x, A/D y, Q/E yaw, SPACE stop. One walking reference feeds the x/y rows, the heading, the joint layer's (world-anchored) stance targets and the footholds; the QP allocator by default; the trot at duty 0.70. **Simulated, not flown** — what MuJoCo says it can and cannot do is [doc/walk/README.md](../doc/walk/README.md) |
 | `selftest.py` | — | 48 checks, no robot |
 
 ## The staging ladder, with DOG6's own numbers
