@@ -10,11 +10,15 @@ python -m hw.fold2_trot              the same, knees out: front legs the rear mi
 python -m hw.fully_trot              hw.fold_trot, the trot's x/y closed on the Kalman filter
 python -m hw.trot                    the nominal crouch, then T trots in place
 python -m hw.fold_walk               hw.fold_trot, then WASD/QE walk it while trotting
+python -m hw.fold2_walk              the same over hw.fold2_trot, knees out
 ```
 
 Implements the design note in [`doc/dog6_stand_control.tex`](../../doc): an
 SRB wrench law with a weighted-least-squares force allocator, replacing the
-per-leg Cartesian compliance law in the **lift phase only**.
+per-leg Cartesian compliance law in the **lift phase only**.  Since
+2026-10-04 the allocator every entry point runs is the QP (`qp.py`: the
+friction pyramid and the contact box inside the problem, where the least
+squares clips them on afterwards); `--alloc wls` keeps the least squares.
 
 `sequence.py` runs the whole six-phase stand — `limp → settle → crouch → lift
 → park → done` — but the balance law drives one phase of it. The other five
@@ -61,7 +65,7 @@ and `r_w` are never spelled the same way.
 | `allocation.py` | stage 4. Pure transmission — no trunk feedback at all |
 | `torque.py` | stage 5, plus the tilt-aware leg-gravity term |
 | `law.py` | the five chained; one call per sweep. `sequence.py` owns *when*, this owns *what* |
-| `qp.py` | stage 4 as a QP (`--alloc qp`): the pyramid and the contact box *inside* the problem, a dense primal active set from the projected unconstrained optimum |
+| `qp.py` | stage 4 as a QP, **the default** (`--alloc wls` for the least squares): the pyramid and the contact box *inside* the problem, a dense primal active set from the projected unconstrained optimum, capped at 20 iterations (~1.5 ms) |
 | `trajectory.py` | walking: `sim.cmpc.trajectory`'s reference generator, the command slewed, clipped to the hardware box and leashed to the filter |
 | `keys.py` | walking: W/S x, A/D y, Q/E yaw, SPACE stop |
 | `footstep.py` | walking: eq (33) + Raibert's term for the foothold; the arc in the world (x/y) and the trunk (z) |
@@ -120,6 +124,11 @@ Whole law, all four leg-gravity terms refreshed every sweep:
 | `stance_torque` | 8 µs |
 | IK for the tracking trip | 67 µs |
 | **total** | **210 µs** of a 333 µs slot |
+
+Measured with the least squares.  The QP that is the default since
+2026-10-04 costs ~0.7x the least squares on the same machine on its fast path
+(no face of the cone touched: 80 against 120 µs on the development VM), plus
+~70 µs per active-set iteration when one is — capped at 20.
 
 The closed-form leg gravity is what makes it fit. It agrees with
 `sim.kinematics.leg_frames`' walk to 2.2e-16 over 300 random poses **and**

@@ -7,7 +7,7 @@ qd filter, IMU latency, the gate's 120 N·m/s slew and 9 N·m clip), with
 `hw.trot_esti`'s Kalman filter fed **one sweep late** as `hw.stand` does.
 The operator "holds keys": the command comes from a schedule.  Everything
 here is simulation on the CAD model with DOG5's rotor inertia; **nothing has
-flown**.  Section 9 says how to reproduce every table.*
+flown**.  Section 10 says how to reproduce every table.*
 
 **TL;DR.**  `hw.fold_walk` walks `hw.fold_trot` from the keyboard (W/S x, A/D
 y, Q/E yaw) with the joint layer **kept**: its stance targets are anchored in
@@ -32,6 +32,13 @@ in 3 at 0.10 m/s, and with M0 fitted it never did.  The estimator under-reads
 distance by ~10 %, so the robot walks ~10 % faster than asked.  The keys'
 box ships at 0.10 / 0.05 m/s and 20 °/s.
 
+**Follow-up, the same day, on request.**  The QP is now every entry point's
+default allocator — stand, rise, hold, trot, walk (section 5.1): in place
+it is the least squares to 0.05° of tilt, pushed it delivers more of the
+wrench, and its worst case is capped at ~1.5 ms.  And `hw.fold2_walk` walks
+the knees-out FOLD2 with the same walk (section 7): its CoM is on both trot
+diagonals, and every case run on it is calmer than on the fold.
+
 ![envelope](fig/fig_envelope.png)
 
 ## 1. What was built
@@ -52,13 +59,16 @@ keys ──► WalkKeys.command (body axes) ──► WalkReference ──► Re
 | `hw/balance/footstep.py` | the swing leg's **trajectory**: eq (33) + Raibert's term for the foothold, the x/y arc a quintic in the **world** (ground speed at both ends), z the in-place bump in the trunk |
 | `hw/balance/swing_control.py` | the swing leg's **control**: task-space computed torque (`osc`, the default) or the Cartesian impedance |
 | `hw/balance/walk.py` | ties them to one reference; the joint layer's world-anchored targets |
-| `hw/fold_walk.py` | the entry point: `hw.fold_trot` + the hook + the QP + the walk's clock |
+| `hw/fold_walk.py` | the entry point: `hw.fold_trot` + the hook + the QP + the walk's clock (`walking()`, which wraps any trot entry point) |
+| `hw/fold2_walk.py` | the same walk over `hw.fold2_trot`, knees out (section 7) |
 | `doc/walk/walksim.py` | this study |
 
-`law.BalanceLaw` gains `alloc` (`"wls"` default, `"qp"`) and `walk` (None
-default).  With both at their defaults nothing changes for any other entry
-point: `selftest` still passes the 317 checks it passed before (the same two
-fail, section 9), and 53 new ones in its section 14.
+`law.BalanceLaw` gains `alloc` and `walk`.  `walk` defaults to None, and
+then nothing of the walk reaches any other entry point.  `alloc` defaults to
+`"qp"` since the follow-up of the same day, on request: every entry point
+now allocates with the QP (section 5.1), `--alloc wls` the least squares.
+`selftest` passes the checks it passed before (the same two fail, section
+10) and its section 14's new ones.
 
 ## 2. One reference — and why the joint layer survives walking
 
@@ -219,6 +229,62 @@ Verification: on 77 captured hard sweeps and 3 000 random wrenches / stances
 / ramps, the forces agree with SLSQP to 1e-4 N, never violate a constraint,
 never hit the cap (worst 26 iterations); `selftest` §14 certifies 400 more
 by KKT (stationarity 8e-11, every multiplier ≥ 0).
+
+### 5.1 The default, on every entry point (2026-10-04)
+
+`law.BalanceLaw.alloc` and `hw.stand --alloc` default to the QP for every
+entry point and every phase the SRB law drives — the stands, the rise, the
+hold, the trot, the walk; `--alloc wls` keeps the least squares, and the
+banner says which (`allocator QP -- the pyramid and the contact box inside
+the problem`).  To be precise about what changes: the least squares'
+forces are inside the cone too — it clips each foot into it and rescales —
+but it meets the wrench *first*, so where the cone binds the wrench it
+delivers is whatever the clip left; the QP delivers the closest wrench the
+cone allows.  Where nothing binds the two are the same allocation.
+
+The trot entry points in place, as flown (least squares) and as they now
+ship (QP), 8 s each, and pushed sideways 3 s into the trot (`--allocs`):
+
+| entry point | case | allocator | stood | max tilt | peak τ | slip | QP worst iterations |
+|---|---|---|---|---|---|---|---|
+| `hw.fold_trot` | in place, 8 s | least squares | yes | 2.24° | 1.34 N·m | 9.4 mm/s | — |
+| `hw.fold_trot` | in place, 8 s | QP | yes | 2.27° | 1.34 N·m | 9.6 mm/s | 5 |
+| `hw.fold_trot` | pushed 5 N × 0.2 s sideways | least squares | yes | 6.87° | 1.45 N·m | 10.7 mm/s | — |
+| `hw.fold_trot` | pushed 5 N × 0.2 s sideways | QP | yes | 6.88° | 1.66 N·m | 10.7 mm/s | 5 |
+| `hw.fold_trot` | pushed 10 N × 0.2 s sideways | least squares | yes | 11.86° | 2.43 N·m | 12.4 mm/s | — |
+| `hw.fold_trot` | pushed 10 N × 0.2 s sideways | QP | yes | 11.84° | 2.80 N·m | 12.3 mm/s | 7 |
+| `hw.fold_trot` | 0.1 N·m joint friction, IMU 15 ms | least squares | yes | 1.56° | 1.36 N·m | 7.9 mm/s | — |
+| `hw.fold_trot` | 0.1 N·m joint friction, IMU 15 ms | QP | yes | 1.60° | 1.35 N·m | 7.9 mm/s | 5 |
+| `hw.fold_trot` | floor μ 0.5 | least squares | yes | 2.29° | 1.35 N·m | 9.7 mm/s | — |
+| `hw.fold_trot` | floor μ 0.5 | QP | yes | 2.33° | 1.35 N·m | 9.7 mm/s | 5 |
+| `hw.fold2_trot` | in place, 8 s | least squares | yes | 0.50° | 1.25 N·m | 5.5 mm/s | — |
+| `hw.fold2_trot` | in place, 8 s | QP | yes | 0.47° | 1.25 N·m | 5.5 mm/s | 4 |
+| `hw.fold2_trot` | pushed 5 N × 0.2 s sideways | least squares | yes | 5.53° | 1.25 N·m | 6.8 mm/s | — |
+| `hw.fold2_trot` | pushed 5 N × 0.2 s sideways | QP | yes | 5.56° | 1.41 N·m | 6.8 mm/s | 4 |
+| `hw.fold2_trot` | pushed 10 N × 0.2 s sideways | least squares | yes | 9.72° | 2.15 N·m | 8.7 mm/s | — |
+| `hw.fold2_trot` | pushed 10 N × 0.2 s sideways | QP | yes | 9.77° | 2.60 N·m | 8.5 mm/s | 5 |
+| `hw.fold2_trot` | 0.1 N·m joint friction, IMU 15 ms | least squares | yes | 0.61° | 1.26 N·m | 4.2 mm/s | — |
+| `hw.fold2_trot` | 0.1 N·m joint friction, IMU 15 ms | QP | yes | 0.62° | 1.26 N·m | 4.1 mm/s | 4 |
+| `hw.fold2_trot` | floor μ 0.5 | least squares | yes | 0.54° | 1.24 N·m | 5.3 mm/s | — |
+| `hw.fold2_trot` | floor μ 0.5 | QP | yes | 0.52° | 1.24 N·m | 5.3 mm/s | 3 |
+
+Indistinguishable in place, under friction and latency and on a slippery
+floor (tilt within 0.05°).  Under a push the QP's torque peak is 0.2–0.45
+N·m higher at the same tilt: it meets more of the wrench the push calls for,
+with bigger forces on the cone's faces — DOG5's caution in `allocation.py`
+(a QP's p95 torque 2.73 against 1.61 N·m in its trot stance), here small
+because S = I gives up the unreachable moment the way the least squares did.
+
+**Cost.**  On the development VM the QP is ~110 µs + ~70 µs per active-set
+iteration; its fast path (no face touched — every stand sweep, most trot
+sweeps) is 80 µs against the least squares' 120.  The iterations are
+numpy's call overhead, not the solve: a Schur-complement step (one m×m
+solve, H inverted once) produced the same iterates to 1e-9 N and saved
+nothing.  `config.QP_MAX_ITER` is now 20 (was 30), so the worst case is
+~1.5 ms: no walk of the shipped configuration that stood needed more than
+20 in a sweep (most 4–7; the trots in place above, 3–7), every iterate is
+inside the cone, and none is worse than the one before — `selftest` checks
+a solve stopped at its cap for both.
 
 ## 6. What MuJoCo says
 
@@ -460,7 +526,70 @@ report's `law timing` first.  The cheapest further cut is the
 joint layer's IK: one Newton step from the measured q, `q + J⁻¹(x_t − x)`,
 in place of the closed form.
 
-## 7. Feasibility
+## 7. FOLD2: `hw.fold2_walk`
+
+`hw.fold2_trot`'s stand — `posture.FOLD2`, the front legs the rear legs
+mirrored so every knee is outboard of its hip, the straight rise to the
+160 mm hold — walked by `fold_walk.walking`: the same hook, keys and box,
+the same swing law, clock and QP.  Nothing in the walk is posture-specific
+beyond what it reads off the stance at the first trot sweep: the footholds
+are placed about the sites latched from q_hold (FOLD2's feet at ±219.5 mm
+in x, where the fold's stand has the front pair at +149.5), and the SRB pin
+is FOLD2's own.  Two facts decide how it walks, both checked at the hold:
+
+- **the swing leg is the same leg, mirrored**: Λ is 0.31 / 0.36 / 5.8 kg in
+  x / y / z on every leg, as on the fold, and `M0 J⁻¹ ẑ` is the same
+  0.18 N·m per m/s² at the knee — section 4's torque-rate budget holds to
+  the digit, and the swing gains carry over unchanged;
+- **FOLD2's CoM is on both trot diagonals** (0.0 mm off each line; the
+  fold's stand has it 5.7 mm off both): the moment no diagonal pair can
+  make about its own line — the line-contact argument of section 4 — is
+  zero for this stance, so no two-foot phase starts with a moment the law
+  cannot deliver.
+
+### 7.1 The single runs
+
+`python doc/walk/walksim.py --fold2`, phase 0, one run each:
+
+| scenario | command (vx, vy, r) | stood | true (vx, vy, r) | max tilt | peak τ | slip |
+|---|---|---|---|---|---|---|
+| `f2_inplace` | in place | yes | — | 1.0° | 3.55 N·m | 7.6 mm/s |
+| `f2_fwd05` | +0.05, +0.00, +0°/s | yes | +0.055, +0.001, -0.0 | 1.6° | 3.78 N·m | 12.5 mm/s |
+| `f2_fwd10` | +0.10, +0.00, +0°/s | yes | +0.109, +0.002, +0.0 | 3.3° | 4.85 N·m | 21.5 mm/s |
+| `f2_fwd15` | +0.15, +0.00, +0°/s | yes | +0.167, +0.002, -0.0 | 6.4° | 6.33 N·m | 38.5 mm/s |
+| `f2_fwd20` | — | **fell** | — | 45.2° | 6.66 N·m | 39.2 mm/s |
+| `f2_back10` | -0.10, +0.00, +0°/s | yes | -0.111, -0.000, +0.0 | 2.8° | 4.99 N·m | 22.9 mm/s |
+| `f2_lat05` | +0.00, +0.05, +0°/s | yes | +0.000, +0.056, +0.0 | 2.0° | 3.65 N·m | 13.4 mm/s |
+| `f2_latm05` | +0.00, -0.05, +0°/s | yes | -0.000, -0.056, -0.0 | 1.9° | 3.81 N·m | 12.8 mm/s |
+| `f2_lat08` | +0.00, +0.08, +0°/s | yes | +0.000, +0.088, +0.0 | 2.6° | 3.78 N·m | 17.3 mm/s |
+| `f2_lat10` | +0.00, +0.10, +0°/s | yes | -0.000, +0.110, +0.0 | 2.9° | 3.80 N·m | 19.7 mm/s |
+| `f2_yaw20` | +0.00, +0.00, +20°/s | yes | +0.000, -0.000, +19.7 | 1.0° | 3.83 N·m | 14.9 mm/s |
+| `f2_yawm20` | +0.00, +0.00, -20°/s | yes | -0.000, +0.000, -19.7 | 1.0° | 3.81 N·m | 15.0 mm/s |
+| `f2_yaw40` | +0.00, +0.00, +40°/s | yes | +0.003, -0.001, +39.3 | 3.9° | 5.05 N·m | 26.1 mm/s |
+| `f2_combo` | +0.10, +0.00, +20°/s | yes | +0.104, +0.002, +19.7 | 7.7° | 5.35 N·m | 26.3 mm/s |
+| `f2_diag` | +0.10, +0.05, +0°/s | yes | +0.110, +0.055, +0.0 | 3.5° | 4.85 N·m | 24.6 mm/s |
+| `f2_fwd10_wls` | +0.10, +0.00, +0°/s | yes | +0.109, +0.001, +0.0 | 3.3° | 4.87 N·m | 21.6 mm/s |
+| `f2_fwd10_fric` | +0.10, +0.00, +0°/s | yes | +0.108, +0.002, +0.0 | 3.3° | 4.95 N·m | 19.9 mm/s |
+| `f2_fwd10_mu05` | +0.10, +0.00, +0°/s | yes | +0.110, +0.001, +0.1 | 3.0° | 4.93 N·m | 22.7 mm/s |
+| `f2_fwd10_arm06` | +0.10, +0.00, +0°/s | yes | +0.107, +0.003, -0.0 | 3.7° | 4.42 N·m | 25.6 mm/s |
+| `f2_fwd10_arm06fit` | +0.10, +0.00, +0°/s | yes | +0.111, +0.000, -0.0 | 1.5° | 3.26 N·m | 19.4 mm/s |
+| `f2_lat05_arm06` | +0.00, +0.05, +0°/s | yes | +0.000, +0.058, -0.0 | 3.1° | 3.57 N·m | 16.2 mm/s |
+| `f2_lat05_arm06fit` | +0.00, +0.05, +0°/s | yes | +0.000, +0.054, -0.0 | 2.2° | 2.65 N·m | 13.6 mm/s |
+
+Against the fold's single runs (section 6.5) every case is calmer — in
+place 1.0° against 3.7°, 0.10 m/s forward 3.3° against 4.5°, sideways
+0.08 m/s 2.6° against 5.2° — and 0.15 m/s forward, which tipped in 3 of 6
+phases on the fold, stands at 6.4°; 0.10 m/s sideways, never flown on the
+shipped fold, stands at 2.9°.  0.20 m/s forward falls.  The lighter rotor with DOG5's M0 (`_arm06`), which fell once in
+three on the fold, stands here; fitted (`_arm06fit`) it is the calmest walk
+of the study (1.5°).
+
+### 7.2 Across the gait phase
+
+Six phases a case and the hardware unknowns at three (`--f2repeats`): in
+the follow-up to this commit, when the runs finish.
+
+## 8. Feasibility
 
 **In MuJoCo: yes, inside the envelope of section 6.5**, every case at every
 phase tried under 10° of tilt, peak torque 3.7–6.2 N·m against the 9 N·m clip,
@@ -494,7 +623,7 @@ on roll (the capture point about the diagonal); and the structural one, a
 horizon — cMPC plans the next stance's wrench and absorbs the foothold
 errors this law cannot.
 
-## 8. What is not modelled
+## 9. What is not modelled
 
 - **DOG6's rotor.**  The plant is DOG5's 0.0085 kg·m² a joint unless a
   scenario scales it (section 6.6).
@@ -506,17 +635,20 @@ errors this law cannot.
   which is what cMPC uses to absorb the foothold errors that this law
   cannot.
 
-## 9. Reproduce
+## 10. Reproduce
 
 ```
 V=<a python with numpy, scipy, mujoco 3.x>
-$V -m hw.balance.selftest                      372 checks, the same 2 failures as before
+$V -m hw.balance.selftest                      378 checks, the same 2 failures as before
 $V doc/walk/walksim.py                         6.5, the single runs (STANDARD)
 $V doc/walk/walksim.py --v0                    6.1
 $V doc/walk/walksim.py --sens                  6.2 (--grid, --grid2: the grids behind it)
 $V doc/walk/walksim.py --qrepeats              6.3, 6.4
 $V doc/walk/walksim.py --xrepeats              6.5, 6.6
-$V doc/walk/walksim.py fwd10 lat05             any named scenario (--list)
+$V doc/walk/walksim.py --allocs                5.1, the trots in place, QP against least squares
+$V doc/walk/walksim.py --fold2                 7.1, FOLD2 single runs
+$V doc/walk/walksim.py --f2repeats             7.2, FOLD2 six phases a case
+$V doc/walk/walksim.py fwd10 f2_lat05          any named scenario (--list)
 ```
 
 Runs write `doc/walk/data/walk_<name>.json` (metrics) and `.npz` (the

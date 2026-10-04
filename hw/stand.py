@@ -886,7 +886,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          terse: bool = False, limits: bool = True,
          rise_track: bool = False, height: float = None,
          stand_xy=None, slide_from: float = None,
-         est_xy: bool = None, alloc: str = "wls") -> int:
+         est_xy: bool = None, alloc: str = "qp") -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -936,10 +936,13 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     (2026-10-02).  It needs a gait and an `estimator` whose objects also have
     `estimate()` (`hw.trot_esti.EstimatorFeed`); with the loop on `run` is
     called with `feed`, and with `--no-est-xy` the filter only prints.
-    `alloc` is `--alloc`'s default for an entry point with a gait: "wls",
-    the least squares every trot flew, or "qp" (`law.BalanceLaw.alloc`,
-    `hw.fold_walk`'s).  A hook with `law_kwargs(args)` hands the law more
-    keyword arguments -- `hw.fold_walk`'s walk plan.
+    `alloc` is `--alloc`'s default, every entry point, every phase the SRB
+    law drives: "qp" (`hw.balance.qp`, the friction pyramid and the contact
+    box inside the problem -- the default since 2026-10-04, on request), or
+    "wls" (`allocation.allocate`, the least squares with the cone clipped on
+    afterwards, which every run flew until then).  A hook with
+    `law_kwargs(args)` hands the law more keyword arguments --
+    `hw.fold_walk`'s walk plan.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -1010,8 +1013,17 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                      help="roll only, same units as --kd-att; default follows "
                           "--kd-att")
     law.add_argument("--mu", type=float, default=BCFG.MU,
-                     help="friction coefficient the allocator PROJECTS onto; "
-                          "it bounds what is asked for, not what the floor gives")
+                     help="friction coefficient of the allocator's cone (the "
+                          "QP's pyramid, or the round cone the least squares "
+                          "projects onto); it bounds what is asked for, not "
+                          "what the floor gives")
+    law.add_argument("--alloc", choices=("qp", "wls"), default=alloc,
+                     help="the force allocator, every phase the SRB law "
+                          "drives: 'qp' (default) the friction pyramid and "
+                          "the contact box INSIDE the problem, so the wrench "
+                          "delivered is the closest the cone can make "
+                          "(hw.balance.qp); 'wls' the least squares, the cone "
+                          "clipped on afterwards (every run until 2026-10-04)")
     law.add_argument("--ablate-attitude", action="store_true",
                      help="zero both attitude gains -- the other half of the "
                           "A/B.  Height loop and gravity only; the trunk will "
@@ -1131,12 +1143,6 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           help="T steps the gait by HAND, half a cycle a "
                                "press: one diagonal lifts and lands, HOLD by "
                                "itself, and the next T swings the other one")
-        trot.add_argument("--alloc", choices=("wls", "qp"), default=alloc,
-                          help="the force allocator in the hold and the trot: "
-                               "'wls' the least squares, the cone clipped on "
-                               "afterwards (every trot until 2026-10-04); "
-                               "'qp' the cone inside the problem "
-                               "(hw.balance.qp)")
         if step_to is not None:
             trot.add_argument("--step-period", type=float,
                               default=(gait.period if step_period is None
@@ -1413,8 +1419,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               **({} if not slide else dict(
                                   stand_xy=np.asarray(stand_xy, float),
                                   slide_from_h=slide_from)),
-                              **({} if gait is None else dict(
-                                  alloc=args.alloc)),
+                              alloc=args.alloc,
                               **({} if hook is None
                                  or not hasattr(hook, "law_kwargs")
                                  else hook.law_kwargs(args)),
@@ -1600,9 +1605,13 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   "on four feet (%.1f Hz on %.1f kg), half that on a diagonal"
                   % (args.kp_stance_xy, args.kd_stance_xy, 4 * args.kp_stance_xy,
                      np.sqrt(4 * args.kp_stance_xy / BCFG.MASS) / (2 * np.pi), BCFG.MASS))
-        print("       mu %.2f, leg gravity %d leg%s/sweep"
+        print("       mu %.2f, leg gravity %d leg%s/sweep, allocator %s"
               % (args.mu, args.gravity_legs,
-                 "" if args.gravity_legs == 1 else "s"))
+                 "" if args.gravity_legs == 1 else "s",
+                 "QP -- the pyramid and the contact box inside the problem"
+                 if args.alloc == "qp" else
+                 "WLS -- the least squares, the cone clipped on afterwards "
+                 "(--alloc qp is the default)"))
         print("       SRB PINNED at the %s stance, %.0f mm hold: %s"
               % (crouch.name, args.height, srb.describe()))
         if args.ablate_attitude:

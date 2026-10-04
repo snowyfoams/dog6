@@ -20,7 +20,11 @@ WHAT IT CHANGES, AND WHAT IT DOES NOT
     ramping out, a diagonal pair asked for a moment about its own line, a
     push that puts a foot on the cone.
 
-    THE COST OF ENFORCING THE CONE HARD, MEASURED ON DOG5 (allocation.py's
+    THE DEFAULT SINCE 2026-10-04 (`law.BalanceLaw.alloc`, `hw.stand --alloc`),
+    on request, for the robot: the cone is a constraint here, where the least
+    squares meets the wrench first and clips after.  `--alloc wls` keeps it.
+
+THE COST OF ENFORCING THE CONE HARD, MEASURED ON DOG5 (allocation.py's
     docstring): the QP's torque peaks were p95 2.73 against 1.61 N*m for
     the min-norm allocator in the same trot stance -- a QP that must meet
     the wrench pushes forces onto the cone's faces.  The S weights are the
@@ -33,12 +37,15 @@ THE SOLVER: A DENSE PRIMAL ACTIVE SET, NOT OSQP
     problem is tiny -- at most 12 variables, 6 rows a foot -- and on most
     sweeps no face is touched at all: the unconstrained optimum, one 12x12
     solve, IS the answer, and that is checked first (faster than the least
-    squares, ~65 against ~100 us on the same machine).  When a face is
+    squares, ~80 against ~120 us on the same machine).  When a face is
     touched, a primal active set starts from the unconstrained optimum
     PROJECTED into the cone, with the clipped rows as its working set, and
-    takes a few 24x24 solves.  Every iterate stays feasible, so the cap
-    (`config.QP_MAX_ITER`) returns a force the cone allows even if it stops
-    early -- it can be suboptimal, never infeasible.
+    takes a few 24x24 solves, ~70 us an iteration -- numpy's per-call cost,
+    not the solve: a Schur-complement step (an m x m solve, H inverted once)
+    was tried, gave the same iterates to 1e-9 N and saved nothing.  Every
+    iterate stays feasible and none is worse than the one before, so the cap
+    (`config.QP_MAX_ITER`, 20: ~1.5 ms) returns a force the cone allows even
+    if it stops early -- suboptimal, never infeasible.
 
     Nocedal & Wright, Numerical Optimization, 2nd ed., Alg. 16.3.
 

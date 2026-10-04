@@ -659,10 +659,14 @@ QP_S = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 QP_ALPHA = 1.0e-4
 QP_BETA = 0.0
 #: Active-set iterations a sweep may take; the cap returns the last FEASIBLE
-#: iterate.  Most sweeps take none (no face touched: the unconstrained
-#: optimum is the answer); the slowest of a MuJoCo walk took 13, and 400
-#: random wrenches in `selftest` 23.
-QP_MAX_ITER = 30
+#: iterate -- inside the cone, and no worse than the projected start (the
+#: least squares' clip, in effect), since every step descends.  THE CAP IS
+#: THE WORST-CASE TIME, now that the QP is every entry point's allocator:
+#: ~110 us + ~70 us an iteration on the development VM (the fast path, no
+#: face touched, 80 us against the least squares' 120), so 20 is ~1.5 ms.
+#: No MuJoCo walk of the shipped configuration that stood needed more than
+#: 20 in a sweep (most 4-7); 30 until 2026-10-04.
+QP_MAX_ITER = 20
 
 
 def describe() -> str:

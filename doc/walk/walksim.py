@@ -64,6 +64,7 @@ sys.path.insert(0, os.path.join(REPO, "doc", "crouch_trot"))
 import hwsim as H                    # noqa: E402
 from sim import coordinates as C, params as P   # noqa: E402
 from hw import fold_stand as FS, fold_trot as FT, trot as TR, imu as IMU  # noqa: E402
+from hw import fold2_trot as F2       # noqa: E402
 from hw.balance import config as BCFG, posture as POSE, controller as BCTRL  # noqa: E402
 from hw.balance import swing as BSWING  # noqa: E402
 from hw.balance.trajectory import Command, WalkReference   # noqa: E402
@@ -319,6 +320,99 @@ for _vname, (_vopts, _vcases, _n) in _XVARIANTS.items():
                 t_cmd=1.5 + 0.6 * _seed / _n, **_XCASES[_case], **_vopts)
 XREPEATS = [k for k in SCENARIOS if k.startswith("x_")]
 
+# ===========================================================================
+# THE QP AS EVERY ENTRY POINT'S ALLOCATOR (2026-10-04), and FOLD2's walk
+# ===========================================================================
+F2O = dict(posture="fold2")
+#: The trot entry points in place, as flown (the least squares) and as they
+#: now ship (the QP): hw.fold_trot (no prefix) and hw.fold2_trot (f2_),
+#: then pushed sideways 0.2 s, 3 s into the trot, and with the hardware
+#: unknowns.  `--allocs`.
+FLOWN = dict(walk=False, duty=0.8, settle=SETTLE_TROT)
+for _pre, _po in (("", {}), ("f2_", F2O)):
+    for _alloc in ("wls", "qp"):
+        _o = dict(FLOWN, alloc=_alloc, **_po)
+        SCENARIOS["%sflown_%s" % (_pre, _alloc)] = dict(
+            schedule=INPLACE, trot_s=8.0, opts=_o)
+        for _f in (5, 10):
+            SCENARIOS["%sflown_%s_push%d" % (_pre, _alloc, _f)] = dict(
+                schedule=INPLACE, trot_s=8.0, opts=_o,
+                push=("trot", 3.0, 0.2, (0.0, float(_f), 0.0)))
+        SCENARIOS["%sflown_%s_fric" % (_pre, _alloc)] = dict(
+            schedule=INPLACE, trot_s=8.0,
+            opts=dict(_o, frictionloss=0.1, imu_ms=15.0))
+        SCENARIOS["%sflown_%s_mu05" % (_pre, _alloc)] = dict(
+            schedule=INPLACE, trot_s=8.0, opts=dict(_o, friction=0.5))
+ALLOCS = [k for k in SCENARIOS if k.startswith(("flown_", "f2_flown_"))]
+
+#: FOLD2 WALKING, `hw.fold2_walk` as shipped: the fold's walk on the knees-
+#: out stance (same swing law, clock, keys).  Single runs at phase 0
+#: (`--fold2`), then six phases a case and the hardware unknowns at three
+#: (`--f2repeats`), with 0.15 / 0.20 m/s and 0.10 sideways to find where it
+#: stops.
+SCENARIOS.update({
+    "f2_inplace": dict(schedule=INPLACE, trot_s=8.0, opts=dict(F2O)),
+    "f2_fwd05":  _walk(vx=0.05, **F2O),
+    "f2_fwd10":  _walk(vx=0.10, **F2O),
+    "f2_fwd15":  _walk(vx=0.15, **F2O),
+    "f2_fwd20":  _walk(vx=0.20, **F2O),
+    "f2_back10": _walk(vx=-0.10, **F2O),
+    "f2_lat05":  _walk(vy=0.05, **F2O),
+    "f2_latm05": _walk(vy=-0.05, **F2O),
+    "f2_lat08":  _walk(vy=0.08, **F2O),
+    "f2_lat10":  _walk(vy=0.10, **F2O),
+    "f2_yaw20":  _walk(r=20.0, **F2O),
+    "f2_yawm20": _walk(r=-20.0, **F2O),
+    "f2_yaw40":  _walk(r=40.0, **F2O),
+    "f2_combo":  _walk(vx=0.10, r=20.0, **F2O),
+    "f2_diag":   _walk(vx=0.10, vy=0.05, **F2O),
+    "f2_fwd10_wls":  _walk(vx=0.10, alloc="wls", **F2O),
+    "f2_fwd10_fric": _walk(vx=0.10, frictionloss=0.1, imu_ms=15.0, **F2O),
+    "f2_fwd10_mu05": _walk(vx=0.10, friction=0.5, **F2O),
+    "f2_fwd10_arm06": _walk(vx=0.10, armature_scale=0.6, **F2O),
+    "f2_fwd10_arm06fit": _walk(vx=0.10, armature_scale=0.6,
+                               ff_armature=_ARM, **F2O),
+    "f2_lat05_arm06": _walk(vy=0.05, armature_scale=0.6, **F2O),
+    "f2_lat05_arm06fit": _walk(vy=0.05, armature_scale=0.6,
+                               ff_armature=_ARM, **F2O),
+})
+F2STANDARD = [k for k in SCENARIOS if k.startswith("f2_")
+              and not k.startswith("f2_flown")]
+_YCASES = dict(_XCASES, fwd15=dict(vx=0.15), fwd20=dict(vx=0.20),
+               lat10=dict(vy=0.10))
+_YVARIANTS = {
+    "f2ship": ({}, ("inplace", "fwd05", "fwd10", "fwd15", "fwd20", "back10",
+                    "lat05", "latm05", "lat08", "lat10", "yaw20", "yawm20",
+                    "yaw40", "combo"), 6),
+    "f2fric": (dict(frictionloss=0.1, imu_ms=15.0),
+               ("fwd10", "lat05", "yaw20"), 3),
+    "f2mu05": (dict(friction=0.5), ("fwd10", "lat05", "yaw20"), 3),
+    "f2arm06": (dict(armature_scale=0.6),
+                ("inplace", "fwd10", "lat05", "yaw20"), 3),
+    "f2arm06fit": (dict(armature_scale=0.6, ff_armature=_ARM),
+                   ("inplace", "fwd10", "lat05", "yaw20"), 3)}
+for _vname, (_vopts, _vcases, _n) in _YVARIANTS.items():
+    for _case in _vcases:
+        for _seed in range(_n):
+            SCENARIOS["y_%s_%s_%d" % (_vname, _case, _seed)] = _walk(
+                t_cmd=1.5 + 0.6 * _seed / _n, **_YCASES[_case], **_vopts,
+                **F2O)
+F2REPEATS = [k for k in SCENARIOS if k.startswith("y_")]
+
+
+#: The two fold stances as their trot entry points hand them to `hw.stand`:
+#: FOLD with the slanted rise (hw.fold_trot), FOLD2 straight up, its stand's
+#: feet the crouch's (hw.fold2_trot).  Same hold, clock and apex.
+POSTURES = {
+    "fold": dict(walk="hw.fold_walk", trot="hw.fold_trot", crouch=POSE.FOLD,
+                 height=FT.HEIGHT, stand_xy=FT.STAND_XY,
+                 slide_from=FT.SLIDE_FROM_H, period=FT.PERIOD_S,
+                 apex=FT.SWING_HEIGHT),
+    "fold2": dict(walk="hw.fold2_walk", trot="hw.fold2_trot",
+                  crouch=POSE.FOLD2, height=F2.HEIGHT, stand_xy=None,
+                  slide_from=None, period=F2.PERIOD_S, apex=F2.SWING_HEIGHT),
+}
+
 
 def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
           settle: float | None = BCFG.WALK_SETTLE_S,
@@ -327,12 +421,15 @@ def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
           period: float | None = None, duty: float | None = BCFG.WALK_DUTY,
           swing_height: float | None = None,
           tau_slew: float | None = None, zeta_swing: float | None = None,
-          ff_scale: float | None = None, ff_armature: float | None = None):
-    """(`hwsim.Entry`, WalkPlan or None) -- `hw.fold_walk` as `hw.stand.main`
-    builds it at its defaults: `hw.fold_trot`'s stand and trot, the walk
-    plan, the allocator, the estimator's x/y loop on."""
-    o = TR.trot_options(FT.PERIOD_S)
-    srb = POSE.FOLD.srb_at(FT.HEIGHT, FT.STAND_XY)
+          ff_scale: float | None = None, ff_armature: float | None = None,
+          posture: str = "fold"):
+    """(`hwsim.Entry`, WalkPlan or None) -- `hw.fold_walk` (or, `posture`
+    "fold2", `hw.fold2_walk`) as `hw.stand.main` builds it at its defaults:
+    the trot entry point's stand and trot, the walk plan, the allocator, the
+    estimator's x/y loop on.  `walk` False is the trot entry point itself."""
+    pz = POSTURES[posture]
+    o = TR.trot_options(pz["period"])
+    srb = pz["crouch"].srb_at(pz["height"], pz["stand_xy"])
     wide = (np.full(C.N_JOINTS, -1e9), np.full(C.N_JOINTS, 1e9))   # --no-limits
     gains = BCTRL.BalanceGains()
     gains.kp_att[0], gains.kd_att[0] = FS.ROLL_GAINS
@@ -360,7 +457,9 @@ def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
         gait_kw["duty"] = duty
         gait_kw["ramp"] = min(BCFG.CONTACT_RAMP,
                               0.9 * (duty - 0.5) / (2.0 * duty))
-    e = H.Entry("hw.fold_walk" if walk else "hw.fold_trot", POSE.FOLD,
+    slanted = ({} if pz["stand_xy"] is None else
+               dict(stand_xy=pz["stand_xy"], slide_from_h=pz["slide_from"]))
+    e = H.Entry(pz["walk"] if walk else pz["trot"], pz["crouch"],
                 o["tau_cap"], tau_ceiling=o["tau_ceiling"],
                 tau_slew=o["tau_slew"] if tau_slew is None else tau_slew,
                 overspeed_trip=o["overspeed_trip"],
@@ -370,12 +469,12 @@ def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
                 gait_period=o["gait"].period if period is None else period,
                 limits=wide,
                 gait_kw=gait_kw,
-                law_kw=dict(gains=gains, h_lift=FT.HEIGHT, srb=srb,
+                law_kw=dict(gains=gains, h_lift=pz["height"], srb=srb,
                             residual_trip=False, rise_track=True,
-                            stand_xy=FT.STAND_XY, slide_from_h=FT.SLIDE_FROM_H,
+                            **slanted,
                             kp_joint=BCFG.KP_JOINT_HOLD,
                             kd_joint=BCFG.KD_JOINT_HOLD,
-                            swing_height=(FT.SWING_HEIGHT if swing_height is None
+                            swing_height=(pz["apex"] if swing_height is None
                                           else swing_height),
                             kp_swing=BCFG.KP_SWING, kd_swing=BCFG.KD_SWING,
                             est_xy=True, alloc=alloc, walk=plan))
@@ -385,7 +484,10 @@ def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
 class Driver:
     """`hw.stand.run`'s ESTIMATOR_SLOT and the operator's keys, per sweep."""
 
-    def __init__(self, sim, schedule):
+    def __init__(self, sim, schedule, push=None, pushes=None):
+        #: (phase, t_after, duration_s, (fx, fy, fz)) or None; `pushes` is the
+        #: list `HwSim.run` reads every step -- appended once the phase starts.
+        self.push, self.pushes = push, pushes
         self.feed = EstimatorFeed(None)
         m = sim.model
         self.acc_adr = m.sensor_adr[m.sensor("imu_acc").id]
@@ -405,6 +507,10 @@ class Driver:
         return Command(vx=cmd[0], vy=cmd[1], yaw_rate=math.radians(cmd[2]))
 
     def __call__(self, sim, now, stand, body):
+        if self.push is not None and stand.phase_name == self.push[0]:
+            _, t_after, dur, force = self.push
+            self.pushes.append((now + t_after, now + t_after + dur, force))
+            self.push = None
         if self.pending is not None:
             stand.feed_estimate(self.pending)
         if now >= self.next_acc - 1e-12:              # the 0x40 stream, 100 Hz
@@ -456,11 +562,14 @@ def run(name: str) -> dict:
     e, plan = entry(**opts)
     sim = H.HwSim(e, H.HwParams(**hwkw))
     sim.place(e.crouch.q, e.crouch.z_origin)
-    drv = Driver(sim, sc["schedule"])
+    # A never-active first entry: `HwSim.run` keeps THIS list only if it is
+    # not empty, and the Driver appends the scenario's push to it.
+    pushes = [(-1.0, -1.0, (0.0, 0.0, 0.0))]
+    drv = Driver(sim, sc["schedule"], push=sc.get("push"), pushes=pushes)
     op = H.Operator(hold_s=T_HOLD, trot_s=sc["trot_s"], park=False,
                     hold_after_s=1.5)
     res = sim.run(op, t_max=3.0 + 1.0 + 3.0 + T_HOLD + sc["trot_s"] + 3.0,
-                  quiet=True, pre_update=drv)
+                  push=pushes, quiet=True, pre_update=drv)
     out = metrics(name, res, drv, sim)
     out["wall_s"] = round(time.time() - t0, 1)
     os.makedirs(DATA, exist_ok=True)
@@ -586,6 +695,11 @@ def main(argv) -> int:
                  REPEATS if "--repeats" in argv else
                  QREPEATS if "--qrepeats" in argv else
                  XREPEATS if "--xrepeats" in argv else
+                 ALLOCS if "--allocs" in argv else
+                 F2STANDARD if "--fold2" in argv else
+                 F2REPEATS if "--f2repeats" in argv else
+                 (ALLOCS + F2STANDARD + F2REPEATS) if "--fold2all" in argv
+                 else
                  (XREPEATS + V0SET + STANDARD) if "--final" in argv
                  else
                  V0SET if "--v0" in argv else
@@ -594,7 +708,7 @@ def main(argv) -> int:
     with Pool(min(4, len(names))) as pool:
         results = pool.map(run, names)
     print(table(results))
-    if all(r["name"][:2] in ("r_", "q_", "x_") for r in results):
+    if all(r["name"][:2] in ("r_", "q_", "x_", "y_") for r in results):
         print()
         print(repeat_table(results))
     print("wall %.0f s" % (time.time() - t0))

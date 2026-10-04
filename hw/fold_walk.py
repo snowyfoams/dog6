@@ -16,8 +16,8 @@ estimator closing x/y, the joint layer -- with five things on top
     footstep.py        eq (33) + feedback, the arc in the world
     swing_control.py   the swing leg: task-space computed torque (`--swing-law
                        osc`, the default) or the Cartesian impedance
-    qp.py              the QP allocator, the default here (--alloc wls is the
-                       flown least squares)
+    qp.py              the QP allocator -- every entry point's default since
+                       2026-10-04 (--alloc wls is the least squares)
 
 and walk.py tying them to ONE reference: the x/y rows, the heading, the joint
 layer's targets and the footholds are all computed from the same sample.
@@ -74,7 +74,7 @@ from .balance.keys import WalkKeys   # noqa: E402
 from .balance.trajectory import WalkReference   # noqa: E402
 from .balance.walk import WalkPlan   # noqa: E402
 
-__all__ = ["main", "WalkHook", "walk_options"]
+__all__ = ["main", "WalkHook", "walk_options", "walking"]
 
 
 class WalkHook:
@@ -217,12 +217,14 @@ class WalkHook:
         return line
 
 
-def walk_options() -> dict:
-    """`hw.fold_trot`'s options, the walking hook, the QP -- and the walk's
-    own clock: `hw.fold_trot`'s 0.6 s at `config.WALK_DUTY`, the contact
-    ramp fitted to its four-foot window (`--period`, `--duty`,
-    `--contact-ramp`, `--settle` still override)."""
-    opts = FT.stand_options()
+def walking(trot_options: dict) -> dict:
+    """A trot entry point's `hw.stand.main` options, made a WALK: the
+    walking hook, the QP, and the walk's own clock -- the trot's period at
+    `config.WALK_DUTY`, the contact ramp fitted to its four-foot window, no
+    settle (`--period`, `--duty`, `--contact-ramp`, `--settle` still
+    override).  `hw.fold_walk` is this over `hw.fold_trot`, `hw.fold2_walk`
+    over `hw.fold2_trot`."""
+    opts = dict(trot_options)
     clock = opts["gait"]
     opts["gait"] = GAIT.TrotGait(period=clock.period, duty=BCFG.WALK_DUTY,
                                  offsets=clock.offsets,
@@ -230,6 +232,11 @@ def walk_options() -> dict:
                                  settle_s=BCFG.WALK_SETTLE_S,
                                  settle_every=clock.settle_every)
     return dict(opts, hook=WalkHook(), alloc="qp")
+
+
+def walk_options() -> dict:
+    """`hw.fold_trot`'s options, walking (`walking`)."""
+    return walking(FT.stand_options())
 
 
 def main(argv=None) -> int:

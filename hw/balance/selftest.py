@@ -1197,10 +1197,11 @@ def main() -> int:
           [default.kp_att[1], default.kd_att[1], default.kp_att[2],
            default.kd_att[2]], 0.0, "")
 
-    def _roll_push(gains):
+    def _roll_push(gains, alloc="qp"):
         """The REAL law in the fold stance, rolled 5.6 deg -> commanded Mx."""
         law = LAW.BalanceLaw(gains=gains, foot_xy=POSE.FOLD.foot_xy,
-                             dynamic_setpoint=False, srb=POSE.FOLD.srb)
+                             dynamic_setpoint=False, srb=POSE.FOLD.srb,
+                             alloc=alloc)
         at = lambda R=None: state_at(cfg.H_LIFT, R=R, foot_xy=POSE.FOLD.foot_xy,
                                      q_seed=POSE.FOLD.q, srb=POSE.FOLD.srb)
         law.arm(0.0, at())
@@ -1212,14 +1213,21 @@ def main() -> int:
           stiff.wrench.b_d[3] < 2.5 * weak.wrench.b_d[3] < 0.0,
           "Mx %+.3f -> %+.3f N*m (the run logged -0.14 with the old gains)"
           % (weak.wrench.b_d[3], stiff.wrench.b_d[3]))
-    # The residual is NOT zero and is not meant to be: LAMBDA's Tikhonov
-    # damping leaves ~1e-4 N*m at any gain.  What matters is that it stays at
-    # that floor rather than growing with the bigger ask.
-    check("...and the allocator delivers it -- no trip, residual at the "
-          "lambda floor",
-          stiff.trip is None and stiff.allocation.residual_moment < 1e-3,
-          "%.1e N*m (sustained trip %.2f); fz %s N"
-          % (stiff.allocation.residual_moment, cfg.RESIDUAL_MOMENT_NM,
+    # The residual is NOT zero and is not meant to be: each allocator's own
+    # regularisation leaves a floor -- the QP's alpha (the default, 1e-4: the
+    # soft cone, ~1 % of the ask) and the least squares' LAMBDA (Tikhonov,
+    # ~1e-4 N*m at any gain).  What matters is that it stays at that floor,
+    # two orders under the sustained trip, rather than growing past it.
+    stiff_wls = _roll_push(rolled, alloc="wls")
+    check("...and the allocator delivers it -- no trip; the QP within 2 % of "
+          "the ask (alpha), the least squares at the lambda floor",
+          stiff.trip is None and stiff_wls.trip is None
+          and stiff.allocation.residual_moment
+          < 0.02 * abs(stiff.wrench.b_d[3])
+          and stiff_wls.allocation.residual_moment < 1e-3,
+          "QP %.1e, WLS %.1e N*m (sustained trip %.2f); fz %s N"
+          % (stiff.allocation.residual_moment,
+             stiff_wls.allocation.residual_moment, cfg.RESIDUAL_MOMENT_NM,
              np.array2string(stiff.allocation.fz, precision=1)))
     stiff_lift = LAW.BalanceLaw(gains=rolled, foot_xy=POSE.FOLD.foot_xy,
                                 dynamic_setpoint=False, srb=POSE.FOLD.srb)
@@ -2382,6 +2390,12 @@ def main() -> int:
           0.10 * WTRAJ.DT_MAX, 1e-15, " m")
 
     # -- qp.py: the cone inside the problem ---------------------------------
+    plain = LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb)
+    check("QP is the law's DEFAULT allocator (2026-10-04, on request): the "
+          "cone inside the problem; alloc='wls' keeps the least squares",
+          plain.alloc == "qp" and isinstance(plain.qp, WQP.QpAllocator)
+          and LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb,
+                             alloc="wls").qp is None)
     qpa = WQP.QpAllocator()
     trim = np.array([0.0, 0.0, cfg.WEIGHT, 0.3, -0.2, 0.05])
     a_q = qpa.allocate(at_fold.r_w, trim)
@@ -2418,7 +2432,9 @@ def main() -> int:
     # non-negative combination of the working rows -- KKT, which for a
     # convex QP is optimality.
     stat_w = lam_w = viol_w = 0.0
+    qpa = WQP.QpAllocator(max_iter=60)       # the solver, not the sweep's cap
     capped0 = qpa.capped
+    hardest = None
     for k in range(400):
         r_k = at_fold.r_w + rng.normal(0.0, 0.01, (4, 3))
         b_k = (np.array([0.0, 0.0, cfg.WEIGHT, 0.0, 0.0, 0.0])
@@ -2440,12 +2456,37 @@ def main() -> int:
             lam_w = min(lam_w, float(lam.min()))
         stat_w = max(stat_w, float(np.abs(grad).max()))
         viol_w = max(viol_w, float((Cm @ x - dvec).max()))
+        if hardest is None or qpa.last_iter > hardest[0]:
+            hardest = (qpa.last_iter, r_k, b_k, c_k)
     check("...KKT on 400 random wrenches, stances and ramps: stationary, "
-          "multipliers >= 0, feasible, never capped",
+          "multipliers >= 0, feasible, converged",
           stat_w < 1e-6 and lam_w > -1e-6 and viol_w <= 1e-9
           and qpa.capped == capped0,
           "stationarity %.1e, min lambda %.1e, violation %.1e, worst %d it"
           % (stat_w, lam_w, viol_w, qpa.iter_max_seen))
+    # THE CAP (config.QP_MAX_ITER) IS THE SWEEP'S WORST-CASE TIME: stopped
+    # early on the hardest of those, the force is still inside the cone and
+    # no worse than where the active set started -- every step descends.
+    _, r_h, b_h, c_h = hardest
+    w_h = np.ones(4) if c_h is None else c_h
+    legs_h = np.flatnonzero(w_h >= WQP.W_PLANTED_MIN)
+    H, g, _A, Cm, dvec, lo_h, hi_h = qpa._build(r_h, b_h, legs_h, w_h)
+    start = WQP.project_feasible(np.linalg.solve(H, -g).reshape(-1, 3), lo_h,
+                                 hi_h, cfg.MU).reshape(-1)
+    short = WQP.QpAllocator(max_iter=2)
+    x_s = short.allocate(r_h, b_h, contact=c_h).f_w[legs_h].reshape(-1)
+
+    def _obj(x):
+        return 0.5 * x @ H @ x + g @ x
+    check("...and a solve stopped at its cap is still inside the cone, and "
+          "no worse than its projected start",
+          not short.last_converged and short.capped == 1
+          and float((Cm @ x_s - dvec).max()) <= 1e-9
+          and _obj(x_s) <= _obj(start) + 1e-12,
+          "the %d-iteration case stopped at 2: cost %.4f against %.4f at the "
+          "start, cap in the robot's sweeps %d" % (hardest[0], _obj(x_s),
+                                                   _obj(start),
+                                                   cfg.QP_MAX_ITER))
 
     # -- footstep.py: eq (33), the arc in the world -------------------------
     sites = SWING.rest_feet_b(cfg.H_LIFT, fold.foot_xy)[:, :2]
@@ -2724,6 +2765,51 @@ def main() -> int:
           and built.zeta_swing == cfg.ZETA_SWING_OSC
           and built.reference.vx_max == cfg.WALK_VX_MAX,
           "wn %s rad/s" % np.array2string(built.wn_swing, precision=0))
+    # hw.fold2_walk: the same walk over hw.fold2_trot (fold_walk.walking).
+    from .. import fold2_trot as F2T
+    from .. import fold2_walk as F2W
+    t2 = F2T.stand_options()
+    o2 = FW.walking(t2)
+    c2 = o2["gait"]
+    check("hw.fold2_walk: hw.fold2_trot's stand -- FOLD2, its straight rise, "
+          "its hold -- walking: the hook, the QP, the walk's clock",
+          o2["crouch"] is POSE.FOLD2 and "stand_xy" not in o2
+          and o2["height"] == F2T.HEIGHT == t2["height"]
+          and isinstance(o2["hook"], FW.WalkHook) and o2["alloc"] == "qp"
+          and c2.period == t2["gait"].period and c2.duty == cfg.WALK_DUTY
+          and c2.ramp == cfg.WALK_CONTACT_RAMP
+          and c2.settle_s == cfg.WALK_SETTLE_S,
+          "%.2f s, duty %.2f, settle %.1f s" % (c2.period, c2.duty,
+                                                c2.settle_s))
+    check("...walking() leaves the trot entry point's own options alone (a "
+          "fresh gait; the trot's clock untouched), and hw.fold2_walk is it",
+          t2["gait"].duty == cfg.DUTY and t2["gait"].settle_s == cfg.SETTLE_S
+          and "hook" not in t2 and "alloc" not in t2
+          and c2 is not t2["gait"]
+          and F2W.walk_options()["crouch"] is POSE.FOLD2)
+    f2 = POSE.FOLD2
+    at_f2 = state_at(F2T.HEIGHT, foot_xy=f2.foot_xy, q_seed=f2.q,
+                     srb=f2.srb_at(F2T.HEIGHT))
+    lw2 = LAW.BalanceLaw(gains=_xy_gains(), foot_xy=f2.foot_xy.copy(),
+                         dynamic_setpoint=False, srb=f2.srb_at(F2T.HEIGHT),
+                         h_lift=F2T.HEIGHT, track_stop_deg=0.0, est_xy=True,
+                         kp_joint=cfg.KP_JOINT_HOLD,
+                         kd_joint=cfg.KD_JOINT_HOLD,
+                         walk=WWALK.WalkPlan())
+    lw2.arm(0.0, at_f2)
+    lw2.ramp = REF.Quintic.ramp(F2T.HEIGHT, F2T.HEIGHT, 1.0)
+    lw2.hold_joints(at_f2.q)
+    tg2b = GAIT.TrotGait()
+    tg2b.reset(1.0)
+    lw2.feed_estimate(_est(0.996))
+    o_f2 = lw2.update(1.0, at_f2, gait=tg2b, xy_hold=True)
+    q_f2e, _ = lw2.walk.hold_targets(lw2, at_f2, o_f2.ref)
+    close("...FOLD2 engages bumplessly too: the stance targets ARE its q_hold "
+          "on the first trot sweep", q_f2e, C.unflat(lw2.q_hold), 1e-9,
+          " rad")
+    close("...and its footholds are placed about FOLD2's OWN sites, trunk x "
+          "+-219.5 mm", np.abs(lw2.walk.sites_b),
+          np.tile([0.2195, 0.065], (4, 1)), 5e-4, " m")
 
     # =====================================================================
     print("\n" + "=" * 78)

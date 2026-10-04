@@ -432,12 +432,15 @@ class BalanceLaw:
     est_acc_max_age_s: float = cfg.EST_ACC_MAX_AGE_S
     #: m/s^2, the authority clamp on the x/y rows (`controller.balance_wrench`).
     xy_acc_max: float = cfg.XY_ACC_MAX
-    #: THE FORCE ALLOCATOR, 2026-10-04.  "wls" is `allocation.allocate`, the
-    #: least squares every entry point flew until now; "qp" is
-    #: `qp.QpAllocator`, the cone and the contact ramp's box inside the
-    #: problem instead of clipped on afterwards (`--alloc`; `hw.fold_walk`'s
-    #: default).  qp.py says where the two differ and where they cannot.
-    alloc: str = "wls"
+    #: THE FORCE ALLOCATOR.  "qp" is `qp.QpAllocator`: the friction pyramid
+    #: and the contact ramp's box INSIDE the problem, so the wrench delivered
+    #: is the closest one the cone can make -- the default since 2026-10-04,
+    #: on request, for the robot.  "wls" is `allocation.allocate`, the
+    #: least squares every run flew until then: it meets the wrench and THEN
+    #: clips each foot into the cone and rescales, so where the cone binds
+    #: the wrench delivered is whatever the clip left (`--alloc wls`).
+    #: qp.py says where the two differ and where they cannot.
+    alloc: str = "qp"
     #: WALKING, 2026-10-04: a `walk.WalkPlan`, or None -- every entry point
     #: but `hw.fold_walk`, for which nothing below changes.  Attached, it
     #: engages on the first trot sweep and from then on owns the x/y rows'
