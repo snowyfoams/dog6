@@ -83,10 +83,10 @@ def inertial_feedforward(leg: int, q, jac, v_ref, a_ref,
                else np.asarray(inertia, dtype=float))
     q = np.asarray(q, dtype=float)
     jac = np.asarray(jac, dtype=float)
-    qd_ref = np.linalg.solve(jac, np.asarray(v_ref, dtype=float))
+    qd_ref = SWING.solve_jacobian(jac, np.asarray(v_ref, dtype=float))
     jdot_qd = (HK.foot_jacobian(leg, q + qd_ref * _JDOT_EPS) - jac) @ qd_ref
     jdot_qd /= _JDOT_EPS
-    qdd_ref = np.linalg.solve(jac, np.asarray(a_ref, dtype=float) - jdot_qd)
+    qdd_ref = SWING.solve_jacobian(jac, np.asarray(a_ref, dtype=float) - jdot_qd)
     return inertia @ qdd_ref
 
 
@@ -123,7 +123,7 @@ def swing_osc_torque(state, leg: int, ref, wn=None, zeta=None, inertia=None):
     a_fb = (wn * wn * (np.asarray(ref.p, dtype=float) - state.x_b[leg])
             + 2.0 * zeta * wn * (np.asarray(ref.v, dtype=float) - v))
     # One factorisation for both: J^-1 [a_ff  a_fb].
-    qdd = np.linalg.solve(jac, np.column_stack((a_ff, a_fb)))
+    qdd = SWING.solve_jacobian(jac, np.column_stack((a_ff, a_fb)))
     tau_ff = inertia @ qdd[:, 0]
     tau = tau_ff + inertia @ qdd[:, 1]
     return tau, tau_ff

@@ -2816,6 +2816,27 @@ def main() -> int:
         for i in range(C.N_LEGS))
     close("...a reference 80 mm off pulls each leg's target only "
           "HOLD_XY_ERR_MAX away", reach, cfg.HOLD_XY_ERR_MAX, 1e-9, " m")
+    # A SINGULAR LEG MUST NOT RAISE, 2026-10-05: a fall mid-walk straightened
+    # a planted leg in MuJoCo and `np.linalg.solve` raised out of the law --
+    # on the robot `hw.stand.run` ends on any exception and drops it limp.
+    sing = np.array([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [0.0, 0.0, 1.0]])
+    x_s = SWING.solve_jacobian(sing, np.array([1.0, 2.0, 3.0]))
+    check("swing.solve_jacobian: a singular matrix gets the least-squares "
+          "answer, not LinAlgError", np.all(np.isfinite(x_s))
+          and np.allclose(sing @ x_s, [1.0, 2.0, 3.0], atol=1e-9))
+    q_s = q_m.copy()
+    knees = np.linspace(-np.pi, np.pi, 3601)
+    dets = [abs(np.linalg.det(HK.foot_jacobian(0, [q_m[0, 0], q_m[0, 1], k])))
+            for k in knees]
+    q_s[0, 2] = knees[int(np.argmin(dets))]          # FL straight: det ~ 0
+    st_s = STATE.read(C.flat(q_s), np.zeros(C.N_JOINTS), o_m, srb=fold.srb)
+    try:
+        q_ts, qd_ts = wp.hold_targets(wl, st_s, ref_m)
+        ok_s = bool(np.all(np.isfinite(q_ts)) and np.all(np.isfinite(qd_ts)))
+    except np.linalg.LinAlgError:
+        ok_s = False
+    check("...and hold_targets on a planted leg at its singular pose "
+          "(|det J| %.1e) returns finite targets" % min(dets), ok_s)
     before = wp.anchor_w.copy()
     wp._planted = both.copy()
     est_td = _est(1.0, p=[0.05, 0.02, 0.2])

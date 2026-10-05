@@ -312,7 +312,7 @@ class WalkPlan:
             q_t[i] = HK.leg_ik(int(i), np.array([tx - hip[0], ty - hip[1],
                                                  z - hip[2]]),
                                q_seed=q4[i])
-            qd_t[i] = np.linalg.solve(state.jac[i], xd_t)
+            qd_t[i] = SWING.solve_jacobian(state.jac[i], xd_t)
         return q_t, qd_t
 
     def swing_ref(self, leg: int, s: float, law, state, ref, est):

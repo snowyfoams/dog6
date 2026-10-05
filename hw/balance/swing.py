@@ -205,6 +205,7 @@ from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
 
 __all__ = ["rest_feet_b", "swing_reference", "swing_reference_pva",
+           "solve_jacobian",
            "leg_gains", "swing_torque", "swing_feedforward",
            "feedforward_inertia",
            "joint_swing_reference", "joint_swing_torque", "swing_demand",
@@ -215,6 +216,20 @@ __all__ = ["rest_feet_b", "swing_reference", "swing_reference_pva",
 #: joint`, the fold trot's until 2026-09-28), or the knee alone (`--swing
 #: knee`, 2026-10-02, for `hw.fold2_trot`).
 SWING_MODES = ("cartesian", "joint", "knee")
+
+
+def solve_jacobian(a, b):
+    """`np.linalg.solve(a, b)`, and the least-squares answer where `a` is
+    SINGULAR instead of an exception.  A planted leg that has slid out
+    straight, or a swinging one flung to full extension, has a singular
+    Jacobian; the law must not raise on it -- `hw.stand.run` ends the run
+    on any exception and the robot drops limp (2026-10-05, found in
+    MuJoCo: a fall mid-walk raised LinAlgError in `walk.hold_targets`)."""
+    try:
+        return np.linalg.solve(a, b)
+    except np.linalg.LinAlgError:
+        return np.linalg.lstsq(np.asarray(a, dtype=float),
+                               np.asarray(b, dtype=float), rcond=None)[0]
 
 
 def rest_feet_b(h: float, foot_xy=None) -> np.ndarray:
@@ -438,11 +453,11 @@ def swing_feedforward(leg: int, q, v_ref, a_ref, jac=None,
     j2 = jac[:, 1:]
     normal = j2.T @ j2
     qd_ref = np.zeros(3)
-    qd_ref[1:] = np.linalg.solve(normal, j2.T @ np.asarray(v_ref, dtype=float))
+    qd_ref[1:] = solve_jacobian(normal, j2.T @ np.asarray(v_ref, dtype=float))
     jdot_qd = (HK.foot_jacobian(leg, q + qd_ref * _JDOT_EPS) - jac) @ qd_ref
     jdot_qd /= _JDOT_EPS
     qdd_ref = np.zeros(3)
-    qdd_ref[1:] = np.linalg.solve(
+    qdd_ref[1:] = solve_jacobian(
         normal, j2.T @ (np.asarray(a_ref, dtype=float) - jdot_qd))
     return inertia @ qdd_ref
 
