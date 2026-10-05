@@ -45,6 +45,19 @@ lighter rotor included.
 
 ![envelope](fig/fig_envelope.png)
 
+**After the robot, 2026-10-05 (section 11).**  The trot that fails "after a
+while" and the walk's trot in place that is worse than the trot's are, in
+MuJoCo, one hardware unknown: the CoM a few mm off the CAD's.  3 / 5 mm
+takes `hw.fold_trot` in place from 2.2° to 10° with the tilt rms growing
+every 10 s and fells every walk within seconds; the rotor, friction,
+latency, floor and torque constant cost under a degree each.  Shifting the
+law's pin alone does not cure it; re-centring the stance on the measured
+CoM does (`hw.com_check`, `hw.stand --com-offset`).  Until it is measured,
+the walk's impedance on the trot's clock (`--swing-law impedance --duty
+0.8 --contact-ramp 0.15 --settle 0.2`) is the configuration that stood
+every 30 s run.  The harness also measured with the wrong SRB pin for the
+fold until then; section 11.5 has the standard set re-run.
+
 ## 1. What was built
 
 ```
@@ -744,6 +757,17 @@ The two `selftest` failures are the baseline's, unchanged by this work: the
 whole-law timing check against the 333 µs CAN slot (this VM is slower than
 the machine it was set on) and `fold_stand`'s roll gain check.
 
+### 10.1 Reproduce (section 11)
+
+```
+$V doc/walk/longrun.py inplace        11.2  (L_*: 8 configs x 2 plants, 30 s)
+$V doc/walk/longrun.py single         11.3  (S_*: one unknown at a time)
+$V doc/walk/longrun.py corr           11.4  (C_*: the pin alone)
+$V doc/walk/longrun.py cent           11.4  (K_*: the stance re-centred)
+$V doc/walk/longrun.py box            11.5  (B_*: the keys' box, hwlike)
+$V doc/walk/walksim.py ; $V doc/walk/walksim.py --fold2     11.5
+```
+
 ### References
 
 - Di Carlo, Wensing, Katz, Bledt, Kim, *Dynamic Locomotion in the MIT Cheetah 3
@@ -766,3 +790,171 @@ the machine it was set on) and `fold_stand`'s roll gain check.
 - Nocedal, Wright, *Numerical Optimization*, 2nd ed., Springer 2006,
   [doi:10.1007/978-0-387-40065-5](https://doi.org/10.1007/978-0-387-40065-5),
   Alg. 16.3 — the primal active set.
+
+## 11. What fails after a while, and what does not: 30 s on a robot-like plant
+
+*2026-10-05, after the robot: the fold trot stands, then loses its balance
+"after a while"; the walk's trot in place is worse than `hw.fold_trot`'s
+and goes the same way sooner; other Kp / Kd did not cure either.
+`doc/walk/longrun.py` runs both for 30 s in place, then the keys' box, on
+a plant with every hardware unknown the bench and `doc/crouch_trot` name
+at once, and then one at a time.  Section 10.1 says how to reproduce.*
+
+**Two things changed under this section, and they change section 6's
+numbers too.**  (1) `hwsim` measured the trunk with the *crouch's* SRB
+model while the law flew `srb_at(height, stand feet)` -- for the fold, c^b
+x -6.9 against -17.8 mm and z -31.3 against -27.2 -- where `hw.stand.run`
+uses the law's for both.  Every fold number above was produced with that
+11 mm mismatch inside the controller; the harness now does what the robot
+does, and the standard set re-run on it is in 11.5.  (2) A fall mid-walk
+straightened a planted leg, its Jacobian went singular and
+`np.linalg.solve` raised out of `walk.hold_targets`; on the robot
+`hw.stand.run` ends on any exception and the bus closes, so the exception,
+not the fall, would have ended the run.  `swing.solve_jacobian` (the
+least-squares answer on a singular matrix) now sits under the walk's and
+the swing laws' solves; `selftest` §14 checks it.
+
+### 11.1 The plant
+
+`hwlike` is every unknown at once: the rotor 0.6x DOG5's with the law's
+M0 left at DOG5's (the bench's reading), 0.1 N·m of joint Coulomb and the
+IMU 15 ms late, floor μ 0.7, the CoM 3 / 5 mm off the CAD's in trunk x / y,
+and 10 % less torque per amp.  `ideal` is the model as drawn.  Each run is
+`T_HOLD` 3 s, then 30 s of trot in place, four at a time, ~25 s each.  The
+new column is the **tilt rms per 10 s of trot**: a number that grows is
+the failure that takes a while.
+
+### 11.2 In place for 30 s
+
+| config | plant | fell | max tilt | tilt rms per 10 s | drift x / y | peak τ |
+|---|---|---|---|---|---|---|
+| `hw.fold_trot` as shipped (impedance 10/10/400, duty 0.80, settle 0.2) | ideal | no | 2.2° | 0.68 / 0.68 / 0.63 | −2 / 6 mm | 1.38 |
+| | **hwlike** | no | **9.7°** | **2.24 / 3.71 / 5.89** | −33 / −72 mm | 3.19 |
+| `hw.fold_walk` as shipped (osc 25/25/20, duty 0.70, no settle) | ideal | no | 2.8° | 1.13 / 1.13 / 1.13 | 74 / 11 mm | 3.57 |
+| | **hwlike** | no | 7.6° | 3.79 / 4.08 / 4.03 | **250 / 675 mm** | 3.64 |
+| `hw.fold_walk --swing-law impedance --duty 0.8 --contact-ramp 0.15 --settle 0.2` (the walk's 150/150/400 on the trot's clock) | ideal | no | 2.2° | 0.66 / 0.64 / 0.64 | 5 / 0 mm | 1.28 |
+| | **hwlike** | no | **4.3°** | **1.65 / 1.60 / 1.54** | 44 / 12 mm | 1.33 |
+| … the same with the trot's own 10/10/400 (`--kp-swing-walk 10 10 400 --kd-swing-walk 5 5 40`) | ideal | no | 2.2° | 0.59 / 0.55 / 0.55 | 7 / −2 mm | 1.37 |
+| | **hwlike** | **yes, 5.7 s** | 51.9° | 6.76 | 27 / 133 mm | 6.57 |
+
+On the ideal plant all four are the same trot to half a degree, and the
+walk's in-place trot is 0.6° worse than the trot's -- the osc swing's
+torque (3.6 against 1.4 N·m) is the one visible difference.  On the
+robot-like plant the shipped trot **rocks harder every 10 s** and the
+shipped walk drifts two thirds of a metre sideways while "in place"; the
+walk's impedance on the trot's clock is the one configuration whose rms
+stays flat, and the trot's soft 10 N/m gains on the walk fall in 6 s.
+
+### 11.3 One unknown at a time
+
+| unknown, alone | `hw.fold_trot` | … with `--kp-swing 150 150 400 --kd-swing 6 6 40` | `hw.fold_walk` (osc) | walk, impedance on the trot's clock | walk, the trot's 10/10/400 |
+|---|---|---|---|---|---|
+| none (ideal) | 2.2°, rms 0.68 / 0.68 / 0.63 | 2.2°, 0.77 / 0.77 / 0.71 | 2.8°, 1.13 / 1.13 / 1.13 | 2.2°, 0.66 / 0.64 / 0.64 | 2.2°, 0.59 / 0.55 / 0.55 |
+| rotor 0.6x, M0 DOG5's | 2.2°, 0.67 / 0.65 / 0.68 | 2.2°, 0.68 / 0.69 / 0.73 | 4.0°, 1.55 / 1.60 / 1.61 | 2.2°, 0.62 / 0.62 / 0.65 | 2.2°, 0.60 / 0.56 / 0.58 |
+| rotor 0.6x, M0 fitted | — | — | 2.8°, 1.26 / 1.26 / 1.31 | — | — |
+| **CoM 3 / 5 mm off** | **10.4°, 2.41 / 5.20 / 5.71** | **4.4°, 1.56 / 1.65 / 1.69** | **fell, 6.1 s** | **4.6°, 1.69 / 1.73 / 1.76** | **fell, 4.2 s** |
+| 0.1 N·m friction + IMU 15 ms | 2.1°, 0.50 / 0.56 / 0.70 | 1.7°, 0.49 / 0.51 / 0.54 | 2.9°, 1.36 / 1.33 / 1.25 | 1.6°, 0.50 / 0.52 / 0.51 | 2.7°, 0.77 / 0.90 / 0.90 |
+| floor μ 0.7 | 2.3°, 0.69 / 0.69 / 0.67 | 2.2°, 0.77 / 0.80 / 0.71 | 2.8°, 1.12 / 1.13 / 1.13 | 2.2°, 0.65 / 0.63 / 0.64 | 2.2°, 0.60 / 0.52 / 0.56 |
+| torque 0.9x per amp | 2.0°, 0.56 / 0.54 / 0.53 | 2.0°, 0.60 / 0.61 / 0.59 | 2.7°, 0.96 / 0.94 / 0.95 | 2.0°, 0.55 / 0.56 / 0.55 | 2.0°, 0.46 / 0.41 / 0.45 |
+
+(max tilt over 30 s in place, then the tilt rms over each 10 s.)
+
+One of the five does all of it: **the CoM 3 / 5 mm off the CAD's**.  Alone
+it takes the shipped trot to 10° with the rms growing 2.4 → 5.2 → 5.7 and
+fells the shipped walk in 6 s; the rotor, the friction with the latency,
+the floor and the torque constant cost under a degree each, growing
+nothing.  The log of the trot says how: with the real CoM 5 mm to the
+left, the left feet carry 18 N against the right's 14, the integrator-less
+attitude loop parks the trunk at −4° of roll, and each swing lands its
+foot a little inboard of the site because the trunk it is planned in is
+rolled; at 10 N/m in x/y the swing does not pull it back out.  The stance
+narrows from 124 to 110 mm over the 30 s, every roll is worse on the
+narrower stance, and so on.  With the walk's 150 N/m the feet come back to
+their sites each swing (the stance stays at 123–124 mm) and the rms stays
+at 1.6°: that is the whole difference between the two impedance rows
+above, and it is why `hw.fold_trot --kp-swing 150 150 400 --kd-swing 6 6
+40` halves the damage (4.5°, flat) without touching anything else.
+
+### 11.4 The cure is geometry, not a gain
+
+The pin alone (`C_*`: the plant's CoM 3 / 5 mm off, the law's
+`SrbModel.com_body` shifted by the same) buys almost nothing: the trot
+9.7 → 7.9°, still growing; the osc walk 7.6 → 7.2°, still drifting.  A
+model does not fix geometry -- the trunk rocks about whichever trot
+diagonal the real CoM is further from, and the fold's CoM is already
+5.7 mm off both.  Moving the stand's sites **with** the offset, so both
+diagonals pass through the real CoM (`K_*`; `hw.stand --com-offset DX DY`
+does both), brings everything back to the ideal plant:
+
+| config, hwlike plant | pin alone (`C_`) | stance re-centred (`K_`) | ideal |
+|---|---|---|---|
+| `hw.fold_trot` in place | 7.9°, rms 1.8 / 2.7 / 4.2 | **1.9°, rms 0.5 / 0.7 / 0.8** | 2.2° |
+| `hw.fold_walk` (osc) in place | 7.2°, drift 0.6 m | 3.8°, drift 0.24 m | 2.8° |
+| … impedance on the trot's clock, in place | 3.9° | **1.5°** | 2.2° |
+| … the trot's 10/10/400 on the walk, in place | fell 7.9 s | 2.3° | 2.2° |
+| osc: 0.06 fwd / 0.06 back / 0.03 left / 12 °/s / 0.06 + 12 °/s | fell / fell / fell / fell / fell | 3.6° / 3.5° / 5.8° / 3.6° / 3.8° | — |
+| impedance, trot's clock: the same five | 9.6° / 3.9° / fell / 5.5° / 11.2° | 5.8° / 1.6° / 3.3° / 3.0° / 10.5° | — |
+
+(The first try moved the sites the other way, and every case fell on its
+first swing: the CoM was then 10 mm off centre instead of 5.  The sign
+is measured minus pinned, and `hw.com_check` prints it that way.)
+
+Moving, the two swing laws split as section 6 found: the osc walks the
+box at 3.5–5.8°, the impedance on the trot's clock is calmer in place and
+turning but asks the 9 N·m clip at 0.06 m/s forward (the 120 ms swing
+carrying a 36 mm step) and reaches 10.5° in the combined case.
+
+### 11.5 The keys' box and the standard set on the fixed harness
+
+The keys' box (0.06 / 0.03 m/s, 12 °/s), robot-like plant, CoM NOT
+corrected -- what the robot is doing today if its CoM is off by this
+much:
+
+| case | osc as shipped | osc, M0 fitted | impedance, trot's clock (150/150/400, duty 0.8, settle) | the trot's 10/10/400, trot's clock | 150/150/400, duty 0.70 | 10/10/400, duty 0.70 |
+|---|---|---|---|---|---|---|
+| in place, 30 s | 7.6°, drift 0.7 m | fell 3.2 s | **4.3°** | fell 5.7 s | fell 2.6 s | fell 1.9 s |
+| forward 0.06 | fell 3.8 s | fell 3.0 s | 11.2° (τ 9.0) | fell 3.3 s | fell 2.6 s | fell 1.9 s |
+| back 0.06 | fell 4.3 s | fell 3.0 s | **4.3°** | fell 4.6 s | fell 2.6 s | fell 1.9 s |
+| left 0.03 | fell 3.2 s | fell 2.6 s | fell 4.0 s | fell 2.7 s | fell 2.3 s | fell 1.8 s |
+| turn 12 °/s | fell 5.2 s | fell 3.5 s | fell 8.3 s | 7.7° | fell 2.5 s | fell 1.9 s |
+| 0.06 + 12 °/s | fell 4.6 s | fell 3.5 s | fell 6.2 s | fell 3.3 s | fell 2.5 s | fell 1.9 s |
+
+With the CoM 5 mm off and uncorrected, **nothing walks** the box, and
+every configuration on the walk's own clock (duty 0.70, 180 ms of swing)
+is on the floor within two seconds -- the longer two-foot phase is the
+longer the trunk falls about a diagonal the CoM is not on (section 4).
+With the stance re-centred (11.4) every one of these stands.
+
+The standard set (section 6.5) and FOLD2's (7.1), re-run with the
+harness measuring on the law's own pin:
+
+| unknown, alone | `hw.fold_trot` | … with `--kp-swing 150 150 400 --kd-swing 6 6 40` | `hw.fold_walk` (osc) | walk, impedance on the trot's clock | walk, the trot's 10/10/400 |
+|---|---|---|---|---|---|
+| none (ideal) | 2.2°, rms 0.68 / 0.68 / 0.63 | 2.2°, 0.77 / 0.77 / 0.71 | 2.8°, 1.13 / 1.13 / 1.13 | 2.2°, 0.66 / 0.64 / 0.64 | 2.2°, 0.59 / 0.55 / 0.55 |
+| rotor 0.6x, M0 DOG5's | 2.2°, 0.67 / 0.65 / 0.68 | 2.2°, 0.68 / 0.69 / 0.73 | 4.0°, 1.55 / 1.60 / 1.61 | 2.2°, 0.62 / 0.62 / 0.65 | 2.2°, 0.60 / 0.56 / 0.58 |
+| rotor 0.6x, M0 fitted | — | — | 2.8°, 1.26 / 1.26 / 1.31 | — | — |
+| **CoM 3 / 5 mm off** | **10.4°, 2.41 / 5.20 / 5.71** | **4.4°, 1.56 / 1.65 / 1.69** | **fell, 6.1 s** | **4.6°, 1.69 / 1.73 / 1.76** | **fell, 4.2 s** |
+| 0.1 N·m friction + IMU 15 ms | 2.1°, 0.50 / 0.56 / 0.70 | 1.7°, 0.49 / 0.51 / 0.54 | 2.9°, 1.36 / 1.33 / 1.25 | 1.6°, 0.50 / 0.52 / 0.51 | 2.7°, 0.77 / 0.90 / 0.90 |
+| floor μ 0.7 | 2.3°, 0.69 / 0.69 / 0.67 | 2.2°, 0.77 / 0.80 / 0.71 | 2.8°, 1.12 / 1.13 / 1.13 | 2.2°, 0.65 / 0.63 / 0.64 | 2.2°, 0.60 / 0.52 / 0.56 |
+| torque 0.9x per amp | 2.0°, 0.56 / 0.54 / 0.53 | 2.0°, 0.60 / 0.61 / 0.59 | 2.7°, 0.96 / 0.94 / 0.95 | 2.0°, 0.55 / 0.56 / 0.55 | 2.0°, 0.46 / 0.41 / 0.45 |
+
+(max tilt over 30 s in place, then the tilt rms over each 10 s.)TD
+
+### 11.6 What to do on the robot, in order
+
+1. **Measure the CoM.**  `hw.fold_trot --log hold.npz`, ENTER to HOLD,
+   hold a few seconds, park; `python -m hw.com_check hold.npz`.  It reads
+   each foot's force off the measured torque through the leg's Jacobian,
+   balances the moments, and prints `--com-offset DX DY` (and the measured
+   vertical force over the weight, which is the drivers' torque constant
+   to within the friction).  In `hwsim` a 3 / 5 mm plant error reads back
+   as 2.5 / 4.5, a −4 / 8 as −3.9 / 7.0.
+2. **Fly it**: `hw.fold_trot --com-offset DX DY`, then the walk with the
+   same flag.  The banner prints the shifted pin and sites.
+3. **Until then**, the configurations that survive an uncorrected CoM in
+   place: `hw.fold_walk --swing-law impedance --duty 0.8 --contact-ramp
+   0.15 --settle 0.2` (the one that stood every 30 s run), and
+   `hw.fold_trot --kp-swing 150 150 400 --kd-swing 6 6 40`.
+4. **Fit the armature** (`hw.swing_bench --analyse`, `--ff-armature`) for
+   the osc walk: with the rotor at 0.6x and M0 unfitted it is 3.9° in
+   place against 2.7° fitted -- real, and a tenth of the CoM's effect.
