@@ -132,9 +132,11 @@ def swing_osc_torque(state, leg: int, ref, wn=None, zeta=None, inertia=None):
 def swing_control_torque(state, leg: int, ref, kp=None, kd=None,
                          ff: bool = False, inertia=None):
     """``(tau, tau_ff)`` for swinging `leg`; `ref` is a `footstep.SwingRef`
-    (anything with p, v, a in the trunk frame).  `tau` includes `tau_ff`."""
-    kp = cfg.KP_SWING_WALK if kp is None else np.asarray(kp, dtype=float)
-    kd = cfg.KD_SWING_WALK if kd is None else np.asarray(kd, dtype=float)
+    (anything with p, v, a in the trunk frame).  `tau` includes `tau_ff`.
+    `kp` / `kd` are (3,) for every leg or (4, 3) a row per leg
+    (`swing.leg_gains`, `--kp-swing-walk-rl` etc., 2026-10-05)."""
+    kp = SWING.leg_gains(cfg.KP_SWING_WALK if kp is None else kp, leg)
+    kd = SWING.leg_gains(cfg.KD_SWING_WALK if kd is None else kd, leg)
     jac = state.jac[leg]
     qd = C.unflat(state.qd)[leg]
     force = (kp * (np.asarray(ref.p, dtype=float) - state.x_b[leg])

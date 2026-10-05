@@ -205,7 +205,8 @@ from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
 
 __all__ = ["rest_feet_b", "swing_reference", "swing_reference_pva",
-           "swing_torque", "swing_feedforward", "feedforward_inertia",
+           "leg_gains", "swing_torque", "swing_feedforward",
+           "feedforward_inertia",
            "joint_swing_reference", "joint_swing_torque", "swing_demand",
            "roll_level", "knee_bump", "knee_swing_amplitude",
            "knee_swing_reference", "knee_swing_demand", "SWING_MODES"]
@@ -268,13 +269,24 @@ def roll_level(p, v, a, roll: float, roll_rate: float):
     return p_b, v_b, m @ np.asarray(a, dtype=float)
 
 
+def leg_gains(gains, leg: int) -> np.ndarray:
+    """(3,) `leg`'s x y z swing gains out of `gains`: (3,) is every leg's,
+    (4, 3) a row per leg, FL FR RL RR -- `--kp-swing-rl` and the rest,
+    2026-10-05, on request: one leg's swing tuned without touching the
+    other three."""
+    gains = np.asarray(gains, dtype=float)
+    return gains[leg] if gains.ndim == 2 else gains
+
+
 def swing_torque(state, leg: int, p_ref, v_ref, kp=None, kd=None) -> np.ndarray:
     """(3,) the swing impedance for `leg`, from this sweep's encoders.
 
     Uses the Jacobian `state.read` already computed -- no second chain walk.
+    `kp` / `kd` are (3,) for every leg or (4, 3) a row per leg
+    (`leg_gains`); None is `config.KP_SWING` / `KD_SWING`.
     """
-    kp = cfg.KP_SWING if kp is None else np.asarray(kp, dtype=float)
-    kd = cfg.KD_SWING if kd is None else np.asarray(kd, dtype=float)
+    kp = leg_gains(cfg.KP_SWING if kp is None else kp, leg)
+    kd = leg_gains(cfg.KD_SWING if kd is None else kd, leg)
     jac = state.jac[leg]
     qd = C.unflat(state.qd)[leg]
     force = (kp * (np.asarray(p_ref, dtype=float) - state.x_b[leg])

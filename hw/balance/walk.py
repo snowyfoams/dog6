@@ -25,7 +25,10 @@ THE RULE THIS FILE EXISTS FOR
                      sees it: x_t = Rz(psi_ref)^T (anchor - p_ref,origin),
                      anchor = the foot's world x/y, latched at touchdown
         swing        lands on the foothold planned from the reference
-                     (footstep.py), in the same world
+                     (footstep.py), in the same world -- AT REST (v_ref and r
+                     zero) on the leg's own site in the trunk frame instead,
+                     the filter nowhere in it: hw.fold_trot's in-place target
+                     (footstep.py, 2026-10-05; `place_at_rest` undoes it)
 
 WHY THE STANCE TARGET IS WORLD-ANCHORED (the joint layer kept, as asked)
     A joint target latched once at HOLD is a stance the walking feet leave:
@@ -48,6 +51,14 @@ WHY THE STANCE TARGET IS WORLD-ANCHORED (the joint layer kept, as asked)
     Per leg, the xy part of (target - measured) is clamped to
     `config.HOLD_XY_ERR_MAX`, and the reference is leashed to the filter
     (trajectory.py), so an estimate gone wrong pulls on a bounded spring.
+
+THE PLACEMENT'S VELOCITY IS LOW-PASSED (2026-10-05, on request)
+    The planner's trunk velocity is the filter's x/y velocity through a
+    first-order low-pass, `v_filter_hz` (config.WALK_V_FILTER_HZ), stepped
+    once per estimate and started at rest when the walk engages: on the
+    robot the raw v_hat is noise enough to move a foothold by centimetres.
+    It reaches the foothold (eq 33 and the Raibert term) and the swing's
+    world-to-trunk velocity, nothing else; the x/y rows read v_hat raw.
 
 WITHOUT AN ESTIMATE
     Before the filter's first answer, or on any sweep it is refused, the
@@ -91,14 +102,33 @@ class WalkPlan:
                  kp_swing=None, kd_swing=None, swing_ff: bool = False,
                  ff_inertia=None, hold_xy_max: float = cfg.HOLD_XY_ERR_MAX,
                  swing_law: str = cfg.WALK_SWING_LAW, wn_swing=None,
-                 zeta_swing: float | None = None):
+                 zeta_swing: float | None = None,
+                 place_at_rest: bool = cfg.WALK_PLACE_AT_REST,
+                 v_filter_hz: float = cfg.WALK_V_FILTER_HZ):
         self.reference = reference if reference is not None else WalkReference()
+        #: False (the default): a swing that lifts with the reference at rest
+        #: lands on its site, trunk frame, no velocity term (footstep.py).
+        self.place_at_rest = bool(place_at_rest)
+        #: Hz, the corner of the low-pass on the filter's x/y velocity as the
+        #: planner reads it (`trunk_xy`); 0 or less reads it raw.  `v_lp` is
+        #: its output, WORLD m/s, and `v_lp_t` the estimate time it last took.
+        self.v_filter_hz = float(v_filter_hz)
+        self.v_lp = np.zeros(2)
+        self.v_lp_t = float("nan")
         self.kv = float(kv)
         self.step_max = np.asarray(step_max, dtype=float).reshape(2)
+        #: The impedance's (x, y, z) gains: (3,) every leg's, or (4, 3) a row
+        #: per leg, FL FR RL RR (`--kp-swing-walk-rl` etc., 2026-10-05).
         self.kp_swing = (cfg.KP_SWING_WALK if kp_swing is None
-                         else np.asarray(kp_swing, dtype=float))
+                         else np.array(kp_swing, dtype=float))
         self.kd_swing = (cfg.KD_SWING_WALK if kd_swing is None
-                         else np.asarray(kd_swing, dtype=float))
+                         else np.array(kd_swing, dtype=float))
+        for name, gains in (("kp_swing", self.kp_swing),
+                            ("kd_swing", self.kd_swing)):
+            if gains.shape not in ((3,), (C.N_LEGS, 3)):
+                raise ValueError("%s: (3,) for every leg or (%d, 3) a row "
+                                 "per leg, not %s"
+                                 % (name, C.N_LEGS, gains.shape))
         self.swing_ff = bool(swing_ff)
         self.ff_inertia = ff_inertia
         if swing_law not in ("impedance", "osc"):
@@ -142,11 +172,14 @@ class WalkPlan:
         return p, v
 
     def trunk_xy(self, law, state, ref, est) -> TrunkXY:
-        """The filter's trunk origin when it is usable this sweep, else the
-        reference's -- see the module docstring, WITHOUT AN ESTIMATE."""
+        """The filter's trunk origin when it is usable this sweep, its x/y
+        velocity low-passed (`v_filter_hz`), else the reference's -- see the
+        module docstring, WITHOUT AN ESTIMATE."""
         if est is not None:
+            v = (self.v_lp.copy() if self.v_filter_hz > 0.0
+                 else np.asarray(est.v_w, dtype=float)[:2].copy())
             return TrunkXY(p=np.asarray(est.p_w, dtype=float)[:2].copy(),
-                           v=np.asarray(est.v_w, dtype=float)[:2].copy(),
+                           v=v,
                            yaw=float(state.yaw),
                            yaw_rate=float(state.omega_w[2]), measured=True)
         p, v = self._origin_ref(law, ref)
@@ -181,10 +214,32 @@ class WalkPlan:
                                        t_stance=gait.stance_duration,
                                        t_swing=gait.swing_duration,
                                        height=law.swing_height, kv=self.kv,
-                                       step_max=self.step_max)
+                                       step_max=self.step_max,
+                                       place_at_rest=self.place_at_rest)
         self._planted = np.ones(C.N_LEGS, dtype=bool)
+        # The placement's low-pass starts AT REST: the trot starts from HOLD.
+        self.v_lp = np.zeros(2)
+        self.v_lp_t = float("nan")
         self.engaged = True
         self.engaged_at = float(now)
+
+    def _low_pass(self, est) -> None:
+        """Step the planner's low-passed x/y velocity by the estimate `est`
+        (None: hold it).  Once per ESTIMATE, by `est.t`: one the law reads on
+        two sweeps counts once.  The first only starts the clock."""
+        if est is None or self.v_filter_hz <= 0.0:
+            return
+        t = float(est.t)
+        if not math.isfinite(self.v_lp_t):
+            self.v_lp_t = t
+            return
+        dt = t - self.v_lp_t
+        if dt <= 0.0:
+            return
+        a = 1.0 - math.exp(-2.0 * math.pi * self.v_filter_hz * dt)
+        self.v_lp = self.v_lp + a * (np.asarray(est.v_w, dtype=float)[:2]
+                                     - self.v_lp)
+        self.v_lp_t = t
 
     # -- the sweep ----------------------------------------------------------
     def step(self, now: float, law, state, gait, clock, est):
@@ -195,6 +250,7 @@ class WalkPlan:
             if clock is None:
                 return None
             self.engage(now, law, state, gait, est)
+        self._low_pass(est)
         target = self.command if clock is not None else _ZERO
         p_hat = None
         if est is not None:
@@ -268,7 +324,15 @@ class WalkPlan:
     def report(self) -> str:
         if not self.engaged:
             return "  walk            attached, never engaged (no trot)"
+        fp = self.planner
         return ("  walk            %d touchdowns anchored, leash acted on %d "
-                "sweeps, %d landings clamped to the step bound"
+                "sweeps, %d landings clamped to the step bound; swings: %d "
+                "at rest (trunk frame, onto the site), %d placed%s"
                 % (self.steps, self.reference.leash_sweeps,
-                   0 if self.planner is None else self.planner.clamped))
+                   0 if fp is None else fp.clamped,
+                   0 if fp is None else fp.swings_at_rest,
+                   0 if fp is None else fp.swings_placed,
+                   " (--place-at-rest)" if self.place_at_rest else "")
+                + ("; placement velocity low-passed at %.1f Hz"
+                   % self.v_filter_hz if self.v_filter_hz > 0.0 else
+                   "; placement velocity raw"))

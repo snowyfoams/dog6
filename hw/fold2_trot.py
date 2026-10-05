@@ -104,7 +104,7 @@ def stand_options() -> dict:
     `hw.fold_trot.stand_options` with the knees-out crouch and no slanted
     rise -- the stand's feet are the crouch's.  A fresh gait each call."""
     return dict(crouch=POSE.FOLD2, dynamic_setpoint=False,
-                only_law="srb", tilt_stop=FS.TILT_STOP_DEG,
+                only_law="srb",
                 roll_gains=FS.ROLL_GAINS, track_stop=FS.TRACK_STOP_DEG,
                 velocity=False, limits=FS.LIMITS,
                 swing_height=SWING_HEIGHT, rise_track=True,

@@ -129,7 +129,7 @@ class BodyState:
                              #       encoder difference, not the driver field
     R: np.ndarray            # (3, 3) world <- trunk
     omega_b: np.ndarray      # (3,) rad/s, TRUNK frame -- what the gyro gives
-    roll: float              # rad, for the tilt trip and the log ONLY
+    roll: float              # rad, for the fall hold and the log ONLY
     pitch: float             # rad
     yaw: float               # rad, magnetometer, UNTRUSTED
     imu_age_s: float
@@ -158,7 +158,9 @@ class BodyState:
 
     @property
     def tilt_deg(self) -> float:
-        """max(|roll|, |pitch|) in degrees -- the quantity the tilt trip reads."""
+        """max(|roll|, |pitch|) in degrees, from TRUE level -- the log's and
+        the status line's.  The fall hold reads it from the setpoint
+        (`law.BalanceLaw.tilt_from_setpoint_deg`)."""
         return float(np.degrees(max(abs(self.roll), abs(self.pitch))))
 
     def status(self) -> str:

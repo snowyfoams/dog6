@@ -402,9 +402,10 @@ def entry(pose, h_mm, period=None, apex_mm=20.0, stance_xy=(400.0, 25.0),
     swing, the joint layer) from `pose`, at `h_mm`, plus the stance xy spring."""
     law_kw = dict(swing_height=1e-3 * apex_mm, h_lift=1e-3 * h_mm,
                   kp_stance_xy=float(stance_xy[0]), kd_stance_xy=float(stance_xy[1]),
-                  kp_joint=float(joint_hold[0]), kd_joint=float(joint_hold[1]))
+                  kp_joint=float(joint_hold[0]), kd_joint=float(joint_hold[1]),
+                  fall_hold_deg=BCFG.FALL_HOLD_DEG)
     return H.Entry("cand:" + pose.name, pose, 9.0, tau_ceiling=9.0, tau_slew=60.0,
-                   overspeed_trip=False, latch=latch, tilt_stop=45.0, track_stop=0.0,
+                   overspeed_trip=False, latch=latch, track_stop=0.0,
                    roll_gains=roll, swing="cartesian", gait_period=period,
                    law_kw=law_kw, limits=NO_LIMITS)
 

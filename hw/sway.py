@@ -35,8 +35,8 @@ HOW THE TRUNK IS MOVED
                 attitude loop drives the shake as it does the nod, with the
                 joint layer beside it.
 
-    The law's height loop is untouched throughout.  The tilt stop reads the
-    MOVED setpoint while nodding.
+    The law's height loop is untouched throughout.  The attitude error reads
+    the MOVED setpoint while nodding (there is no tilt stop: deleted).
 
     signal(t) = A env(t) sin(2 pi t / T).  env smoothsteps 0 -> 1 over the
     first period and back to 0 over one period after the stop, so neither

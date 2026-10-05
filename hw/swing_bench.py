@@ -108,9 +108,11 @@ from sim import params as P          # noqa: E402
 
 from . import CONFIRMED_ON_DOG6      # noqa: E402
 from . import calibration as CAL     # noqa: E402
+from . import can_link as CANL       # noqa: E402
 from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
 from . import kinematics as HK       # noqa: E402
+from . import realtime as RT         # noqa: E402
 from . import safety as SAFE         # noqa: E402
 from . import trot as TROT           # noqa: E402
 from .balance import config as BCFG  # noqa: E402
@@ -121,7 +123,8 @@ from .balance import state as BSTATE  # noqa: E402
 from .balance import swing as SWING  # noqa: E402
 from .balance import torque as TRQ   # noqa: E402
 from .stand import (GAP_ESTOP_S, QD_FILTER_HZ, RATE_HZ, STATUS_EVERY_SWEEPS,  # noqa: E402
-                    STATUS_PERIOD_S, KeyPoller, _torque_lines)
+                    STATUS_PERIOD_S, KeyPoller, _torque_lines, add_swing_leg_flags,
+                    swing_leg_banner, swing_leg_gains)
 
 __all__ = ["SwingBench", "SwingReport", "run", "main", "bench_pose", "POSE_S",
            "TAU_CAP", "POSTURES", "FOLD_HEIGHT"]
@@ -705,12 +708,14 @@ def _print_phase(bench: SwingBench) -> None:
 
 def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
         auto_s: float | None = None, clock=time.perf_counter,
-        log: "BenchLog | None" = None) -> str | None:
+        log: "BenchLog | None" = None,
+        gcq: "RT.QuietGC | None" = None) -> str | None:
     """Drive `bench` on an ARMED `mb` until X or a trip.  Returns the reason.
 
     `hw.stand.run`'s loop with the stand taken out: the same round robin,
-    the same latched sweep, the same gate, monitors and stop lines.  Does
-    not stop the motors -- the caller's `with MotorBus(...)` does.
+    the same latched sweep, the same gate, monitors and stop lines -- the
+    same `realtime.SendGuard` and, with `gcq`, the same collector in its own
+    slot.  Does not stop the motors -- the caller's `with MotorBus(...)` does.
     """
     ids = HM.motor_ids()
     n = len(ids)
@@ -720,13 +725,15 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
     slot = mb.slot(rate_hz)
     alpha_qd = 1.0 - np.exp(-2.0 * np.pi * QD_FILTER_HZ * n * slot)
     level = IMU.TrunkOrientation.level()
+    guard = RT.SendGuard(mb, ids, GAP_ESTOP_S, SAFE.INPUT_LOST_S, gcq)
+    gc_slot = RT.GC_SLOT % n
+    link_lost = CANL.bus_errors()
 
     sweep = 0
     mode, values = "keepalive", None
     q_prev = t_prev = None
     qd_ctrl = np.zeros(n)
     tau_sent = np.zeros(n)
-    worst_gap = np.zeros(n)
     overruns = 0
     t0 = last_status = bench.t_phase = clock()
     last_phase = bench.phase
@@ -735,7 +742,11 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
     deadline = clock() + slot
     k = 0
     while True:
-        mb.poll()
+        try:
+            mb.poll()
+        except link_lost as failure:
+            return ("CAN link lost: %s -- the adapter left USB or can0 went "
+                    "down under the run" % failure)
         if k == 0:
             now = clock()
             try:
@@ -744,7 +755,9 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
                 if now - t0 > 1.0:
                     return str(missing)
                 k = (k + 1) % n
-                mb.keepalive(ids[0])
+                # Through the guard like every other frame, or its clock for
+                # this motor stops at arm() and the first real slot trips.
+                guard.sent(0, mb.keepalive(ids[0]), clock())
                 deadline = clock() + slot
                 continue
             if q_prev is not None and now > t_prev:
@@ -815,7 +828,7 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
                 last_status = now
                 print(bench.status(now, body)
                       + "  |tau|=%.2f  gap=%.1f ms  overrun=%d"
-                      % (float(np.abs(tau_sent).max()), 1e3 * worst_gap.max(), overruns),
+                      % (float(np.abs(tau_sent).max()), guard.worst_ms(), overruns),
                       flush=True)
                 if mode == "torque":
                     print(_torque_lines(tau_sent, tau_meas), flush=True)
@@ -824,23 +837,22 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
         # -- one frame, to one motor ------------------------------------------
         mid = ids[k]
         sent_at = clock()
-        previous = mb.rec(mid).last_cmd_t
-        if previous is not None:
-            gap = sent_at - previous
-            worst_gap[k] = max(worst_gap[k], gap)
-            if gap > GAP_ESTOP_S:
-                return ("CAN %d went %.1f ms without a frame, past the %.0f ms stop "
-                        "line" % (mid, 1e3 * gap, 1e3 * GAP_ESTOP_S))
+        reason = guard.check(k, sent_at)
+        if reason:
+            return reason
         if (sweep % STATUS_EVERY_SWEEPS == 0
                 and k == (sweep // STATUS_EVERY_SWEEPS) % n):
-            mb.status1_req(mid)
+            taken = mb.status1_req(mid)
         elif mode == "position":
-            mb.position(mid, float(np.rad2deg(values[k])),
-                        max_dps=float(bench.max_dps[k]))
+            taken = mb.position(mid, float(np.rad2deg(values[k])),
+                                max_dps=float(bench.max_dps[k]))
         elif mode == "torque":
-            mb.torque(mid, float(values[k]))
+            taken = mb.torque(mid, float(values[k]))
         else:
-            mb.keepalive(mid)
+            taken = mb.keepalive(mid)
+        guard.sent(k, taken, sent_at)
+        if k == gc_slot and gcq is not None:
+            gcq.step(sweep)
 
         k = (k + 1) % n
         overrun = mb.pace(deadline)
@@ -903,6 +915,7 @@ def main(argv=None) -> int:
                     metavar="N_PER_M")
     sw.add_argument("--kd-swing", type=float, nargs=3, default=list(BCFG.KD_SWING),
                     metavar="NS_PER_M")
+    add_swing_leg_flags(sw)
     sw.add_argument("--swing-stop", type=float, default=30.0, metavar="DEG",
                     help="TRIP: a swinging joint this far from the arc's own IK "
                          "stops the run; 0 turns it off")
@@ -920,6 +933,10 @@ def main(argv=None) -> int:
         ap.error("--height is the fold's; the lift posture is config.NOMINAL_POSE "
                  "at %.0f mm" % (1e3 * BCFG.H_LIFT))
     height = FOLD_HEIGHT if args.height is None else 1e-3 * args.height
+    kp_swing, kd_swing, own_swing = swing_leg_gains(args)
+    if own_swing and args.swing != "cartesian":
+        ap.error("--kp/--kd-swing-%s are the Cartesian swing's; --swing %s swings "
+                 "on its own joint PD" % (own_swing[0].lower(), args.swing))
 
     try:
         gait = GAIT.TrotGait(period=args.period, duty=args.duty, ramp=args.contact_ramp,
@@ -938,8 +955,8 @@ def main(argv=None) -> int:
     try:
         bench = SwingBench(gate, gait, legs=[C.LEGS.index(name) for name in args.legs],
                            swing=args.swing, swing_height=1e-3 * args.swing_height,
-                           swing_ff=args.swing_ff, kp_swing=args.kp_swing,
-                           kd_swing=args.kd_swing, pose_s=args.pose_s, swings=args.swings,
+                           swing_ff=args.swing_ff, kp_swing=kp_swing,
+                           kd_swing=kd_swing, pose_s=args.pose_s, swings=args.swings,
                            swing_stop_deg=args.swing_stop,
                            ff_inertia=(None if args.ff_armature is None
                                        else SWING.feedforward_inertia(args.ff_armature)),
@@ -971,6 +988,8 @@ def main(argv=None) -> int:
           % (args.swing_height, args.swing, np.asarray(args.kp_swing),
              np.asarray(args.kd_swing), 1e3 * gait.swing_duration, demand["qd"][2],
              demand["tau"].max(), demand["slew"], 3.0 * demand["slew"], args.tau_slew))
+    if own_swing:
+        print(swing_leg_banner(kp_swing, kd_swing, own_swing, indent="  "))
     if demand["tau"].max() > args.tau_cap:
         print("  WARNING: the arc asks ~%.1f N*m against a %.1f cap -- raise --tau-cap "
               "or lower --swing-height" % (demand["tau"].max(), args.tau_cap))
@@ -988,24 +1007,47 @@ def main(argv=None) -> int:
         from .fake_bus import FakeDriverBus
         mb = motorbus.MotorBus(ids, bus=FakeDriverBus(ids=ids), dirs=HM.motor_directions())
     else:
-        mb = motorbus.MotorBus(ids, bitrate=args.bitrate, dirs=HM.motor_directions())
+        # `hw.stand.main`'s order: the process to nice -20, then can0 made
+        # clean by `hw.can_link`.  Neither for --fake.
+        print("  " + RT.boost())
+        try:
+            mb = CANL.open_motor_bus(ids, bitrate=args.bitrate,
+                                     dirs=HM.motor_directions())
+        except CANL.LinkError as refusal:
+            print("[bench] REFUSED before arming -- CAN: %s" % refusal,
+                  file=sys.stderr)
+            return 2
+    since = CANL.uptime()
     key = KeyPoller()
     if not key.ok and args.auto is None:
         print("[bench] stdin is not a terminal: ENTER and X will not work", file=sys.stderr)
     log = BenchLog() if args.log else None
     stop = None
+    gcq = RT.QuietGC()
     try:
         with mb:
+            print("  " + gcq.start())
             if not mb.arm(rate_hz=args.rate, timeout_s=args.arm_timeout):
                 print("[bench] not every motor armed", file=sys.stderr)
+                if not args.fake:
+                    print("[can] %s" % CANL.after_failed_arm(mb), file=sys.stderr)
                 return 1
-            stop = run(mb, bench, rate_hz=args.rate, key=key, auto_s=args.auto, log=log)
+            stop = run(mb, bench, rate_hz=args.rate, key=key, auto_s=args.auto,
+                       log=log, gcq=gcq)
     except KeyboardInterrupt:
         stop = "Ctrl-C"
     finally:
         key.restore()
+        gc_said = gcq.stop()
 
     print()
+    if gc_said:
+        print("[bench] " + gc_said)
+    if not args.fake and stop not in (None, "operator X", "Ctrl-C"):
+        print("[can] at the stop: %s"
+              % CANL.describe(getattr(mb, "at_stop", None)))
+        for line in CANL.dmesg_since(since):
+            print("[can] dmesg: " + line)
     print("[bench] swings:")
     print(bench.report())
     if gate.started_at is not None:

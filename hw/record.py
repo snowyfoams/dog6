@@ -276,8 +276,14 @@ def main(argv=None) -> int:
         mb = motorbus.MotorBus(ids, bus=FakeDriverBus(ids=ids),
                                dirs=HM.motor_directions())
     else:
-        mb = motorbus.MotorBus(ids, bitrate=args.bitrate,
-                               dirs=HM.motor_directions())
+        # can0 reset, replugged if it has to be, probed (`hw.can_link`).
+        from . import can_link as CANL
+        try:
+            mb = CANL.open_motor_bus(ids, bitrate=args.bitrate,
+                                     dirs=HM.motor_directions())
+        except CANL.LinkError as refusal:
+            print("[record] CAN: %s" % refusal, file=sys.stderr)
+            return 2
 
     recorder = None
     if args.out and not args.once:

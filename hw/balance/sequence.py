@@ -26,6 +26,13 @@ THE TROT IS A SUB-STATE OF HOLD, NOT AN EIGHTH PHASE
     away from the crouch's sites steps them home FIRST and parks after --
     the park is a joint ramp to the crouch and would drag them.
 
+    AND SO IS THE FALL HOLD, 2026-10-05.  The sweep the law reports `fallen`
+    (`law.BalanceLaw.fall_hold_deg`: the tilt past 45 deg, in rise, hold,
+    trot or step) the trot and the step are dropped where they are and
+    `phase_name` reads "fall" until ENTER, which PARKS -- the drivers'
+    position ramp to the crouch, from wherever the legs are.  T and W are
+    refused; there is no way back into the balance law in the same run.
+
 `mode` is the whole interface to the bus: "keepalive" (values None), "position"
 (values: (12,) joint rad, capped by `max_dps`) or "torque" (values: (12,) N*m,
 already through `safety.SafetyGate`).  `hw.stand` sends it and does not
@@ -179,6 +186,9 @@ BLURB = {
               "window; ENTER is refused until then",
     "step":   "STEPPING THE FEET -- one gait cycle, each diagonal lands on the "
               "new site; HOLD (or PARK) follows at four feet down",
+    "fall":   "THE FALL HOLD -- past the tilt limit: no balance, no swing, every "
+              "joint held at the stand in joint space.  ENTER parks; X drops "
+              "it limp",
     "park":   "driver position mode -> crouch",
     "done":   "driver position mode, holding crouch.  ENTER exits",
 }
@@ -447,6 +457,9 @@ class StandSequence:
         self.stepping = False
         self.park_after_step = False
         self.step_runs = 0
+        #: THE FALL HOLD's sub-state: True from the sweep the law reports
+        #: `fallen` until ENTER parks.  See the module docstring.
+        self.fallen = False
         self._sweep = 0
         #: `_four_foot_window`'s memory: the previous sweep's smallest contact
         #: weight while all four were down, or None.
@@ -459,6 +472,8 @@ class StandSequence:
 
     @property
     def phase_name(self) -> str:
+        if self.fallen:
+            return "fall"
         if self.stepping:
             return "step"
         return "trot" if self.trotting else PHASES[self.phase]
@@ -640,6 +655,13 @@ class StandSequence:
         self.body = self._measured(self.body)
         if self.finished:
             return None
+        # FROM THE FALL HOLD, ENTER PARKS -- whatever phase it fell in, the
+        # feet wherever they are: no step home first, nothing back into the
+        # balance law.  The park's ramp starts from the measured pose below.
+        from_fall = self.fallen
+        if from_fall:
+            self.fallen = False
+            self.phase = PHASES.index("hold")
         if self.trotting:
             return ("trotting -- press T to latch the exit, then ENTER parks "
                     "from HOLD")
@@ -648,7 +670,7 @@ class StandSequence:
                 " then PARK" if self.park_after_step else "")
         # THE FEET GO HOME BEFORE THE PARK.  The park ramps the joints to the
         # crouch; from any other stance that slides the feet on the floor.
-        if (self.phase_name == "hold" and self.law == "srb"
+        if (self.phase_name == "hold" and self.law == "srb" and not from_fall
                 and self.step_gait is not None and not self.feet_home):
             self.notice = self._start_step(now, self.home_xy,
                                            park_after=True)
@@ -823,7 +845,7 @@ class StandSequence:
                                   "steps back and parks." if not self.feet_home
                                   else "ENTER parks."))
 
-        if name in ("rise", "hold", "trot", "step"):
+        if name in ("rise", "hold", "trot", "step", "fall"):
             if self.law == "srb":
                 result = self._lift_srb(
                     now, body,
@@ -837,6 +859,8 @@ class StandSequence:
             elif name == "trot":
                 self.trot.add(now, self.out.state, self.balance, self.out)
                 self._count_swings()
+            if self.balance.fallen and not self.fallen:
+                self._enter_fall(now, name)
             return result
 
         self.tau = np.zeros(C.N_JOINTS)
@@ -865,6 +889,27 @@ class StandSequence:
                          "encoder, or something is pushing the leg")
             return "position", self.q_des, trip
         return "position", self.q_des, None
+
+    def _enter_fall(self, now: float, was: str) -> None:
+        """The law has engaged the fall hold this sweep: drop the trot or the
+        step where it is, and tell the operator what the robot is doing."""
+        self.fallen = True
+        self.trotting = self.trot_exit = False
+        if self.stepping:
+            self.balance.end_step()
+        self.stepping = self.park_after_step = False
+        self.balance.release_xy()
+        self.t_phase = float(now)
+        law = self.balance
+        self.notice = (
+            "FALL HOLD in %s: tilt %.1f deg from the setpoint, past %.0f.  "
+            "Balance, swing and trot OFF; every joint held at the %s in joint "
+            "space, Kp %.1f N*m/rad Kd %.2f N*m*s/rad + leg gravity, through "
+            "the torque cap.  ENTER parks; X drops it limp."
+            % (was, law.fall_tilt_deg, law.fall_hold_deg,
+               "stand HOLD latched" if law.q_stand is not None
+               else "stand the rise was heading to",
+               law.kp_fall, law.kd_fall))
 
     # -- the two lift laws -------------------------------------------------
     def _lift_srb(self, now: float, body, gait=None, xy_hold: bool = False):

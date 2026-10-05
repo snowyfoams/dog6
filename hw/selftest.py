@@ -58,9 +58,11 @@ from sim import params as P          # noqa: E402
 
 from . import CONFIRMED_ON_DOG6      # noqa: E402
 from . import calibration as CAL     # noqa: E402
+from . import can_link as CANL       # noqa: E402
 from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
 from . import kinematics as K        # noqa: E402
+from . import realtime as RT         # noqa: E402
 from . import safety as SAFE         # noqa: E402
 from . import velocity_estimator as VE   # noqa: E402
 from .hardware_map import MapIncomplete   # noqa: E402
@@ -523,6 +525,10 @@ def main() -> int:
     close("...at the stance the kinematics still agrees with sim's Q_STAND",
           np.abs(stance), np.abs(stance[0]), 1e-12, " m")
 
+    # -- 7. the loop's stop line, its GC, and the link ----------------------
+    print("\nthe loop's stop line, its GC, and can0 (no adapter touched)")
+    _loop_and_link_checks()
+
     # ----------------------------------------------------------------------
     print("\n%d checks, %d failed" % (_PASSES + len(_FAILURES), len(_FAILURES)))
     print("The stand's balance controller is gated separately, and this file "
@@ -544,6 +550,204 @@ def _refuses(fn) -> bool:
     except Exception:                # noqa: BLE001
         return True
     return False
+
+
+class _StubMotors:
+    """What `realtime.SendGuard` reads off a `MotorBus`, and nothing else."""
+
+    class _Rec:
+        def __init__(self, t):
+            self.last_cmd_t = t
+
+    def __init__(self, ids, t0):
+        self._recs = {mid: self._Rec(t0) for mid in ids}
+        self.last_send_error = None
+
+    def rec(self, mid):
+        return self._recs[mid]
+
+
+class _StubSocket:
+    """A python-can socket for `can_link.probe`: replies once, or never, or
+    refuses; `on_send` stands in for the adapter taking the frame off USB."""
+
+    def __init__(self, reply=None, refuse=False, on_send=None):
+        self.reply, self.refuse, self.on_send = reply, refuse, on_send
+
+    def send(self, msg, timeout=None):
+        if self.refuse:
+            raise OSError(100, "Network is down")
+        if self.on_send is not None:
+            self.on_send()
+
+    def recv(self, timeout=None):
+        if self.reply is not None:
+            reply, self.reply = self.reply, None
+            return reply
+        time.sleep(timeout or 0.0)
+        return None
+
+
+#: `/proc/net/can/rcvlist_*` with ONE python-can socket open on can0, as the
+#: kernel printed it on 2026-10-05: one row in `rx_all`, one in `rx_err`,
+#: the same userdata.
+_RCVLISTS = [
+    "\nreceive list 'rx_all':\n  (any: no entry)\n  device   can_id   can_mask"
+    "      function          userdata       matches  ident\n   can0      000   "
+    " 00000000  00000000c940fa3d  00000000578bebd3     91980  raw\n",
+    "\nreceive list 'rx_err':\n  (any: no entry)\n  device   can_id   can_mask"
+    "      function          userdata       matches  ident\n   can0      000   "
+    " 1fffffff  00000000c940fa3d  00000000578bebd3         0  raw\n",
+    "\nreceive list 'rx_eff':\n  (any: no entry)\n  (can0: no entry)\n",
+]
+
+
+def _loop_and_link_checks() -> None:
+    import gc
+    import io
+    import types
+
+    ids, limit, window = [1, 2, 3], 0.025, 0.050
+
+    # THE STOP LINE COUNTS FRAMES THE KERNEL TOOK.  Before 2026-10-05 it
+    # counted attempts, and a link refusing every frame never reached it.
+    motors = _StubMotors(ids, 0.0)
+    guard = RT.SendGuard(motors, ids, limit, window)
+    t, tripped = 0.0, None
+    for _ in range(250):
+        for k in range(3):
+            t += 0.004 / 3
+            tripped = tripped or guard.check(k, t)
+            guard.sent(k, True, t)
+    check("SendGuard: a frame every 4 ms never reaches the 25 ms line",
+          tripped is None, "worst %.1f ms" % guard.worst_ms())
+    motors.last_send_error = OSError(105, "No buffer space available")
+    taken, reason = t, None
+    while reason is None and t - taken < 0.2:
+        for k in range(3):
+            t += 0.004 / 3
+            reason = guard.check(k, t)
+            if reason:
+                break
+            guard.sent(k, False, t)
+    check("...a link refusing every frame stops AT the line, not 80 ms on",
+          reason is not None and "REFUSED" in reason
+          and t - taken <= limit + 0.004,
+          "%.1f ms after the last frame taken" % (1e3 * (t - taken)))
+    check("...and the stop says what the kernel said",
+          reason is not None and "No buffer space" in reason)
+
+    # OFF THE CPU OR COMPUTING: the thread's CPU time across the stall.
+    cpu = [0.0]
+    real_time = RT.time
+    RT.time = types.SimpleNamespace(thread_time=lambda: cpu[0],
+                                    perf_counter=real_time.perf_counter)
+    try:
+        off = RT.SendGuard(_StubMotors(ids, 0.0), ids, limit, window)
+        for k in range(3):
+            off.sent(k, True, 0.001 * k)
+        cpu[0] = 0.001
+        said = off.check(0, 0.032) or ""
+        check("...a whole-loop stall with the thread OFF the CPU says so",
+              "OFF-CPU" in said, said[said.find("--"):][:60])
+        gq = RT.QuietGC()
+        gq.last_at, gq.last_ms = 0.003, 24.0
+        busy = RT.SendGuard(_StubMotors(ids, 0.0), ids, limit, window, gq)
+        cpu[0] = 0.0
+        for k in range(3):
+            busy.sent(k, True, 0.001 * k)
+        cpu[0] = 0.029
+        said = busy.check(0, 0.032) or ""
+        check("...and ON it, naming the GC pass that took the time",
+              "COMPUTING" in said and "GC pass of 24.0 ms" in said,
+              said[said.find("--"):][:60])
+    finally:
+        RT.time = real_time
+
+    # THE COLLECTOR: frozen and off from start(), back on at stop().
+    was = gc.isenabled()
+    quiet = RT.QuietGC()
+    quiet.start()
+    frozen_off = (not gc.isenabled()) and gc.get_freeze_count() > 0
+    for sweep in range(300):
+        quiet.step(sweep)
+    said = quiet.stop()
+    check("QuietGC: start() freezes the program and turns collection off",
+          frozen_off, "%d objects frozen in %.0f ms" % (quiet.frozen,
+                                                      quiet.setup_ms))
+    check("...the loop's own passes run, and stop() puts it all back",
+          quiet.passes == 300 and gc.isenabled() == was
+          and gc.get_freeze_count() == 0 and "unreachable" in said,
+          "young max %.0f us" % quiet.young_us_max)
+
+    # THE LINK: whose it is, and what a probe makes of it.
+    check("can_link: one python-can socket is one, though it sits in two lists",
+          len(CANL.sockets_in(_RCVLISTS)) == 1)
+    check("...an empty list is none, and another interface's row is not ours",
+          not CANL.sockets_in(_RCVLISTS[2:]) and not CANL.sockets_in(
+              _RCVLISTS, "can1"))
+    saved = (CANL.receivers, CANL.link_state, CANL._root)
+    ran = []
+    CANL.receivers = lambda iface=CANL.IFACE: 1
+    CANL.link_state = lambda iface=CANL.IFACE: {"up": True,
+                                                "state": "ERROR-ACTIVE"}
+    CANL._root = lambda argv, stdin=None: ran.append(argv)
+    try:
+        raises("...reset() REFUSES a link another process has open",
+               CANL.reset, CANL.LinkError)
+        raises("...and so does replug()",
+               lambda: CANL.replug(say=lambda line: None), CANL.LinkError)
+        check("...without running a single root command", not ran)
+    finally:
+        CANL.receivers, CANL.link_state, CANL._root = saved
+
+    import can
+    tx = [0]
+    saved_tx = CANL._tx_packets
+    CANL._tx_packets = lambda iface=CANL.IFACE: tx[0]
+    try:
+        reply = can.Message(arbitration_id=0x141, is_extended_id=False,
+                            data=[0x9A, 30, 0, 0, 0, 0, 0, 0])
+        check("probe: a motor's reply is 'answer'",
+              CANL.probe(_StubSocket(reply=reply), 1) == "answer")
+        count = lambda: tx.__setitem__(0, tx[0] + 1)      # noqa: E731
+        check("...no reply, the frame off the USB: 'silent' -- motors off, "
+              "no replug", CANL.probe(_StubSocket(on_send=count), 1) == "silent")
+        check("...the frame never off the USB: 'stuck' -- the replug case",
+              CANL.probe(_StubSocket(), 1) == "stuck")
+        check("...the kernel refusing it: 'refused'",
+              CANL.probe(_StubSocket(refuse=True), 1) == "refused")
+    finally:
+        CANL._tx_packets = saved_tx
+
+    # THE RUNNER: an adapter that leaves USB mid-run is a STOP -- reports
+    # and log included -- not a traceback out of `MotorBus.poll()`.
+    from . import stand as STAND
+    from .fake_bus import FakeDriverBus
+    real_recv = FakeDriverBus.recv
+    calls = [0]
+
+    def dying_recv(self, timeout=0.0):
+        calls[0] += 1
+        if calls[0] > 20000:
+            raise can.CanOperationError("Error receiving: No such device", 19)
+        return real_recv(self, timeout)
+
+    FakeDriverBus.recv = dying_recv
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            code = STAND.main(["--fake", "--auto", "1", "--no-imu"])
+    finally:
+        FakeDriverBus.recv = real_recv
+    text = out.getvalue()
+    stop = [line[line.find(":", 20) + 2:] for line in text.splitlines()
+            if line.startswith("[stand] E-STOP")]
+    check("hw.stand: the adapter leaving USB mid-run is a stop, not a crash",
+          code == 1 and "CAN link lost" in text and "No such device" in text,
+          stop[0][:60] if stop else "no stop line")
+    check("...and the run's reports still print after it",
+          "[stand] GC:" in text and "motors stopped" in text)
 
 
 if __name__ == "__main__":

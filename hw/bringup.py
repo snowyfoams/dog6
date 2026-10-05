@@ -92,7 +92,10 @@ def _bus(ids, bitrate: int, fake: bool = False, joint_frame: bool = False):
     if fake:
         from .fake_bus import FakeDriverBus
         return motorbus.MotorBus(ids, bus=FakeDriverBus(ids=ids), dirs=dirs)
-    return motorbus.MotorBus(ids, bitrate=bitrate, dirs=dirs)
+    # can0 reset, replugged if it has to be, probed (`hw.can_link`); a
+    # `LinkError` is `main`'s to print.
+    from . import can_link as CANL
+    return CANL.open_motor_bus(ids, bitrate=bitrate, dirs=dirs)
 
 
 def _hold(mb, can_id, target_deg, seconds, dps, rate_hz, unwrap):
@@ -512,7 +515,12 @@ def main(argv=None) -> int:
     if getattr(args, "port", "sentinel") is None:
         from . import imu as IMU
         args.port = IMU.DEFAULT_PORT
-    return args.func(args)
+    from . import can_link as CANL
+    try:
+        return args.func(args)
+    except CANL.LinkError as refusal:
+        print("[bringup] CAN: %s" % refusal, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

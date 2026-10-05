@@ -228,7 +228,7 @@ class TrunkOrientation:
 
     R: np.ndarray            # (3, 3)  world <- trunk, `coordinates.rot_zyx`
     omega_b: np.ndarray      # (3,)    rad/s in the TRUNK frame -- the gyro's
-    roll: float              # rad, trimmed.  For the tilt trip and the log,
+    roll: float              # rad, trimmed.  For the fall hold and the log,
     pitch: float             # rad, trimmed.  NOT for the control law.
     yaw: float               # rad, magnetometer -- UNTRUSTED as an absolute
     #                          heading; held against the latched one (KP_YAW)

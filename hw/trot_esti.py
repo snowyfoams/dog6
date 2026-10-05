@@ -535,7 +535,6 @@ def main(argv=None) -> int:
     """`hw.trot.main`'s run, the filter printed beside it and, with
     `--est-xy` (the default), closing the hold's and the trot's x/y."""
     return STAND.main(argv, crouch=TROT.CROUCH, only_law="srb",
-                      tilt_stop=TROT.TILT_STOP_DEG,
                       track_stop=TROT.TRACK_STOP_DEG,
                       step_to=TROT.STEP_FOOT_XY,
                       step_period=TROT.STEP_PERIOD_S,

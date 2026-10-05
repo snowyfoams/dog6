@@ -142,11 +142,23 @@ THE 50 MS INPUT-LOST PROTECTION IS WHAT SHAPES THE LOOP
       * the driver fault byte only arrives in a 0x9A reply, so one 0x9A
         replaces one control frame every other sweep, rotating over the
         twelve.  That motor's command gap becomes two sweeps, 8 ms at 250 Hz;
-      * before every send the gap since that motor's previous frame is
-        measured.  Past `GAP_ESTOP_S` -- half the window -- the run stops
-        while the drivers are still listening, rather than finding out from a
-        0x80 that one of them already went limp.  A 0x80 seen anyway is its
-        own e-stop.
+      * before every send the gap since that motor's previous frame THE
+        KERNEL TOOK is measured.  Past `GAP_ESTOP_S` -- half the window --
+        the run stops while the drivers are still listening, rather than
+        finding out from a 0x80 that one of them already went limp, and says
+        whether the link refused, another process had the core, or this one
+        was computing (`realtime.SendGuard`).  A 0x80 seen anyway is its own
+        e-stop;
+      * nothing else may take the time either: the garbage collector is
+        frozen before `arm()` and run by the loop in a slot of its own, and
+        on the robot every thread runs at nice -20 (`hw.realtime`: a GC pass
+        reproduced "CAN 6 went 27.3 ms without a frame" on the fake bus, and
+        four MuJoCo sweeps beside a real run took a quarter of its core --
+        the two candidates for that stop, 2026-10-05);
+      * can0 itself is the program's: reset before the socket opens and
+        after the motors stop, re-plugged in software when it has to be
+        (`hw.can_link`).  A link that dies under the loop is a stop reason
+        like any other, with the log and the reports after it.
 
 
 AN E-STOP IS A LIMP ROBOT, AND DURING RISE OR HOLD THAT IS A DROP
@@ -158,6 +170,13 @@ AN E-STOP IS A LIMP ROBOT, AND DURING RISE OR HOLD THAT IS A DROP
     supported -- and note that HOLD is the phase an operator deliberately
     PUSHES, so it is the phase in which a trip is most likely and a drop
     least expected.
+
+    A TILT ENDS NOTHING: THE TILT E-STOP IS DELETED, 2026-10-05, on request.
+    Past `--fall-hold` the balance law stops and every joint is held at the
+    stand in joint space (`balance.law.BalanceLaw.fall_hold_deg`, phase
+    "fall") until ENTER parks or X drops it -- 45 deg in every trot.  The
+    stands have no fall hold (their 5 N*m/s slew cannot carry it), so in a
+    stand nothing acts on a tilt; the tracking trip is still on.
 
     `--tau-cap` defaults to `safety.TAU_START_MAX` = 1.0 N*m, which CANNOT
     lift the robot: the lift phase will push, saturate, and leave the trunk on
@@ -196,8 +215,10 @@ from sim import params as P          # noqa: E402
 
 from . import CONFIRMED_ON_DOG6      # noqa: E402
 from . import calibration as CAL     # noqa: E402
+from . import can_link as CANL       # noqa: E402
 from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
+from . import realtime as RT         # noqa: E402
 from . import safety as SAFE         # noqa: E402
 from . import velocity_estimator as VEL  # noqa: E402
 from .balance import config as BCFG  # noqa: E402
@@ -514,11 +535,18 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         auto_s: float | None = None, clock=time.perf_counter,
         imu=None, log: "StandLog | None" = None,
         velocity: "VelocityTap | None" = None, estimator=None,
-        hook=None, terse: bool = False, feed: bool = False) -> str | None:
+        hook=None, terse: bool = False, feed: bool = False,
+        gcq: "RT.QuietGC | None" = None) -> str | None:
     """Drive `stand` on an ARMED `mb` until done, X, or a trip.
 
     Returns the stop reason, or None for a clean exit from "done".  Does not
     stop the motors -- the caller's `with MotorBus(...)` does, on every path.
+    A link that dies under the loop (the adapter off USB, can0 down) is a
+    stop reason too, not an exception: the log and the reports still come.
+
+    `gcq` is `main`'s started `realtime.QuietGC`: with it the loop runs the
+    garbage collector itself, in `realtime.GC_SLOT`; without it the
+    automatic collector runs wherever an allocation trips it, as before.
 
     `imu` is an `hw.imu.ImuDog` or None.  NONE IS AN ABLATION, NOT A DEFAULT:
     with no IMU the trunk is assumed perfectly level and infinitely fresh, the
@@ -562,13 +590,16 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     level = IMU.TrunkOrientation.level()
     est_slot = ESTIMATOR_SLOT % n
     est_sweep = None                  # (now, stand, body, orientation), latched
+    # The gap counted on frames the kernel TOOK, and the verdict on a stall.
+    guard = RT.SendGuard(mb, ids, GAP_ESTOP_S, SAFE.INPUT_LOST_S, gcq)
+    gc_slot = RT.GC_SLOT % n
+    link_lost = CANL.bus_errors()
 
     sweep = 0
     mode, values = "keepalive", None
     q_prev = t_prev = None
     qd_ctrl = np.zeros(n)
     q = np.zeros(n)
-    worst_gap = np.zeros(n)
     overruns = 0
     #: `_crouch_report`, once per arrival of a position ramp (crouch, park).
     pose_reported = False
@@ -583,7 +614,12 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     deadline = clock() + slot
     k = 0
     while True:
-        mb.poll()
+        try:
+            mb.poll()
+        except link_lost as failure:
+            return ("CAN link lost: %s -- the adapter left USB or can0 went "
+                    "down under the run (the drivers go limp within %.0f ms)"
+                    % (failure, 1e3 * SAFE.INPUT_LOST_S))
         if k == 0:
             now = clock()
             q, qd_driver = CAL.joint_state(mb, unwrappers)
@@ -767,7 +803,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 tail = "" if terse else (
                         "  |tau|=%.2f/%.2f  gap=%.1f ms  overrun=%d%s"
                         % (float(np.abs(stand.tau).max()), stand.tau_peak,
-                           1e3 * worst_gap.max(), overruns,
+                           guard.worst_ms(), overruns,
                            "" if stand.out is None else
                            "  res %.1fN/%.2fNm"
                            % (stand.out.allocation.residual_force,
@@ -808,10 +844,15 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                     track = ""
                     if stand.phase_name in ("settle", "crouch", "park", "done") \
                             and stand.q_des is not None and not terse:
+                        # NOT `k`: that is the slot, and the frame below goes
+                        # to ids[k].  Named `k` until 2026-10-05, every
+                        # position-phase status line moved the round robin
+                        # to the worst joint and skipped the motors before
+                        # it for a sweep -- an 8 ms gap where 4 was meant.
                         err = np.abs(np.asarray(body.q) - np.asarray(stand.q_des))
-                        k = int(np.argmax(err))
-                        track = "  track %.1f deg (%s)" % (np.degrees(err[k]),
-                                                           HM.JOINT_LABELS[k])
+                        worst = int(np.argmax(err))
+                        track = "  track %.1f deg (%s)" % (np.degrees(err[worst]),
+                                                           HM.JOINT_LABELS[worst])
                     print("   %-6s t=%5.1f  h_cmd=%6.1f  %s%s%s"
                           % (stand.phase_name, now - stand.t_phase,
                              1e3 * BSTATE.origin_to_height(stand.h_cmd),
@@ -824,33 +865,36 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 if (hook is not None and not terse
                         and stand.phase_name in ("hold", "trot")):
                     print("          " + hook.status(now, stand), flush=True)
-                if (stand.phase_name in ("rise", "hold", "trot", "step")
-                        and not terse):
+                if (stand.phase_name in ("rise", "hold", "trot", "step",
+                                         "fall") and not terse):
                     print(_torque_lines(stand.tau, tau_meas), flush=True)
             sweep += 1
 
         # -- one frame, to one motor --------------------------------------
         mid = ids[k]
         sent_at = clock()
-        previous = mb.rec(mid).last_cmd_t
-        if previous is not None:
-            gap = sent_at - previous
-            worst_gap[k] = max(worst_gap[k], gap)
-            if gap > GAP_ESTOP_S:
-                return ("CAN %d went %.1f ms without a frame, past the %.0f ms "
-                        "stop line (the drivers' window is %.0f ms)"
-                        % (mid, 1e3 * gap, 1e3 * GAP_ESTOP_S,
-                           1e3 * SAFE.INPUT_LOST_S))
+        # Past GAP_ESTOP_S since this motor's last frame THE KERNEL TOOK --
+        # and the reason says whether the link refused, another process had
+        # the core, or this one was computing (`realtime.SendGuard`).
+        reason = guard.check(k, sent_at)
+        if reason:
+            return reason
         if (sweep % STATUS_EVERY_SWEEPS == 0
                 and k == (sweep // STATUS_EVERY_SWEEPS) % n):
-            mb.status1_req(mid)
+            taken = mb.status1_req(mid)
         elif mode == "position":
-            mb.position(mid, float(np.rad2deg(values[k])),
-                        max_dps=float(stand.max_dps[k]))
+            taken = mb.position(mid, float(np.rad2deg(values[k])),
+                                max_dps=float(stand.max_dps[k]))
         elif mode == "torque":
-            mb.torque(mid, float(values[k]))
+            taken = mb.torque(mid, float(values[k]))
         else:
-            mb.keepalive(mid)
+            taken = mb.keepalive(mid)
+        guard.sent(k, taken, sent_at)
+
+        # The garbage collector, in a slot of its own after its frame -- not
+        # wherever an allocation happens to trip it (`realtime.QuietGC`).
+        if k == gc_slot and gcq is not None:
+            gcq.step(sweep)
 
         # A tap that costs real time runs HERE, in a slot of its own and
         # AFTER that slot's frame is already out -- see `ESTIMATOR_SLOT`.
@@ -874,9 +918,61 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
     # unreachable
 
 
+def add_swing_leg_flags(group, base: str = "swing") -> None:
+    """`--kp-swing-fl` .. `--kd-swing-rr`: ONE LEG'S Cartesian swing PD, x y
+    z, in place of `--kp-swing` / `--kd-swing` on that leg alone.  2026-10-05,
+    on request: a leg whose swing is weak is tuned without touching the other
+    three.  The trot's parser and `hw.swing_bench`'s; `base` "swing-walk" is
+    the walk's impedance, `--kp-swing-walk-rl` in place of `--kp-swing-walk`
+    (`hw.fold_walk`, `hw.fold2_walk`).  `swing_leg_gains` reads them back."""
+    for leg in C.LEGS:
+        group.add_argument("--kp-%s-%s" % (base, leg.lower()), type=float,
+                           nargs=3, default=None, metavar="N_PER_M",
+                           help="%s's own swing stiffness, x y z, in place of "
+                                "--kp-%s on %s alone" % (leg, base, leg))
+        group.add_argument("--kd-%s-%s" % (base, leg.lower()), type=float,
+                           nargs=3, default=None, metavar="NS_PER_M",
+                           help="%s's own swing damping, in place of --kd-%s"
+                                % (leg, base))
+
+
+def swing_leg_gains(args, base: str = "swing"
+                    ) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """(4, 3) Kp, (4, 3) Kd -- a row per leg, FL FR RL RR: `--kp-<base>` /
+    `--kd-<base>` in every row, a leg's own flags in its own -- and the
+    names of the legs that have their own."""
+    name = base.replace("-", "_")
+    kp = np.tile(np.asarray(getattr(args, "kp_" + name), dtype=float),
+                 (C.N_LEGS, 1))
+    kd = np.tile(np.asarray(getattr(args, "kd_" + name), dtype=float),
+                 (C.N_LEGS, 1))
+    own = []
+    for i, leg in enumerate(C.LEGS):
+        row_p = getattr(args, "kp_%s_%s" % (name, leg.lower()), None)
+        row_d = getattr(args, "kd_%s_%s" % (name, leg.lower()), None)
+        if row_p is not None:
+            kp[i] = row_p
+        if row_d is not None:
+            kd[i] = row_d
+        if row_p is not None or row_d is not None:
+            own.append(leg)
+    return kp, kd, own
+
+
+def swing_leg_banner(kp, kd, own, indent: str = "       ") -> str:
+    """The banner's line for the legs with their own swing gains."""
+    rest = [leg for leg in C.LEGS if leg not in own]
+    return ("%sPER-LEG swing PD: %s%s"
+            % (indent,
+               "; ".join("%s Kp %s Kd %s" % (leg, kp[C.LEGS.index(leg)],
+                                            kd[C.LEGS.index(leg)])
+                         for leg in own),
+               "; %s as above" % " ".join(rest) if rest else ""))
+
+
 def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          dynamic_setpoint: bool = None, only_law: str = None,
-         tilt_stop: float = None, roll_gains: tuple = None,
+         roll_gains: tuple = None,
          track_stop: float = None, gait=None, tau_cap: float = None,
          tau_ceiling: float = None, tau_slew: float = None,
          overspeed_trip: bool = True, step_to=None,
@@ -886,7 +982,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          terse: bool = False, limits: bool = True,
          rise_track: bool = False, height: float = None,
          stand_xy=None, slide_from: float = None,
-         est_xy: bool = None, alloc: str = "qp") -> int:
+         est_xy: bool = None, alloc: str = "qp",
+         fall_hold: float = None) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -894,8 +991,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     `limits` False is `--no-limits` by default: every limit on WHERE the
     robot goes is off -- the soft joint limits (the gate's torque block and
     its e-stop), the position-mode tracking trips, the torque-phase tracking
-    trip, the tilt stop, the residual trip and the overspeed trip.  What stays
-    on is `NO_LIMITS_KEPT`.
+    trip, the residual trip and the overspeed trip.  What stays on is
+    `NO_LIMITS_KEPT`.  There is no tilt stop to turn off: it is deleted.
 
     `gait` (a `balance.gait.TrotGait`) enables T; `tau_cap`, `tau_ceiling`
     and `tau_slew` are the gate's default cap, the ceiling it will accept and
@@ -943,6 +1040,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     afterwards, which every run flew until then).  A hook with
     `law_kwargs(args)` hands the law more keyword arguments --
     `hw.fold_walk`'s walk plan.
+    `fall_hold` (deg) is `--fall-hold`'s default, THE FALL HOLD
+    (`law.BalanceLaw.fall_hold_deg`): every trot passes
+    `config.FALL_HOLD_DEG` through `trot.trot_options`; None is off, the
+    stands' default -- on their 5 N*m/s slew it whirls the legs, and
+    `--fall-hold` is refused below `config.FALL_HOLD_MIN_SLEW_NM_S`.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -1028,14 +1130,26 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                      help="zero both attitude gains -- the other half of the "
                           "A/B.  Height loop and gravity only; the trunk will "
                           "NOT push back")
-    law.add_argument("--tilt-stop", type=float,
-                     default=BCFG.TILT_STOP_DEG if tilt_stop is None
-                     else tilt_stop, metavar="DEG",
-                     help="e-stop past this many degrees FROM THE SETPOINT.  "
-                          "IT IS A TRIP: raising it lets the robot reach an "
-                          "attitude it cannot come back from, and an e-stop "
-                          "there is a harder fall.  Raise it to WATCH a "
-                          "steady-state tilt the default stops you seeing")
+    law.add_argument("--fall-hold", type=float,
+                     default=0.0 if fall_hold is None else float(fall_hold),
+                     metavar="DEG",
+                     help="THE FALL HOLD: past this many degrees FROM THE "
+                          "SETPOINT the balance law, the swing and the trot "
+                          "stop and every joint is held at the stand in joint "
+                          "space; the run goes on until ENTER parks.  There "
+                          "is no tilt e-stop (deleted), so 0 -- off -- means "
+                          "nothing acts on a tilt.  Not a limit: --no-limits "
+                          "leaves it on.  Needs --tau-slew %.0f or more"
+                          % BCFG.FALL_HOLD_MIN_SLEW_NM_S)
+    law.add_argument("--kp-fall", type=float, default=BCFG.KP_FALL_HOLD,
+                     metavar="NM_PER_RAD",
+                     help="the fall hold's joint stiffness, every joint, on "
+                          "top of the leg's own weight.  STIFFER IS WORSE "
+                          "behind the slew: in MuJoCo 10 whirled the legs in "
+                          "2 of 8 falls and 30 in all 3 tried "
+                          "(config.KP_FALL_HOLD)")
+    law.add_argument("--kd-fall", type=float, default=BCFG.KD_FALL_HOLD,
+                     metavar="NMS_PER_RAD", help="the fall hold's joint damping")
     law.add_argument("--track-stop", type=float,
                      default=(np.rad2deg(BCFG.TRACK_STOP_RAD) if track_stop is None
                               else track_stop), metavar="DEG",
@@ -1051,8 +1165,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                      default=bool(limits),
                      help="ON: the soft joint limits (the gate's torque block "
                           "and e-stop), the position-mode and torque-phase "
-                          "tracking trips, the tilt stop, the residual trip "
-                          "and the overspeed trip -- at the flags above")
+                          "tracking trips, the residual trip and the "
+                          "overspeed trip -- at the flags above")
     lim.add_argument("--no-limits", dest="limits", action="store_false",
                      default=argparse.SUPPRESS,
                      help="all of those OFF, whatever the flags above say.  "
@@ -1132,6 +1246,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                "default is the operator's best fold trot, "
                                "2026-10-02 (config.KD_SWING); DOG5's was 8 8 "
                                "15")
+        add_swing_leg_flags(trot)
         trot.add_argument("--kp-swing-knee", type=float, nargs=3,
                           metavar="NM_PER_RAD", default=list(BCFG.KP_SWING_KNEE),
                           help="--swing knee's joint PD, abd pitch knee: abd "
@@ -1253,7 +1368,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         hook.add_arguments(ap)
     args = ap.parse_args(argv)
     if hook is not None:
-        hook.configure(args)
+        try:
+            hook.configure(args)
+        except ValueError as refusal:     # the hook's own flags, refused
+            ap.error(str(refusal))
     if args.latch is None:
         args.latch = (bool(BCFG.SETPOINT_DYNAMIC) if dynamic_setpoint is None
                       else bool(dynamic_setpoint))
@@ -1302,10 +1420,28 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         if args.swing_roll and swing != "cartesian":
             ap.error("--swing-roll levels the Cartesian arc; --swing %s "
                      "latches its own at liftoff" % swing)
+        kp_swing, kd_swing, own_swing = swing_leg_gains(args)
+        if own_swing and swing != "cartesian":
+            ap.error("--kp/--kd-swing-%s are the Cartesian swing's; --swing "
+                     "%s swings on its own joint PD"
+                     % (own_swing[0].lower(), swing))
+        if own_swing and getattr(hook, "replaces_swing", False):
+            ap.error("--kp/--kd-swing-%s are the trot's swing, and this entry "
+                     "point's hook replaces it: the walk's own are "
+                     "--kp/--kd-swing-walk-%s"
+                     % (own_swing[0].lower(), own_swing[0].lower()))
+    if args.fall_hold > 0.0 and slew < BCFG.FALL_HOLD_MIN_SLEW_NM_S:
+        ap.error("--fall-hold on a %.0f N*m/s slew: a joint PD behind a slew "
+                 "that slow limit-cycles -- in MuJoCo, hw.fold_stand pushed "
+                 "over at 5 N*m/s, the legs whirled (670 deg off the stand); "
+                 "at 60 and 120 they held.  Add --tau-slew %.0f or more, "
+                 "knowing it is the stand's whole torque path, or leave the "
+                 "fall hold off (config.FALL_HOLD_MIN_SLEW_NM_S)"
+                 % (slew, BCFG.FALL_HOLD_MIN_SLEW_NM_S))
     if not args.limits:
         # --no-limits, `main`'s docstring.  Set before anything is built or
         # printed, so the banner reports what actually flies.
-        args.tilt_stop, args.track_stop = float("inf"), 0.0
+        args.track_stop = 0.0
         overspeed_trip = False
     try:
         gate = SAFE.SafetyGate(args.tau_cap, unconfirmed_reason=reason,
@@ -1388,7 +1524,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               gravity_legs_per_sweep=args.gravity_legs,
                               mu=args.mu, foot_xy=crouch.foot_xy,
                               dynamic_setpoint=args.latch,
-                              tilt_stop_deg=args.tilt_stop,
+                              fall_hold_deg=(args.fall_hold
+                                             if args.fall_hold > 0.0 else None),
+                              kp_fall=args.kp_fall, kd_fall=args.kd_fall,
                               track_stop_deg=args.track_stop,
                               residual_trip=args.limits, srb=srb,
                               swing=swing,
@@ -1403,8 +1541,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               ff_inertia=(None if gait is None or args.ff_armature is None
                                           else BSWING.feedforward_inertia(args.ff_armature)),
                               **({} if gait is None else dict(
-                                  kp_swing=np.asarray(args.kp_swing, float),
-                                  kd_swing=np.asarray(args.kd_swing, float),
+                                  kp_swing=kp_swing, kd_swing=kd_swing,
                                   kp_swing_knee=np.asarray(args.kp_swing_knee,
                                                            float),
                                   kd_swing_knee=np.asarray(args.kd_swing_knee,
@@ -1469,6 +1606,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   "N/m Kd %s N s/m" % (args.swing_height,
                                        np.asarray(args.kp_swing),
                                        np.asarray(args.kd_swing)))
+            if own_swing:
+                print(swing_leg_banner(kp_swing, kd_swing, own_swing))
         # WHAT THE SWING ASKS, AGAINST WHAT THE GATE ALLOWS.  The one line
         # that says in advance whether the foot can FOLLOW the arc.  It lifts
         # either way -- it did at 80 ms of swing on the robot, 2026-09-25 --
@@ -1580,8 +1719,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                       "motionless trunk: leg odometry with a fake accelerometer")
     if not args.limits:
         print("  LIMITS OFF (--no-limits): soft joint limits (torque block and "
-              "e-stop), position-mode and torque-phase tracking, tilt stop, "
-              "residual trip, overspeed trip.  --limits puts them back.")
+              "e-stop), position-mode and torque-phase tracking, residual "
+              "trip, overspeed trip.  --limits puts them back.")
         print("       still on: %s" % NO_LIMITS_KEPT)
     if not overspeed_trip:
         print("  OVERSPEED TRIP OFF: joint speed is recorded, never stopped "
@@ -1635,19 +1774,23 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
           % (args.rate, 1e3 / args.rate, 1e3 * GAP_ESTOP_S,
              1e3 * SAFE.INPUT_LOST_S))
     if not args.limits:
-        print("  trips: tilt OFF, tracking OFF, residual OFF, position-mode "
-              "tracking OFF, joint limits OFF -- nothing stops on where the "
-              "robot goes")
+        print("  trips: tracking OFF, residual OFF, position-mode tracking "
+              "OFF, joint limits OFF -- nothing stops on where the robot "
+              "goes.  No tilt e-stop (deleted)")
     else:
-        print("  trips: tilt %.0f deg%s, tracking %s, residual %.1f N / "
-              "%.2f N*m sustained"
-              % (args.tilt_stop,
-                 "" if args.tilt_stop == BCFG.TILT_STOP_DEG else
-                 "  <-- RAISED from %.0f, the robot can reach an attitude it "
-                 "cannot recover from" % BCFG.TILT_STOP_DEG,
-                 ("%.0f deg" % args.track_stop) if args.track_stop > 0
+        print("  trips: tracking %s, residual %.1f N / %.2f N*m sustained.  "
+              "No tilt e-stop (deleted)"
+              % (("%.0f deg" % args.track_stop) if args.track_stop > 0
                  else "OFF",
                  BCFG.RESIDUAL_FORCE_N, BCFG.RESIDUAL_MOMENT_NM))
+    if args.law == "srb" and args.fall_hold > 0.0:
+        print("  FALL HOLD past %.0f deg from the setpoint: no balance, no "
+              "swing, no trot -- every joint held at the stand, Kp %.1f "
+              "N*m/rad Kd %.2f N*m*s/rad + leg gravity, and the run goes on "
+              "until ENTER parks"
+              % (args.fall_hold, args.kp_fall, args.kd_fall))
+    elif args.law == "srb":
+        print("  fall hold OFF: nothing acts on a tilt")
     print("  ENTER steps the phase (RISE ends on its own).  X is an E-STOP "
           "-- from rise or hold it DROPS the robot.")
     if hook is not None:
@@ -1673,8 +1816,22 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         bus = FakeDriverBus(ids=ids)
         mb = motorbus.MotorBus(ids, bus=bus, dirs=HM.motor_directions())
     else:
-        mb = motorbus.MotorBus(ids, bitrate=args.bitrate,
-                               dirs=HM.motor_directions())
+        # THE PROCESS FIRST, THEN THE LINK.  Every thread to nice -20 before
+        # the IMU's reader starts, so it inherits it (`realtime.boost`); then
+        # can0 reset, replugged in software if it has to be, and probed --
+        # what `ip link set can0 down / up` and the USB cable were for
+        # (`hw.can_link`).  --fake does neither: a fake run must not
+        # outrank a real one on the CPU, or reset its link.
+        print("  " + RT.boost())
+        try:
+            mb = CANL.open_motor_bus(ids, bitrate=args.bitrate,
+                                     dirs=HM.motor_directions())
+        except CANL.LinkError as refusal:
+            print("[stand] REFUSED before arming -- CAN: %s" % refusal,
+                  file=sys.stderr)
+            key.restore()
+            return 2
+    since = CANL.uptime()
 
     # The IMU is opened BEFORE the bus and started before arming: its stream
     # takes a moment to come up, and the one place that must not wait for a
@@ -1691,6 +1848,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             print("[stand] no IMU: %s\n[stand] pass --no-imu to run the "
                   "level-trunk ablation deliberately." % failure,
                   file=sys.stderr)
+            key.restore()
+            if not args.fake:
+                mb.close()        # the socket shut and can0 reset, unarmed
             return 2
 
     tap = None
@@ -1716,25 +1876,43 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   "not a sensor")
 
     stop = None
+    gcq = RT.QuietGC()
     try:
         with mb:
+            # The collector frozen and switched off BEFORE arming: its one
+            # full collection takes tens of ms, and from arm() on nothing may.
+            print("  " + gcq.start())
             if not mb.arm(rate_hz=args.rate, timeout_s=args.arm_timeout):
                 print("[stand] not every motor armed", file=sys.stderr)
+                if not args.fake:
+                    print("[can] %s" % CANL.after_failed_arm(mb),
+                          file=sys.stderr)
                 return 1
             # Straight into the loop: arm() streamed until this instant, and
             # nothing may sit between it and the first slot.
             stop = run(mb, stand, rate_hz=args.rate, key=key,
                        auto_s=args.auto, imu=imu, log=log, velocity=tap,
                        estimator=est_tap, hook=hook, terse=terse,
-                       feed=xy_loop)
+                       feed=xy_loop, gcq=gcq)
     except KeyboardInterrupt:
         stop = "Ctrl-C"
     finally:
         key.restore()
         if imu is not None:
             imu.stop()
+        gc_said = gcq.stop()
 
     print()
+    if gc_said:
+        print("[stand] " + gc_said)
+    if not args.fake and stop not in (None, "operator X", "Ctrl-C"):
+        # THE LINK AS THE STOP LEFT IT, read before the exit reset cleared
+        # it, and what the kernel said about USB during the run: a stop that
+        # was the adapter says so here, not in the control law.
+        print("[can] at the stop: %s"
+              % CANL.describe(getattr(mb, "at_stop", None)))
+        for line in CANL.dmesg_since(since):
+            print("[can] dmesg: " + line)
     if args.law == "srb" and stand.balance.armed:
         print("[stand] the lift, as the law saw it:")
         print(stand.balance.report())

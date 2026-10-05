@@ -13,9 +13,16 @@
 from WIDE on request 2026-09-21 -- no abduction splay), the attitude
 setpoint LATCHED in limp, the HEADING latched at the end of the crouch
 (below), and roll
-following `--kp-att / --kd-att` (90 / 17) -- except the tilt stop, 45 deg
-(`TILT_STOP_DEG`), and the torque-phase tracking trip, OFF
-(`TRACK_STOP_DEG`).  Every one is still a flag.
+following `--kp-att / --kd-att` (90 / 17) -- except the torque-phase
+tracking trip, OFF (`TRACK_STOP_DEG`).  Every one is still a flag.
+
+THE FALL HOLD, 2026-10-05, on request: in every trot (`trot_options`), past
+45 deg from the setpoint the run does NOT stop.  The balance law, the swing
+and the trot stop, and every joint is held at the stand HOLD latched by a
+joint PD alone, Kp 5 / Kd 0.2 plus the leg's weight
+(`balance.law.BalanceLaw.fall_hold_deg`); the phase reads "fall", ENTER
+parks, X drops it.  The tilt e-stop that used to sit at 45 deg here
+(`TILT_STOP_DEG`) is DELETED, on request: no tilt stops a run.
 
 The trot is `trot_options` below -- the cap, slew and overspeed decision
 first made for `hw.fold_trot` -- with the Cartesian swing and a FASTER clock:
@@ -35,6 +42,8 @@ has the run).
     $V -m hw.trot --half-gait                   the handover by HAND: each
                                                 T is half a gait cycle, the
                                                 diagonals alternating
+    $V -m hw.trot --kd-swing-rl 5 5 60          ONE LEG'S swing PD: RL's own,
+                                                the other three on --kd-swing
 
 WHY THIS STANCE, AFTER THE FOLD ONE
     The fold trot tipped in roll on 2026-09-17.  That fold stance (rear legs
@@ -191,6 +200,31 @@ THE SWING FEEDFORWARD, 2026-09-25 (`--swing-ff`, off by default)
     own dynamics, 20 mm / 140 ms: 4.3 mm of x at touchdown without it, 0.8
     with it.  It is in now, one Jacobian more.
 
+ONE LEG'S SWING GAINS, 2026-10-05, ON REQUEST
+    `--kp-swing-fl` .. `--kd-swing-rr` (x y z, N/m and N s/m) replace
+    `--kp-swing` / `--kd-swing` on that leg alone, so a leg whose swing is
+    weak is tuned without touching the other three; the banner prints the
+    legs that have their own.  Every trot entry point and `hw.swing_bench`
+    (`hw.stand.add_swing_leg_flags`; the law takes a (4, 3) table,
+    `balance.swing.leg_gains`).  The Cartesian swing's only: `--swing joint`
+    / `knee` refuse them before the bus opens.  The walk has its own,
+    `--kp-swing-walk-rl` etc. on its impedance (`hw.fold_walk`).
+
+    MuJoCo, `hw.fold_trot` at its defaults, RL's three motors making 60 %
+    of the torque asked: RL's trunk-frame apex 7.1 -> 3.1 mm (the other
+    three 7.6-7.8).  RL's own Kd_z 60 / 80 brought it to 4.6 / 5.9 mm, Kp_z 600
+    alone to 3.6, Kp_z 700 with Kd_z 70 to 6.0 -- KD_Z IS THE KNOB on a
+    120 ms swing, Kd (v_ref - v) carrying the arc's speed before the error
+    has grown.  The other three legs and the trunk's roll / pitch did not
+    move.  What it costs: RL's slew clip 0.00 -> 0.17 N*m and its touchdown
+    -0.02 -> -0.09 m/s at Kd_z 80.  Coulomb friction on RL's pitch and knee
+    (0.3 N*m) cost the same 3.1 mm, and the same gains gave back about as
+    much: 5.2 at Kd_z 60, 5.8 at 600 / 60 (5.1 for the torque loss).
+    NOT FLOWN.  And in that model no leg reaches the 20 mm arc at the
+    defaults (7-9 mm, 33-40 ms late, at the inherited or 0.6x armature),
+    while on the robot the operator called the height good -- so read the
+    numbers as the knob's direction and size, not the robot's apex.
+
 THE STATE ESTIMATOR CLOSES THE HOLD'S AND THE TROT'S x/y, 2026-10-02, ON REQUEST
     Every trot, this one included: `trot_options` brings `hw.trot_esti`'s
     `EstimatorFeed` and `est_xy`, so the CoM's world x/y and rate come from
@@ -238,7 +272,7 @@ from .balance import config as BCFG  # noqa: E402
 from .balance import gait as GAIT    # noqa: E402
 from .balance import posture as POSE  # noqa: E402
 
-__all__ = ["main", "trot_options", "CROUCH", "TAU_CAP", "PERIOD_S", "TILT_STOP_DEG",
+__all__ = ["main", "trot_options", "CROUCH", "TAU_CAP", "PERIOD_S",
            "TRACK_STOP_DEG", "STEP_FOOT_XY", "STEP_PERIOD_S"]
 
 #: The crouch the trot lifts from and parks in: the normal one, abd not
@@ -280,10 +314,6 @@ TAU_CAP = SAFE.TAU_HARD_NM
 #: request (`config.KP_SWING` has the run).
 PERIOD_S = 0.6
 
-#: Raised from `hw.stand`'s 12 deg on request 2026-09-17, to `hw.fold_trot`'s.
-#: STILL A TRIP: past it the run stops and the trunk drops.  Run supported.
-TILT_STOP_DEG = 45.0
-
 #: The torque-phase tracking trip: OFF, on request 2026-09-17, after it ended
 #: a trot on "RL.knee is 26.3 deg from the IK at the commanded height (limit
 #: 25)".  It compares the joints against the IK of a LEVEL trunk at the
@@ -314,19 +344,21 @@ def trot_options(period: float = BCFG.GAIT_PERIOD) -> dict:
     A fresh gait each call: the clock carries its own start time.  The state
     estimator comes with it and closes the hold's and the trot's x/y,
     `--est-xy` on by default (see the module docstring); `--no-est-xy`
-    prints it only.
+    prints it only.  And the fall hold at `config.FALL_HOLD_DEG`, which the
+    trot's slew is fast enough to fly (`config.FALL_HOLD_MIN_SLEW_NM_S`).
     """
     # Imported here: `hw.trot_esti` imports this module for its own main.
     from .trot_esti import EstimatorFeed
     return dict(gait=GAIT.TrotGait(period=period), tau_cap=TAU_CAP,
                 tau_ceiling=TAU_CAP, tau_slew=BCFG.TAU_SLEW_TROT_NM_S,
-                overspeed_trip=False, estimator=EstimatorFeed, est_xy=True)
+                overspeed_trip=False, estimator=EstimatorFeed, est_xy=True,
+                fall_hold=BCFG.FALL_HOLD_DEG)
 
 
 def main(argv=None) -> int:
     """`hw.stand.main` from `CROUCH`, SRB only, plus the trot and W."""
     return STAND.main(argv, crouch=CROUCH, only_law="srb",
-                      tilt_stop=TILT_STOP_DEG, track_stop=TRACK_STOP_DEG,
+                      track_stop=TRACK_STOP_DEG,
                       step_to=STEP_FOOT_XY, step_period=STEP_PERIOD_S,
                       velocity=True, **trot_options(PERIOD_S))
 

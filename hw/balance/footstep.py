@@ -57,6 +57,23 @@ THE ARC: x/y IN THE WORLD, z IN THE TRUNK -- the split is deliberate
     moves, and a damper fed the trunk-frame velocity without it brakes every
     turn.  cMPC's `to_body` dropped it and said so; at 40 deg/s on a 0.2 m
     lever it is 0.14 m/s.
+
+AT REST THE ARC IS IN THE TRUNK FRAME -- hw.fold_trot's swing, 2026-10-05
+    With the reference AT REST (`at_rest`: v_ref and r both zero) a swing
+    that lifts is planned in the TRUNK frame for its whole flight: the same
+    x/y quintic from the foot latched at liftoff, landing on the leg's own
+    site, and the same z bump -- no eq (33), no Raibert term and no world,
+    so the filter's p, v and heading do not enter it (they place only the
+    logged `land_w`).  That is hw.fold_trot's in-place target, the arc from
+    rest site to rest site (`swing.swing_reference_pva`), started on the foot
+    instead of on the site so that a stiff swing law takes no step at
+    liftoff.  Why, on request: on the robot, standing, v_hat is rms 0.05-0.08
+    m/s with spikes to 0.4 (fold_walk_imp.npz), so the foothold above,
+    re-aimed every sweep, wandered 10-60 mm inside one 115 ms swing, and
+    Kp 150 chased it and threw the feet.  Decided once per swing, on its
+    first sweep: a key pressed mid-swing places the NEXT swing, and a swing
+    that lifted while walking lands where it was placed.  `place_at_rest`
+    keeps the placement at rest, as flown before.
 """
 from __future__ import annotations
 
@@ -118,7 +135,8 @@ class FootstepPlanner:
 
     def __init__(self, sites_b, *, t_stance: float, t_swing: float,
                  height: float = cfg.SWING_HEIGHT, kv: float = cfg.STEP_KV,
-                 step_max=cfg.STEP_MAX_XY):
+                 step_max=cfg.STEP_MAX_XY,
+                 place_at_rest: bool = cfg.WALK_PLACE_AT_REST):
         #: (4, 2) the stance's neutral feet, TRUNK frame x/y about the origin.
         self.sites_b = np.array(sites_b, dtype=float).reshape(C.N_LEGS, 2)
         self.t_stance, self.t_swing = float(t_stance), float(t_swing)
@@ -127,13 +145,37 @@ class FootstepPlanner:
         self.step_max = np.asarray(step_max, dtype=float).reshape(2)
         self.lift_w = np.full((C.N_LEGS, 2), np.nan)
         self.land_w = np.full((C.N_LEGS, 2), np.nan)
+        #: (4, 2) the foot at liftoff, TRUNK frame: where an arc at rest
+        #: starts.  (4,) True while the leg's swing in the air is one --
+        #: decided on its first sweep (`at_rest`), never with `place_at_rest`.
+        self.lift_b = np.full((C.N_LEGS, 2), np.nan)
+        self.rest_swing = np.zeros(C.N_LEGS, dtype=bool)
+        self.place_at_rest = bool(place_at_rest)
         #: Landings the workspace clamp moved, for the report.
         self.clamped = 0
+        #: Swings flown at rest (trunk frame, onto the site), and placed.
+        self.swings_at_rest = 0
+        self.swings_placed = 0
+
+    #: How near zero v_ref (m/s) and r (rad/s) must be for the reference to
+    #: be AT REST.  The keys snap a sum to exactly zero and the slew lands on
+    #: its target, so this absorbs float dust and nothing else.
+    REST_EPS = 1e-9
+
+    @classmethod
+    def at_rest(cls, ref) -> bool:
+        """True when the walking reference `ref` is AT REST: v_ref and r both
+        zero -- before the first key, or once SPACE has slewed it to a stop."""
+        return (abs(float(ref.v[0])) < cls.REST_EPS
+                and abs(float(ref.v[1])) < cls.REST_EPS
+                and abs(float(ref.yaw_rate)) < cls.REST_EPS)
 
     def release(self, leg: int) -> None:
         """The leg is down: forget its liftoff and plan."""
         self.lift_w[leg] = np.nan
         self.land_w[leg] = np.nan
+        self.lift_b[leg] = np.nan
+        self.rest_swing[leg] = False
 
     def foothold(self, leg: int, s: float, trunk: TrunkXY, ref) -> np.ndarray:
         """(2,) WORLD x/y the foot should touch down at -- the module's eq.
@@ -172,13 +214,26 @@ class FootstepPlanner:
         scalars (`selftest` holds them to it): x/y its quintic between two
         world points, z its two half-arcs to one apex with both ends at
         `z_rest`.  Building two of its objects per leg per sweep cost the law
-        more than the QP did."""
+        more than the QP did.
+
+        AT REST (`at_rest(ref)` on the swing's first sweep, held until
+        `release`) the x/y arc is the TRUNK-frame one instead, from the
+        latched foot to the leg's site (`_plan_at_rest`, module docstring)."""
         c, sn = math.cos(float(trunk.yaw)), math.sin(float(trunk.yaw))
         px, py = float(trunk.p[0]), float(trunk.p[1])
         if not math.isfinite(float(self.lift_w[leg, 0])):
             bx, by = float(x_b[0]), float(x_b[1])
             self.lift_w[leg, 0] = px + c * bx - sn * by
             self.lift_w[leg, 1] = py + sn * bx + c * by
+            self.lift_b[leg] = (bx, by)
+            self.rest_swing[leg] = (not self.place_at_rest
+                                    and self.at_rest(ref))
+            if self.rest_swing[leg]:
+                self.swings_at_rest += 1
+            else:
+                self.swings_placed += 1
+        if self.rest_swing[leg]:
+            return self._plan_at_rest(leg, s, c, sn, px, py, z_rest)
         self.land_w[leg] = self.foothold(leg, s, trunk, ref)
         s = min(max(float(s), 0.0), 1.0)
         rate = 1.0 / self.t_swing
@@ -192,11 +247,7 @@ class FootstepPlanner:
         vwx, vwy = dx * dh * rate, dy * dh * rate
         awx, awy = dx * ddh * rate * rate, dy * ddh * rate * rate
         # z in the trunk: the in-place bump on the commanded height.
-        seg, dseg = (2.0 * s, 2.0) if s < 0.5 else (2.0 - 2.0 * s, -2.0)
-        hz, dhz, ddhz = _quintic(seg)
-        pz = z_rest + self.height * hz
-        vz = self.height * dhz * dseg * rate
-        az = self.height * ddhz * dseg * dseg * rate * rate
+        pz, vz, az = self._bump(s, z_rest)
 
         # World -> trunk by the heading: p_b = Rz^T (p_w - p), and its rate
         # carries the turn, v_b = Rz^T (v_w - v) - w x p_b.
@@ -212,6 +263,38 @@ class FootstepPlanner:
         return SwingRef(p=np.array([pbx, pby, pz]),
                         v=np.array([vbx, vby, vz]),
                         a=np.array([abx, aby, az]),
+                        land_w=self.land_w[leg].copy(),
+                        lift_w=self.lift_w[leg].copy())
+
+    def _bump(self, s: float, z_rest: float):
+        """``(pz, vz, az)``, trunk z at clamped progress `s`: the in-place bump
+        on the commanded height.  Both arcs fly this one."""
+        rate = 1.0 / self.t_swing
+        seg, dseg = (2.0 * s, 2.0) if s < 0.5 else (2.0 - 2.0 * s, -2.0)
+        hz, dhz, ddhz = _quintic(seg)
+        return (z_rest + self.height * hz,
+                self.height * dhz * dseg * rate,
+                self.height * ddhz * dseg * dseg * rate * rate)
+
+    def _plan_at_rest(self, leg: int, s: float, c: float, sn: float,
+                      px: float, py: float, z_rest: float) -> SwingRef:
+        """The swing AT REST: TRUNK frame, the x/y quintic from the foot
+        latched at liftoff to the leg's site, and the z bump.  The filter's
+        heading and position (`c, sn, px, py`) place only the logged `land_w`,
+        the site where the filter has it now."""
+        s = min(max(float(s), 0.0), 1.0)
+        rate = 1.0 / self.t_swing
+        lx, ly = float(self.lift_b[leg, 0]), float(self.lift_b[leg, 1])
+        sx, sy = float(self.sites_b[leg, 0]), float(self.sites_b[leg, 1])
+        dx, dy = sx - lx, sy - ly
+        h, dh, ddh = _quintic(s)
+        pz, vz, az = self._bump(s, z_rest)
+        self.land_w[leg, 0] = px + c * sx - sn * sy
+        self.land_w[leg, 1] = py + sn * sx + c * sy
+        return SwingRef(p=np.array([lx + dx * h, ly + dy * h, pz]),
+                        v=np.array([dx * dh * rate, dy * dh * rate, vz]),
+                        a=np.array([dx * ddh * rate * rate,
+                                    dy * ddh * rate * rate, az]),
                         land_w=self.land_w[leg].copy(),
                         lift_w=self.lift_w[leg].copy())
 
@@ -241,6 +324,11 @@ def describe() -> str:
                     % (v, np.degrees(r), np.round(1e3 * land, 1),
                        np.round(1e3 * sites[0], 1),
                        np.round(1e3 * (land - sites[0]), 1)))
+    rows.append("  at rest (v_ref 0, r 0): %s"
+                % ("placed as above, v_hat in it (place_at_rest)"
+                   if planner.place_at_rest else
+                   "the TRUNK-frame arc from the liftoff foot to the site, "
+                   "no velocity term -- hw.fold_trot's in-place target"))
     return "\n".join(rows)
 
 

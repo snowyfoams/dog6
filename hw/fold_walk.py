@@ -4,6 +4,10 @@
     $V -m hw.fold_walk --fake --auto 1 --no-imu      the whole path, no robot
     $V -m hw.fold_walk --log fold_walk.npz           on the robot
     $V -m hw.fold_walk --alloc wls                   the least squares instead
+    $V -m hw.fold_walk --swing-law impedance --kd-swing-walk-rl 6 6 60
+                                                     ONE LEG'S impedance (RL's
+                                                     Kd), the other three on
+                                                     --kd-swing-walk
 
     limp -> settle -> crouch -> rise -> hold --T--> trot (walk) --T--> hold -> park
 
@@ -33,6 +37,17 @@ M0's rotor is DOG5's -- the bench read DOG6's as ~1/1.7 of it.  Fit it with
 `hw.swing_bench --analyse` and pass `--ff-armature`; or fly `--swing-law
 impedance`, which does not read M0 unless `--swing-ff`.
 
+ONE LEG'S OWN IMPEDANCE, 2026-10-05, on request: `--kp-swing-walk-fl` ..
+`--kd-swing-walk-rr` replace `--kp-swing-walk` / `--kd-swing-walk` on that
+leg alone -- `hw.trot`'s per-leg swing gains ("ONE LEG'S SWING GAINS"), on
+the walk's impedance.  `--swing-law osc` refuses them: its knobs are
+`--wn-swing` / `--zeta-swing`.  `hw.fold2_walk` has them through this hook.
+MuJoCo, on the next flight's flags (`--swing-law impedance --duty 0.8
+--contact-ramp 0.15 --settle 0.2`), RL's motors making 60 % of the torque:
+in place RL's trunk-frame apex 7.1 -> 3.1 mm, and RL's own Kp_z 700 / Kd_z
+70 (or Kd_z 80 alone) gave back 6.0; walking 0.05 m/s 4.7 -> 1.8 -> 5.0;
+FOLD2 in place 3.2 -> 6.1.  The other three legs did not move.  NOT FLOWN.
+
 THE KEYS ACT WHILE TROTTING.  In HOLD they accumulate a command and the
 status line shows it, but the reference only moves while the robot trots,
 and T stops feeding it the moment the exit is latched: the reference slews
@@ -43,8 +58,27 @@ two -- the footholds come back to the stance's own sites -- then T, then
 ENTER: the park is a joint ramp to the crouch and drags any foot that is off
 its site.
 
-THE KEYS' BOX IS WHAT MUJOCO WALKED, not what the robot might: 0.10 m/s in
-x, 0.05 in y, 20 deg/s (config.WALK_*_MAX; --v-max, --yaw-rate-max).
+THE KEYS' BOX IS 60 % OF WHAT MUJOCO WALKED, since 2026-10-05 on request:
+0.06 m/s in x, 0.03 in y, 12 deg/s, and a press is 0.03 m/s or 6 deg/s
+(config.WALK_*; --v-max, --yaw-rate-max, --v-step, --yaw-step).  MuJoCo
+walked the 0.10 / 0.05 m/s and 20 deg/s box at 0.05 m/s and 10 deg/s a
+press.
+
+AT ZERO COMMAND THE SWING IS hw.fold_trot's, 2026-10-05 (on request).  On the
+robot, standing, the filter's v_hat is rms 0.05-0.08 m/s with spikes to 0.4,
+and the foothold carried 0.27 s of it, re-aimed every sweep: the stiff swing
+chased a target that wandered 10-60 mm inside one swing and threw the feet
+(fold_walk_imp.npz).  Now, with the reference at rest, each swing flies the
+walk's arc in the TRUNK frame from the foot to its own site, no velocity
+term, the filter nowhere in it (footstep.py).  Any key places the NEXT swing
+again; after SPACE the swings already in the air land where they were
+placed.  The clock, the swing law and the world-anchored stance targets are
+still the walk's.  `--place-at-rest` is the walk as flown before.
+
+THE PLACEMENT'S VELOCITY IS LOW-PASSED, 2026-10-05 (on request): walking,
+the foothold reads the filter's x/y velocity through a first-order low-pass,
+`--v-filter-hz` (config.WALK_V_FILTER_HZ; 0 reads it raw).  The x/y rows
+still read it raw.  The status line shows both, `est v` and `lp`.
 
 [SIM-TUNED, NOT FLOWN]: doc/walk/README.md has what MuJoCo says it does.
 
@@ -87,6 +121,10 @@ class WalkHook:
     def __init__(self):
         self.keys = WalkKeys()
         self.plan: WalkPlan | None = None
+        #: the impedance's (4, 3) gains and the legs with their own, from
+        #: `configure`
+        self.kp_rows = self.kd_rows = None
+        self.own_swing: list[str] = []
 
     # -- hw.stand.main's hook -----------------------------------------------
     def add_arguments(self, ap) -> None:
@@ -115,6 +153,8 @@ class WalkHook:
                        default=list(BCFG.KP_SWING_WALK), metavar="N_PER_M")
         g.add_argument("--kd-swing-walk", type=float, nargs=3,
                        default=list(BCFG.KD_SWING_WALK), metavar="NS_PER_M")
+        # --kp-swing-walk-fl .. --kd-swing-walk-rr: one leg's own impedance.
+        STAND.add_swing_leg_flags(g, "swing-walk")
         g.add_argument("--hold-xy-max", type=float,
                        default=1e3 * BCFG.HOLD_XY_ERR_MAX, metavar="MM",
                        help="per-leg clamp on the walking joint target's "
@@ -132,6 +172,20 @@ class WalkHook:
                        help="'osc' bandwidth per trunk axis, rad/s")
         g.add_argument("--zeta-swing", type=float,
                        default=BCFG.ZETA_SWING_OSC, help="'osc' damping ratio")
+        g.add_argument("--place-at-rest", action="store_true",
+                       default=BCFG.WALK_PLACE_AT_REST,
+                       help="keep eq (33)'s and Raibert's velocity terms in "
+                            "the foothold at zero command too -- the walk as "
+                            "flown before 2026-10-05, whose swing chases the "
+                            "filter's v_hat standing still.  Default: at rest "
+                            "each swing lands on its own site, trunk frame, "
+                            "hw.fold_trot's in-place target")
+        g.add_argument("--v-filter-hz", type=float,
+                       default=BCFG.WALK_V_FILTER_HZ, metavar="HZ",
+                       help="corner of the first-order low-pass on the "
+                            "filter's x/y velocity as the foot placement "
+                            "reads it; 0 reads it raw.  The x/y rows read it "
+                            "raw either way")
 
     def configure(self, args) -> None:
         self.keys = WalkKeys(v_step=args.v_step,
@@ -144,15 +198,26 @@ class WalkHook:
                                   leash=1e-3 * args.leash)
         ff = getattr(args, "swing_ff", False)
         armature = getattr(args, "ff_armature", None)
+        # ONE LEG'S OWN impedance, 2026-10-05, on request: a (4, 3) table,
+        # `--kp-swing-walk` in every row.  The osc law has no Kp/Kd to take.
+        self.kp_rows, self.kd_rows, self.own_swing = STAND.swing_leg_gains(
+            args, "swing-walk")
+        if self.own_swing and args.swing_law != "impedance":
+            raise ValueError(
+                "--kp/--kd-swing-walk-%s are the impedance's gains (--swing-law "
+                "impedance); the '%s' swing is tuned by --wn-swing / "
+                "--zeta-swing" % (self.own_swing[0].lower(), args.swing_law))
         self.plan = WalkPlan(reference=reference, kv=args.step_kv,
-                             kp_swing=args.kp_swing_walk,
-                             kd_swing=args.kd_swing_walk, swing_ff=ff,
+                             kp_swing=self.kp_rows,
+                             kd_swing=self.kd_rows, swing_ff=ff,
                              ff_inertia=(None if armature is None else
                                          BSWING.feedforward_inertia(armature)),
                              hold_xy_max=1e-3 * args.hold_xy_max,
                              swing_law=args.swing_law,
                              wn_swing=args.wn_swing,
-                             zeta_swing=args.zeta_swing)
+                             zeta_swing=args.zeta_swing,
+                             place_at_rest=args.place_at_rest,
+                             v_filter_hz=args.v_filter_hz)
 
     def law_kwargs(self, args) -> dict:
         return dict(walk=self.plan)
@@ -179,7 +244,21 @@ class WalkHook:
                                   args.step_kv, args.alloc),
                 "     swing %s; gait %.2f s at duty %.2f (%.0f ms of swing)"
                 % (swing, args.period, args.duty,
-                   1e3 * args.period * (1.0 - args.duty))]
+                   1e3 * args.period * (1.0 - args.duty)),
+                ] + ([STAND.swing_leg_banner(self.kp_rows, self.kd_rows,
+                                             self.own_swing, indent="     ")]
+                     if self.own_swing else []) + [
+                "     at zero command: %s"
+                % ("placed as when walking, the filter's v_hat in the "
+                   "foothold (--place-at-rest)" if args.place_at_rest else
+                   "each swing lands on its own site, trunk frame, no "
+                   "velocity term -- hw.fold_trot's in-place target"),
+                "     placement velocity: %s"
+                % ("the filter's x/y low-passed at %.1f Hz (tau %.0f ms); "
+                   "the x/y rows read it raw"
+                   % (args.v_filter_hz, 1e3 / (2.0 * np.pi * args.v_filter_hz))
+                   if args.v_filter_hz > 0.0 else
+                   "the filter's x/y, raw (--v-filter-hz 0)")]
 
     def owns(self, ch) -> bool:
         return self.keys.owns(ch)
@@ -212,6 +291,9 @@ class WalkHook:
         if out.estimate is not None:
             e = np.asarray(out.estimate.v_w, dtype=float)
             line += " | est v %+.3f %+.3f" % (e[0], e[1])
+            if self.plan is not None and self.plan.v_filter_hz > 0.0:
+                line += " lp %+.3f %+.3f" % (self.plan.v_lp[0],
+                                             self.plan.v_lp[1])
         if ref.leashed:
             line += "  LEASHED"
         return line

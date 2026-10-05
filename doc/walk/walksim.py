@@ -463,7 +463,7 @@ def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
                 o["tau_cap"], tau_ceiling=o["tau_ceiling"],
                 tau_slew=o["tau_slew"] if tau_slew is None else tau_slew,
                 overspeed_trip=o["overspeed_trip"],
-                latch=False, tilt_stop=FS.TILT_STOP_DEG,
+                latch=False,
                 track_stop=FS.TRACK_STOP_DEG, roll_gains=FS.ROLL_GAINS,
                 swing="cartesian",
                 gait_period=o["gait"].period if period is None else period,
@@ -477,7 +477,8 @@ def entry(alloc: str = "qp", walk: bool = True, swing_ff: bool = False,
                             swing_height=(pz["apex"] if swing_height is None
                                           else swing_height),
                             kp_swing=BCFG.KP_SWING, kd_swing=BCFG.KD_SWING,
-                            est_xy=True, alloc=alloc, walk=plan))
+                            est_xy=True, alloc=alloc, walk=plan,
+                            fall_hold_deg=BCFG.FALL_HOLD_DEG))
     return e, plan
 
 

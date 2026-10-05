@@ -8,6 +8,10 @@
     $V -m hw.fold_trot --swing joint --period 2.0 --swing-height 40
                                                    the fold trot as it was
                                                    before 2026-09-28
+    $V -m hw.fold_trot --kd-swing-rl 5 5 60 --kp-swing-rl 10 10 600
+                                                   ONE LEG'S swing PD (RL's
+                                                   here); `hw.trot`, "ONE
+                                                   LEG'S SWING GAINS"
 
     limp -> settle -> crouch -> rise -> hold --T--> trot --T--> hold -> park
                                                (exit at the next four-foot window)
@@ -84,9 +88,8 @@ THE RISE IS TRACKED, 2026-10-01
 TWO HALVES, BOTH IMPORTED, NEITHER COPIED
     THE STAND      `hw.fold_stand`'s: the crouch (`posture.FOLD`), the fixed
                    IMU datum, the SRB-only law, LIMITS OFF (`fold_stand.LIMITS`,
-                   since 2026-09-25; with `--limits`, the 45 deg tilt stop and
-                   the tracking trip OFF), the roll gains
-                   (`fold_stand.ROLL_GAINS`, 290 / 23).
+                   since 2026-09-25; with `--limits`, the tracking trip OFF),
+                   the roll gains (`fold_stand.ROLL_GAINS`, 290 / 23).
     THE TROT       `hw.trot`'s, the one `hw.trot_esti` flies:
                    `trot.trot_options` -- DOG5's gait (duty 0.80, contact ramp
                    0.15, the 0.2 s four-foot settle every 2 cycles), the 9
@@ -169,8 +172,31 @@ THE ESTIMATOR IS `hw.trot_esti`'S KALMAN FILTER, 2026-09-28, on request
     what `hw.fully_trot` flew first, its docstring has the account.  One more
     status line, `xy loop`.  `--no-est-xy` is this file as it was.
 
+THE FALL HOLD, 2026-10-05, on request ("estop is not a good way")
+    Past 45 deg of tilt from the setpoint (`--fall-hold`, every trot's) the
+    balance law, the swing and the trot stop -- in the rise, the hold, the
+    trot -- and every joint is held at the stand HOLD latched by the joint
+    PD alone, Kp 5 / Kd 0.2 plus the leg's weight, through the 9 N*m cap and
+    the slew: `balance.law.BalanceLaw.fall_hold_deg`.  Phase "fall" until
+    ENTER parks: the run does NOT stop.  The tilt e-stop it replaces is
+    DELETED, on request ("when tilt 46, then just hold the leg posture and
+    don't stop"), so no tilt stops a run, `--limits` or not;
+    `--fall-hold 0` leaves nothing acting on a tilt.
+
+    MuJoCo, this file as shipped, pushed over mid-trot (40 / 80 N sideways,
+    150 N back and forward, a push in HOLD and in the rise, friction,
+    FOLD2): every fall settled, the legs within 1.8 deg rms of the stand a
+    second after -- except the 150 N forward throw (legs flung ~180 deg),
+    within 5 deg after 1.7 s.  STIFFER IS WORSE: behind the gate's 120
+    N*m/s slew a stiff PD's torque cannot keep up and the leg limit-cycles
+    -- Kp 10 whirled the legs in 2 of 8 falls, Kp 30 in all 3 tried.  The
+    model's legs do not touch the floor (only the feet and the trunk do),
+    so a fall on the robot lands on more than it did there.
+    `config.KP_FALL_HOLD` has the numbers.
+
 KEYS
-    ENTER  the stand's phases, as ever.  REFUSED while trotting.
+    ENTER  the stand's phases, as ever.  REFUSED while trotting.  In the
+           fall hold, PARKS from wherever the legs are.
     T      from HOLD, start trotting.  While trotting, latch the exit: the
            switch back to HOLD waits for all four feet at full weight.
     X      E-STOP.  From rise, hold or trot it DROPS the robot.  Run supported.
@@ -225,7 +251,7 @@ def stand_options() -> dict:
     it -- on this file's clock and apex.  `hw.fully_trot` flies exactly
     these.  A fresh gait each call."""
     return dict(crouch=POSE.FOLD, dynamic_setpoint=False,
-                only_law="srb", tilt_stop=FS.TILT_STOP_DEG,
+                only_law="srb",
                 roll_gains=FS.ROLL_GAINS, track_stop=FS.TRACK_STOP_DEG,
                 velocity=False, limits=FS.LIMITS,
                 swing_height=SWING_HEIGHT, rise_track=True,

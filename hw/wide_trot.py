@@ -162,7 +162,7 @@ def main(argv=None) -> int:
                             ("--kd-stance-xy", STANCE_XY[1])))
     crouch = pinned_at(wide_posture(own.track), own.height)
     return STAND.main(rest, crouch=crouch, only_law="srb",
-                      tilt_stop=FS.TILT_STOP_DEG, roll_gains=FS.ROLL_GAINS,
+                      roll_gains=FS.ROLL_GAINS,
                       track_stop=FS.TRACK_STOP_DEG, velocity=False,
                       limits=FS.LIMITS,
                       swing_height=SWING_HEIGHT,

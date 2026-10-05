@@ -99,7 +99,6 @@ class Entry:
     tau_slew: float = SAFE.DEFAULT_TAU_SLEW_NM_S
     overspeed_trip: bool = True
     latch: bool = bool(BCFG.SETPOINT_DYNAMIC)
-    tilt_stop: float = float(BCFG.TILT_STOP_DEG)
     track_stop: float = float(np.rad2deg(BCFG.TRACK_STOP_RAD))
     roll_gains: tuple | None = None
     swing: str = "cartesian"
@@ -125,7 +124,7 @@ class Entry:
         kw = dict(gains=gains, rise_s=BCFG.T_RISE, h_lift=BCFG.H_LIFT,
                   gravity_legs_per_sweep=4, mu=BCFG.MU,
                   foot_xy=self.crouch.foot_xy, dynamic_setpoint=self.latch,
-                  tilt_stop_deg=self.tilt_stop, track_stop_deg=self.track_stop,
+                  track_stop_deg=self.track_stop,
                   srb=self.crouch.srb, swing=self.swing)
         kw.update(self.law_kw)
         balance = BLAW.BalanceLaw(**kw)
@@ -150,7 +149,7 @@ def entry_stand(crouch=None, tau_cap=3.0) -> Entry:
 def entry_fold_stand(tau_cap=3.0, crouch=None) -> Entry:
     """`python -m hw.fold_stand --tau-cap 3.0`."""
     return Entry("hw.fold_stand", POSE.FOLD if crouch is None else crouch,
-                 tau_cap, latch=False, tilt_stop=FS.TILT_STOP_DEG,
+                 tau_cap, latch=False,
                  track_stop=FS.TRACK_STOP_DEG, roll_gains=FS.ROLL_GAINS)
 
 
@@ -160,9 +159,10 @@ def entry_fold_trot() -> Entry:
     return Entry("hw.fold_trot", POSE.FOLD, o["tau_cap"],
                  tau_ceiling=o["tau_ceiling"], tau_slew=o["tau_slew"],
                  overspeed_trip=o["overspeed_trip"], latch=False,
-                 tilt_stop=FS.TILT_STOP_DEG, track_stop=FS.TRACK_STOP_DEG,
+                 track_stop=FS.TRACK_STOP_DEG,
                  roll_gains=FS.ROLL_GAINS, swing="joint",
-                 gait_period=o["gait"].period)
+                 gait_period=o["gait"].period,
+                 law_kw=dict(fall_hold_deg=o["fall_hold"]))
 
 
 def entry_trot() -> Entry:
@@ -171,9 +171,10 @@ def entry_trot() -> Entry:
     return Entry("hw.trot", POSE.WIDE, o["tau_cap"],
                  tau_ceiling=o["tau_ceiling"], tau_slew=o["tau_slew"],
                  overspeed_trip=o["overspeed_trip"],
-                 tilt_stop=TR.TILT_STOP_DEG, track_stop=TR.TRACK_STOP_DEG,
+                 track_stop=TR.TRACK_STOP_DEG,
                  swing="cartesian", gait_period=o["gait"].period,
-                 step_to=TR.STEP_FOOT_XY, step_period=TR.STEP_PERIOD_S)
+                 step_to=TR.STEP_FOOT_XY, step_period=TR.STEP_PERIOD_S,
+                 law_kw=dict(fall_hold_deg=o["fall_hold"]))
 
 
 # ===========================================================================

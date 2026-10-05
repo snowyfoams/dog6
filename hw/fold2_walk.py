@@ -4,6 +4,9 @@
     $V -m hw.fold2_walk --fake --auto 1 --no-imu     the whole path, no robot
     $V -m hw.fold2_walk --log fold2_walk.npz         on the robot
     $V -m hw.fold2_walk --ff-armature 0.005          M0 with a fitted rotor
+    $V -m hw.fold2_walk --swing-law impedance --kp-swing-walk-rl 150 150 600
+                                                     ONE LEG'S impedance, as in
+                                                     `hw.fold_walk`
 
     limp -> settle -> crouch -> rise -> hold --T--> trot (walk) --T--> hold -> park
 
@@ -34,8 +37,9 @@ WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
     forward); 0.20 m/s forward is the edge, 4 of 6 to the tilt stop.  Joint
     friction with a late IMU, a mu 0.5 floor, DOG6's lighter rotor with
     DOG5's M0 or a fitted one: none tipped.  The keys' box is the fold's,
-    0.10 / 0.05 m/s and 20 deg/s, for the first flights; `--v-max 0.15 0.10
-    --yaw-rate-max 40` is inside what MuJoCo walked.
+    since 2026-10-05 60 % of the simulated one: 0.06 / 0.03 m/s and 12 deg/s,
+    0.03 m/s or 6 deg/s a press (config.WALK_*); `--v-max 0.15 0.10
+    --yaw-rate-max 40` is still inside what MuJoCo walked.
 
 THE ARMATURE IS THE SWING'S GAIN, here as in `hw.fold_walk`: fit it with
 `hw.swing_bench --analyse` and pass `--ff-armature` before walking.

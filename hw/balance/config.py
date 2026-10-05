@@ -335,7 +335,7 @@ EST_ACC_MAX_AGE_S = 0.050
 #:
 #: WHAT IT COSTS, AND IT IS THE SAME COST DOG5 ACCEPTED: "level" for the run
 #: is the LIMP attitude.  Start the robot on a slope and it will hold that
-#: slope, and `TILT_STOP_DEG` measures from it too.  For a stand on one patch
+#: slope, and `FALL_HOLD_DEG` measures from it too.  For a stand on one patch
 #: of floor that is the right trade -- the legs push against the floor that is
 #: there.  It is the wrong trade the day the robot has to stay upright across
 #: a slope it did not start on.
@@ -344,7 +344,7 @@ EST_ACC_MAX_AGE_S = 0.050
 #: later phase passes back through zero torque, and the asymmetry with the yaw
 #: lock is the point: heading has no truth to return to, but LEVEL does, and
 #: re-latching roll/pitch mid-run would redefine level as whatever tilt the
-#: robot was limping at and drag the tilt stop's reference along with it.
+#: robot was limping at and drag the fall hold's reference along with it.
 SETPOINT_DYNAMIC = True
 
 #: The PRE-LATCH pair, and the sanity reference the latch is warned against.
@@ -407,19 +407,38 @@ LAMBDA = 1.0e-6
 # ===========================================================================
 # the trips  (state.py, allocation.py, and hw.stand)
 # ===========================================================================
-#: Absolute tilt run-stop, on |roll| or |pitch|.  The stand phase had NO way
-#: to trip on the failure it actually exhibits.  DOG5's levelling script
-#: carried this and DOG6's stand did not.
+#: THE TILT E-STOP IS DELETED, 2026-10-05, on request ("estop is not good, i
+#: want to delete it ... when tilt 46, then just hold the leg posture and
+#: don't stop").  It was `TILT_STOP_DEG`, 12 deg (45 in the trots and the
+#: fold stand): past it the run stopped and the trunk dropped limp.  Nothing
+#: on a tilt stops a run now.
 #:
-#: IT IS NOT A SAFETY NET.  DOG5 logged a run where the tilt trip did not fire
-#: and the robot ended up on its belly at 2.4x body weight, reading perfectly
-#: LEVEL while doing so -- because a robot lying flat is level.  [UNTUNED]
-TILT_STOP_DEG = 12.0
+#: THE FALL HOLD in its place: past this tilt FROM THE SETPOINT the law
+#: stops balancing -- no wrench, no swing, no trot -- and holds every joint
+#: at the stand posture in joint space, and the run goes on
+#: (`law.BalanceLaw.fall_hold_deg`).  Every TROT entry point's `--fall-hold`
+#: (`hw.trot.trot_options`); 0 turns it off, and then nothing acts on a
+#: tilt.  NOT a limit on where the robot goes, so `--no-limits` leaves it on.
+#:
+#: A TILT READING IS NOT A SAFETY NET EITHER WAY.  DOG5 logged a run where
+#: the tilt trip did not fire and the robot ended up on its belly at 2.4x
+#: body weight, reading perfectly LEVEL -- because a robot lying flat is.
+FALL_HOLD_DEG = 45.0
+
+#: N*m/s, the slowest gate slew the fall hold may fly on (`hw.stand`
+#: refuses below it).  THE SLEW IS WHAT DECIDES WHETHER IT HOLDS: a joint PD
+#: behind a rate limiter stays linear only while Kp |dq/dt| fits the slew, and
+#: past that the torque lags the request and the leg limit-cycles.  MuJoCo,
+#: `hw.fold_stand` pushed over in HOLD, `KP_FALL_HOLD` below: at the stand's
+#: 5 N*m/s the legs WHIRLED (q 670 deg from the stand, 13 rad/s rms); at 60
+#: and 120 they held within 1.2 / 0.9 deg rms.  The stands fly 5, so their
+#: fall hold is off; the trots fly `TAU_SLEW_TROT_NM_S`.
+FALL_HOLD_MIN_SLEW_NM_S = 60.0
 
 #: Joint tracking trip for the lift.  The stand has no joint-space target, so
 #: it has no tracking trip at all; the IK at the pinned foot xy and the
 #: commanded height supplies one, and it catches a leg that is badly wrong
-#: long before the tilt stop does.  [UNTUNED]
+#: long before the trunk tips.  [UNTUNED]
 TRACK_STOP_RAD = float(np.deg2rad(25.0))
 
 #: IMU staleness.  A lost IMU mid-stand means the attitude terms are running
@@ -507,6 +526,25 @@ KD_JOINT_HOLD = 0.2                 # N*m*s/rad
 KP_JOINT_HOLD_ABD = KP_JOINT_HOLD   # N*m/rad
 KD_JOINT_HOLD_ABD = KD_JOINT_HOLD   # N*m*s/rad
 
+#: THE FALL HOLD's joint PD (`FALL_HOLD_DEG`), every joint, on top of each
+#: leg's own weight: tau = KP (q_stand - q) - KD qd + tau_grav.  ALONE --
+#: no SRB stance torque under it, as the joint layer above always has.
+#: THE JOINT LAYER'S OWN 5 / 0.2.  [SIM-CHECKED 2026-10-05, NOT FLOWN]
+#: MuJoCo, `hw.fold_trot` as shipped (slew 120) pushed over mid-trot, 8
+#: cases -- 40 / 80 N sideways and 150 N fore-aft for 0.25 s, a push in HOLD
+#: and in the rise, 0.1 N*m joint friction, 0.6x armature, FOLD2, ENTER to
+#: park: every one settled, the legs within 1.8 deg rms of the stand from a
+#: second after (5 of the 8 under 0.3), peak 3.6-9.0 N*m; a 150 N FORWARD
+#: throw, tried after, flung the legs ~180 deg and was within 5 deg after
+#: 1.7 s, still settling the whole way, no cycle.  10 / 0.4 whirled
+#: in 2 of the 8 (the fore-aft fall and the rise); 30 / 0.8 in all 3 falls
+#: tried, asking 20-150 N*m of the gate's 9 (`FALL_HOLD_MIN_SLEW_NM_S`).
+#: Stiffer is not better here.  Standing on its feet in the hold (forced
+#: in HOLD), 5 / 0.2 sags 15 mm and still holds.  The model's legs do not
+#: collide with the floor, only the feet and the trunk do.
+KP_FALL_HOLD = 5.0                  # N*m/rad
+KD_FALL_HOLD = 0.2                  # N*m*s/rad
+
 #: The swing apex above the resting foot, in the trunk frame.  20 mm since
 #: 2026-10-02, the operator's best fold trot (below); DOG5's was 40.
 SWING_HEIGHT = 0.020                # m
@@ -561,8 +599,10 @@ TAU_SLEW_TROT_NM_S = 120.0
 #: One W/S/A/D press, m/s; one Q/E press, rad/s.  Half the simulator's
 #: (`sim.cmpc.config.V_STEP`, `YAW_RATE_STEP`): the hardware law has no
 #: horizon to plan a velocity change into, so it gets smaller ones.
-WALK_V_STEP = 0.05
-WALK_YAW_STEP = float(np.radians(10.0))
+#: 60 % OF THAT SINCE 2026-10-05, on request ("the velocity is high"): the
+#: press was 0.05 m/s and 10 deg/s, as doc/walk flew it.
+WALK_V_STEP = 0.03
+WALK_YAW_STEP = float(np.radians(6.0))
 
 #: What the keys may accumulate to: inside what MuJoCo walked, not what the
 #: robot might.  [SIM-TUNED] doc/walk/README.md has the sweep: with the
@@ -570,10 +610,13 @@ WALK_YAW_STEP = float(np.radians(10.0))
 #: 0.08 m/s sideways, 20 and 40 deg/s turns and 0.10 m/s with a 20 deg/s turn
 #: all stayed under 10 deg of tilt; 0.15 m/s forward tipped 3 of 6 (2 to the
 #: tilt stop).  The box is the first flights', below the 0.08 / 40 that also
-#: passed; --v-max and --yaw-rate-max open it.
-WALK_VX_MAX = 0.10                  # m/s
-WALK_VY_MAX = 0.05                  # m/s
-WALK_YAW_RATE_MAX = float(np.radians(20.0))   # rad/s
+#: passed; --v-max and --yaw-rate-max open it.  60 % OF THAT SINCE
+#: 2026-10-05, on request ("the velocity is high"): the box was 0.10 / 0.05
+#: m/s and 20 deg/s, as doc/walk flew it -- `--v-max 0.10 0.05
+#: --yaw-rate-max 20 --v-step 0.05 --yaw-step 10` is the walk as simulated.
+WALK_VX_MAX = 0.06                  # m/s
+WALK_VY_MAX = 0.03                  # m/s
+WALK_YAW_RATE_MAX = float(np.radians(12.0))   # rad/s
 
 #: The command is SLEWED toward what the keys ask, never stepped: a step in
 #: v_ref is a step in the x/y rows' velocity error and in the footholds.
@@ -595,6 +638,30 @@ WALK_YAW_LEASH = float(np.radians(10.0))      # rad
 #: stance's own neutral site, trunk x / y.  [SIM-TUNED]
 STEP_KV = 0.03                      # s
 STEP_MAX_XY = (0.06, 0.04)          # m
+
+#: AT REST THE SWING IS fold_trot's, 2026-10-05 (on request).  With the
+#: reference at rest -- v_ref and r both zero, decided once per swing at
+#: liftoff -- the swing is planned in the TRUNK frame: the walk's arc from the
+#: foot latched at liftoff to the stance's own site, with neither eq (33)'s
+#: v_hat T_st / 2 nor the STEP_KV term, so the filter does not reach the swing
+#: at all (footstep.py, AT REST).  Why: on the robot, standing, v_hat is rms
+#: 0.05-0.08 m/s with spikes to 0.4 (fold_walk_imp.npz), the foothold re-aimed
+#: every sweep at site + 0.27 s x v_hat wandered 10-60 mm inside one swing,
+#: and a stiff swing chased it.  True keeps the placement at rest as flown
+#: before (`hw.fold_walk --place-at-rest`).
+WALK_PLACE_AT_REST = False
+
+#: THE PLACEMENT'S VELOCITY IS LOW-PASSED, 2026-10-05 (on request): the
+#: footstep planner reads the filter's x/y velocity through a first-order
+#: low-pass with this corner (walk.WalkPlan; `--v-filter-hz`, 0 reads it raw).
+#: On the robot, standing, v_hat is rms 0.04-0.08 m/s with spikes to 0.5,
+#: and 0.27 s of it is in every placed foothold.  Offline on those logs a
+#: 1 Hz corner halves the rms and takes the worst spike from 0.50 to 0.20
+#: m/s, at a lag of tau = 1 / (2 pi fc) = 160 ms, a quarter of a stride.
+#: What is left is mostly trunk sway near the gait frequency, which no
+#: low-pass can tell from motion.  The x/y rows still read v_hat raw, as in
+#: every trot.
+WALK_V_FILTER_HZ = 1.0                # Hz
 
 #: The swing foot's Cartesian impedance while WALKING, trunk frame.  The trot
 #: in place's 10 N/m in x/y (`KP_SWING`) is too soft to carry a foot across
@@ -734,11 +801,13 @@ def describe() -> str:
            "pre-latch + sanity reference" if SETPOINT_DYNAMIC else "IN USE",
            SETPOINT_WARN_DEG),
         "  trips",
-        "    tilt %.0f deg   tracking %.0f deg   imu age %.0f ms (freeze, "
-        "not trip)" % (TILT_STOP_DEG, np.rad2deg(TRACK_STOP_RAD),
-                       1e3 * IMU_MAX_AGE_S),
+        "    tracking %.0f deg   imu age %.0f ms (freeze, not trip)   tilt: "
+        "no trip" % (np.rad2deg(TRACK_STOP_RAD), 1e3 * IMU_MAX_AGE_S),
         "    residual %.1f N / %.2f N*m sustained %d sweeps"
         % (RESIDUAL_FORCE_N, RESIDUAL_MOMENT_NM, RESIDUAL_STREAK),
+        "    fall hold %.0f deg (not a trip): every joint to the stand, "
+        "Kp %.1f N*m/rad  Kd %.2f N*m*s/rad + leg gravity"
+        % (FALL_HOLD_DEG, KP_FALL_HOLD, KD_FALL_HOLD),
         "  trot in place  [DOG5 FLOWN]",
         "    period %.2f s  duty %.2f  ramp %.2f  settle %.2f s every %d "
         "cycles"

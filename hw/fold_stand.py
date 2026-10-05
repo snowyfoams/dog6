@@ -8,11 +8,14 @@
     LIMITS OFF, 2026-09-25, on request, after the parallel fold did not stand
     up: `--no-limits` is this script's default (`hw.stand.main`'s `limits`).
     The soft joint limits (the gate's torque block and its e-stop), the
-    position-mode and torque-phase tracking trips, the tilt stop, the
-    residual trip and the overspeed trip are all OFF, and the lift cap is the
-    motors' own 9 N*m (`safety.TAU_HARD_NM`), as `hw.fold_trot`'s.  Still on:
+    position-mode and torque-phase tracking trips, the residual trip and the
+    overspeed trip are all OFF, and the lift cap is the motors' own 9 N*m
+    (`safety.TAU_HARD_NM`), as `hw.fold_trot`'s.  Still on:
     `hw.stand.NO_LIMITS_KEPT` -- X, the drivers' health, the torque shaping.
-    `TILT_STOP_DEG` and `TRACK_STOP_DEG` below are what `--limits` flies.
+    `TRACK_STOP_DEG` below is what `--limits` flies.  The 45 deg tilt
+    e-stop this script had is DELETED (2026-10-05, on request), and it has
+    no fall hold -- its 5 N*m/s slew cannot carry one -- so nothing here
+    acts on a tilt.
 
     ROLL GAINS.  This script defaults roll to kp 290 / kd 23 (`ROLL_GAINS`);
     pitch stays at --kp-att / --kd-att (90 / 17).  Same units as --kp-att.
@@ -124,8 +127,7 @@ from . import safety as SAFE         # noqa: E402
 from . import stand as STAND         # noqa: E402
 from .balance import posture as POSE  # noqa: E402
 
-__all__ = ["main", "TILT_STOP_DEG", "ROLL_GAINS", "TRACK_STOP_DEG", "TAU_CAP",
-           "LIMITS"]
+__all__ = ["main", "ROLL_GAINS", "TRACK_STOP_DEG", "TAU_CAP", "LIMITS"]
 
 #: `hw.stand.main`'s `limits`: OFF, on request 2026-09-25 -- see the module
 #: docstring.  `--limits` on the command line puts them back.
@@ -134,18 +136,6 @@ LIMITS = False
 #: The lift cap: the motors' own, as `hw.fold_trot`'s.  `--tau-cap 3.0` is
 #: the staged one this script used to need.
 TAU_CAP = SAFE.TAU_HARD_NM
-
-#: The tilt e-stop for this script, in degrees FROM THE SETPOINT.  Raised from
-#: `config.TILT_STOP_DEG` (12) because the question this run exists to answer
-#: is what the attitude loop does with a STEADY-STATE tilt, and a stop that
-#: fires at 12 deg ends the run before the number can be read.
-#:
-#: IT IS STILL A TRIP AND IT IS NOW A WEAK ONE.  At 45 deg the robot is far
-#: past anything a four-foot stand recovers from, and an e-stop there drops
-#: the trunk from a worse attitude than one at 12 would have.  The tracking
-#: stop is OFF as well -- see `TRACK_STOP_DEG` for what that leaves guarding
-#: the run.  Run supported.
-TILT_STOP_DEG = 45.0
 
 #: The joint tracking trip: OFF.  It compares the measured joints against the
 #: IK at the COMMANDED height, and that IK reaches nothing but the trip and the
@@ -157,7 +147,7 @@ TILT_STOP_DEG = 45.0
 #: LEVEL trunk, so the steady attitude errors this script exists to observe eat
 #: into it as well.
 #:
-#: WHAT IS LEFT GUARDING THE RUN, with this off and the tilt stop at 45 deg:
+#: WHAT IS LEFT GUARDING THE RUN, with this off and no tilt stop (deleted):
 #: the residual monitor, the torque cap and its readback, the CAN gap and
 #: input-lost trips, and the non-finite check.  NOTHING among those notices a
 #: foot sliding or a leg folding slowly while the attitude still reads fine --
@@ -184,8 +174,7 @@ def main(argv=None) -> int:
     """`hw.stand.main`, from `posture.FOLD`, SRB only, IMU datum FIXED,
     limits OFF, the 9 N*m cap."""
     return STAND.main(argv, crouch=POSE.FOLD, dynamic_setpoint=False,
-                      only_law="srb", tilt_stop=TILT_STOP_DEG,
-                      roll_gains=ROLL_GAINS,
+                      only_law="srb", roll_gains=ROLL_GAINS,
                       track_stop=TRACK_STOP_DEG, tau_cap=TAU_CAP,
                       tau_ceiling=TAU_CAP, limits=LIMITS)
 

@@ -30,14 +30,20 @@ ONE RATE, AND THAT IS A CHOICE WORTH KEEPING
     slot will not hold the law, this is the first thing to turn down and the
     attitude loop is the last.
 
-THE FOUR TRIPS IT CAN RAISE, AND THE ONE IT DELIBERATELY DOES NOT
-    tilt         |roll| or |pitch| past cfg.TILT_STOP_DEG.  The stand had no
-                 way to trip on the failure it actually exhibits.
+THE THREE TRIPS IT CAN RAISE, AND THE TWO IT DELIBERATELY DOES NOT
     tracking     the IK at the pinned foot xy and the commanded height gives
                  the joint-space target the stand otherwise does not have, and
-                 catches a badly wrong leg long before the tilt stop does.
+                 catches a badly wrong leg long before the trunk tips.
     residual     sustained, via `allocation.ResidualMonitor`.
     non-finite   a NaN reaching the drivers is twelve motors at the cap.
+
+    TILT IS NOT A TRIP.  The tilt e-stop is DELETED, 2026-10-05, on request
+    ("estop is not good, i want to delete it"): an e-stop is a limp robot,
+    and at 45 deg that is a trunk dropped from a worse attitude than the one
+    that tripped it.  Past `fall_hold_deg` the law stops balancing and holds
+    every joint at the stand in joint space -- THE FALL HOLD -- for the rest
+    of the run, and says so (`fallen`); nothing stops.  Without a fall hold
+    (the stands) nothing acts on a tilt at all.
 
     IMU STALENESS IS NOT A TRIP.  Past cfg.IMU_MAX_AGE_S the attitude half of
     the PD is frozen to zero and the height loop and gravity keep running --
@@ -223,6 +229,9 @@ class LawOutput:
     #: NaN for a foot that is down.
     ref: object = None
     land_w: np.ndarray | None = None     # (4, 2)
+    #: The fall hold drove this sweep (`BalanceLaw.fall_hold_deg`): `tau` is
+    #: its joint PD, the wrench and the forces are zero -- nothing asked.
+    fallen: bool = False
 
 
 @dataclass
@@ -243,11 +252,26 @@ class BalanceLaw:
     #: needs -- a per-run datum would move "level" between the two and the
     #: comparison would be against two different references.
     dynamic_setpoint: bool | None = None
-    #: Where the tilt e-stop fires, in degrees from the SETPOINT.  None takes
-    #: `config.TILT_STOP_DEG`.  IT IS A TRIP, NOT A TUNING -- raising it is a
-    #: deliberate act by whoever is standing next to the robot, which is why
-    #: it is an argument and why the banner prints it on every run.
-    tilt_stop_deg: float | None = None
+    #: THE FALL HOLD, 2026-10-05, on request: past this many degrees FROM THE
+    #: SETPOINT (`tilt_from_setpoint_deg`) the law stops balancing for the rest
+    #: of the run -- no wrench, no swing, no walk, no x/y -- and every joint is
+    #: held at THE STAND in joint space: `kp_fall (q_stand - q) - kd_fall qd`
+    #: plus each leg's own weight, through the gate's cap and slew like any
+    #: torque.  The stand is the pose the first HOLD latched (`q_stand`), or,
+    #: falling in the rise, the IK the rise is heading to.  None (the law's
+    #: default, and every stand's; every trot entry point passes
+    #: `config.FALL_HOLD_DEG`) is no fall hold.  The gate's slew decides
+    #: whether it holds (`config.FALL_HOLD_MIN_SLEW_NM_S`).
+    #:
+    #: IT REPLACES THE TILT E-STOP, WHICH IS DELETED.  An e-stop is a limp
+    #: robot: past 45 deg that is a trunk dropped from a worse attitude than
+    #: the one that tripped it, and the operator's call was that it is not a
+    #: good way to end ("when tilt 46, then just hold the leg posture and
+    #: don't stop").  Held, the legs keep the stand's shape whatever the
+    #: trunk does, and the run goes on until ENTER parks or X.
+    fall_hold_deg: float | None = None
+    kp_fall: float = cfg.KP_FALL_HOLD
+    kd_fall: float = cfg.KD_FALL_HOLD
     #: The joint TRACKING trip, in degrees.  None takes `config.TRACK_STOP_RAD`;
     #: 0 (or less) turns it OFF.  It is a MONITOR and nothing else --
     #: `ik_reference` feeds only `_trip` and the log, never the torque -- so
@@ -292,7 +316,9 @@ class BalanceLaw:
     #: M^-1 J^T -- one leg in its own dynamics, Kp_z 180 -> 800 took the x
     #: drift from 2 to 10 mm.  Kd_z 15 -> 30 (zeta 0.28 -> 0.57) is the one
     #: worth trying: z rms 3.5 -> 2.8 mm for 1 mm of x.  `--kp-swing`,
-    #: `--kd-swing`.
+    #: `--kd-swing`.  (3,) is every leg's; (4, 3) is a row per leg, FL FR
+    #: RL RR -- 2026-10-05, on request, so one leg whose swing is weak can
+    #: be tuned alone (`--kp-swing-rl` etc., `swing.leg_gains`).
     kp_swing: np.ndarray | None = None
     kd_swing: np.ndarray | None = None
     #: The KNEE swing's joint PD (`swing == "knee"`), (abd, pitch, knee),
@@ -462,6 +488,17 @@ class BalanceLaw:
         if self.swing_roll and self.swing != "cartesian":
             raise ValueError("swing_roll levels the Cartesian arc; the joint "
                              "swing latches its own at liftoff")
+        # OWN COPY, AND THE SHAPE CHECKED HERE: a (3, 4) would index as rows
+        # in the swing every sweep, the wrong numbers on every leg.
+        for name in ("kp_swing", "kd_swing"):
+            gains = getattr(self, name)
+            if gains is not None:
+                gains = np.array(gains, dtype=float)
+                if gains.shape not in ((3,), (C.N_LEGS, 3)):
+                    raise ValueError("%s: (3,) for every leg or (%d, 3) a "
+                                     "row per leg, not %s"
+                                     % (name, C.N_LEGS, gains.shape))
+                setattr(self, name, gains)
         # OWN COPY: the foot step moves it leg by leg, and it usually arrives
         # as a posture's array.
         if self.foot_xy is not None:
@@ -494,12 +531,21 @@ class BalanceLaw:
         self.knee_refusal = ""
         #: (12,) the joint layer's stance target, or None while it is off.
         self.q_hold: np.ndarray | None = None
+        #: (12,) THE STAND: the first pose `hold_joints` latched -- the first
+        #: HOLD's -- kept through every trot, W step and sway that moves
+        #: `q_hold` after it.  What the fall hold holds.
+        self.q_stand: np.ndarray | None = None
+        #: (12,) the fall hold's target once it has engaged, else None; when,
+        #: at what tilt, and what it has done since, for the exit report.
+        self.q_fall: np.ndarray | None = None
+        self.t_fall = float("nan")
+        self.fall_tilt_deg = float("nan")
+        self.fall_sweeps = 0
+        self.fall_tau_peak = 0.0
         if self.srb is None:
             self.srb = cfg.SRB
         if self.dynamic_setpoint is None:
             self.dynamic_setpoint = bool(cfg.SETPOINT_DYNAMIC)
-        if self.tilt_stop_deg is None:
-            self.tilt_stop_deg = float(cfg.TILT_STOP_DEG)
         if self.track_stop_deg is None:
             self.track_stop_deg = float(np.rad2deg(cfg.TRACK_STOP_RAD))
         self.ramp: REF.Quintic | None = None
@@ -616,10 +662,10 @@ class BalanceLaw:
     def tilt_from_setpoint_deg(self, state) -> float:
         """max(|roll|, |pitch|) measured FROM THE SETPOINT, in degrees.
 
-        What the tilt stop reads.  `state.tilt_deg` measures from true level
+        What the fall hold reads.  `state.tilt_deg` measures from true level
         and is the right number for the log and the operator's status line;
-        this is the right one for the trip, because the trip has to mean
-        "the robot has left the attitude the law is holding it at".  On a
+        this is the right one for the hold, because it has to mean "the
+        robot has left the attitude the law is holding it at".  On a
         floor with any slope in it those two differ by the slope, and DOG5
         made the same choice for the same reason.
         """
@@ -736,7 +782,7 @@ class BalanceLaw:
                         dyaw: float) -> None:
         """R_des := the latched setpoint PLUS (droll, dpitch, dyaw), rad.
 
-        The tilt stop and the attitude error read the offset too: the trip
+        The fall hold and the attitude error read the offset too: the hold
         means "left the attitude the law is holding it at", and while the
         target moves that is the moved one.  (0, 0, 0) is the latched hold.
         """
@@ -789,9 +835,66 @@ class BalanceLaw:
         calls it with the measured angles on the sweep the robot REACHES
         HOLD, and keeps it through the hold and the trot."""
         self.q_hold = np.array(q, dtype=float).reshape(C.N_JOINTS)
+        if self.q_stand is None:
+            self.q_stand = self.q_hold.copy()
 
     def release_joints(self) -> None:
         self.q_hold = None
+
+    # -- the fall hold ----------------------------------------------------
+    @property
+    def fallen(self) -> bool:
+        """The fall hold has engaged; from here to the park it is all the law
+        does."""
+        return self.q_fall is not None
+
+    def _fall(self, now: float, state, tilt_deg: float) -> None:
+        """Engage the fall hold, ONCE: latch its target.  The first HOLD's
+        pose, or -- fallen in the rise, before there was one -- the stand the
+        rise is heading to, the IK at `h_lift` on the stand's sites."""
+        if self.q_stand is not None:
+            self.q_fall = self.q_stand.copy()
+        else:
+            self.q_fall = C.flat(ik_reference(self.h_lift, C.unflat(state.q),
+                                              self.home_xy))
+        self.t_fall = float(now)
+        self.fall_tilt_deg = float(tilt_deg)
+
+    def _fall_output(self, now: float, state, clock, started) -> LawOutput:
+        """One fall-hold sweep: every joint to `q_fall`, joint PD plus the
+        leg's own weight at this attitude.  The SRB stages do not run, so the
+        wrench and the forces are zero -- what the law asked of the floor."""
+        gravity = TRQ.all_leg_gravity_torque(state.q, state.R)
+        tau = (self.kp_fall * (self.q_fall - state.q)
+               - self.kd_fall * np.asarray(state.qd) + C.flat(gravity))
+        trip = None
+        if not np.all(np.isfinite(tau)):
+            trip = ("the fall hold's torque is not finite -- the joint state "
+                    "or the attitude is NaN")
+        else:
+            self.fall_tau_peak = max(self.fall_tau_peak,
+                                     float(np.abs(tau).max()))
+        self.fall_sweeps += 1
+        command = self.ramp.at(float(now) - self.t0)
+        zero3 = np.zeros(3)
+        wrench = CTRL.Wrench(b_d=np.zeros(6), acc_lin=zero3,
+                             acc_ang=zero3.copy(), e_R=zero3.copy(),
+                             inertia_w=np.zeros((3, 3)))
+        allocation = ALLOC.Allocation(
+            f_w=np.zeros((C.N_LEGS, 3)), f_unclipped=np.zeros((C.N_LEGS, 3)),
+            residual=np.zeros(6), clipped=np.zeros(C.N_LEGS, dtype=bool))
+        if started is not None:
+            self.timing.add(clock() - started)
+        est = self.estimate
+        return LawOutput(tau=tau, command=command,
+                         com_cmd=REF.com_command(command, state.R, self.srb),
+                         wrench=wrench, allocation=allocation,
+                         q_ref=self.q_fall.copy(),
+                         imu_held=bool(state.imu_stale), trip=trip,
+                         state=state, estimate=est,
+                         est_age_s=(float("nan") if est is None
+                                    else float(now) - float(est.t)),
+                         fallen=True)
 
     def _roll_from_level(self, state) -> tuple[float, float]:
         """(roll from this run's level, its rate), rad and rad/s, from R and
@@ -905,11 +1008,23 @@ class BalanceLaw:
         `xy_hold` is the sequence saying THIS IS THE HOLD OR THE TROT.  With
         `est_xy` it puts the state estimator on the x/y rows (`est_xy` says
         how); without `est_xy` it changes nothing.
+
+        Past `fall_hold_deg` none of the above runs, from that sweep on: the
+        output is the fall hold's (`fallen`), whatever `gait` says.
         """
         if self.ramp is None:
             raise RuntimeError("BalanceLaw.arm() has not been called")
         started = None if clock is None else clock()
         self._sweep += 1
+        # -- the fall hold, BEFORE anything else reads the state ------------
+        # On the sweep it engages as on every one after: not one more sweep
+        # of wrench or swing goes out once the trunk is past it.
+        if self.q_fall is None and self.fall_hold_deg is not None:
+            tilt = self.tilt_from_setpoint_deg(state)
+            if tilt > self.fall_hold_deg:
+                self._fall(now, state, tilt)
+        if self.q_fall is not None:
+            return self._fall_output(now, state, clock, started)
         clock_now = None if gait is None else gait.sample(now)
         if clock_now is not None:
             # THE HEIGHT FROM THE FEET THAT ARE DOWN -- see `state.on_stance`.
@@ -1230,14 +1345,6 @@ class BalanceLaw:
         if not np.all(np.isfinite(allocation.f_w)):
             return ("the allocator returned a non-finite force -- the grasp "
                     "map is singular or the state is NaN")
-        tilt = self.tilt_from_setpoint_deg(state)
-        if tilt > self.tilt_stop_deg:
-            return ("tilt %.1f deg from the setpoint, past the %.0f deg stop "
-                    "(roll %+.1f, pitch %+.1f; setpoint %+.1f / %+.1f)"
-                    % (tilt, self.tilt_stop_deg,
-                       np.degrees(state.roll), np.degrees(state.pitch),
-                       np.degrees(self.sp_roll + self.att_offset[0]),
-                       np.degrees(self.sp_pitch + self.att_offset[1])))
         error = np.abs(state.q - q_ref)
         if (self.track_stop_deg > 0.0
                 and np.any(error > np.deg2rad(self.track_stop_deg))):
@@ -1268,6 +1375,14 @@ class BalanceLaw:
             % ("%+.1f deg at the handover, then world x -- yaw since is "
                "drift off it" % np.degrees(self.yaw_offset) if self.armed
                else "never latched -- the run did not reach the rise"),
+            "  fall hold       %s"
+            % ("OFF" if self.fall_hold_deg is None else
+               "at %.0f deg, never engaged" % self.fall_hold_deg
+               if not self.fallen else
+               "ENGAGED at %.1f deg from the setpoint (past %.0f), then %d "
+               "sweeps holding the stand, peak |tau| %.2f N*m before the gate"
+               % (self.fall_tilt_deg, self.fall_hold_deg, self.fall_sweeps,
+                  self.fall_tau_peak)),
         ] + ([] if not self.est_xy else [
             "  x/y on the estimator  %d hold/trot sweeps driven, %d refused (flown "
             "law those sweeps)%s" % (self.xy_sweeps, self.xy_refused,

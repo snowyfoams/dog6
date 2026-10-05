@@ -532,13 +532,8 @@ def main() -> int:
           balance.tau_peak < 3.0, "%.2f N*m against TAU_STAGED_MAX 3.0"
                                   % balance.tau_peak)
 
-    # each trip, on the state that should fire it
-    over = LAW.BalanceLaw()
-    over.arm(0.0, crouch)
-    tipped = state_at(cfg.H_CROUCH, R=C.rot_x(np.deg2rad(cfg.TILT_STOP_DEG + 3)))
-    check("the tilt trip fires", "tilt" in (over.update(0.0, tipped).trip or ""),
-          over.update(0.0, tipped).trip)
-
+    # each trip, on the state that should fire it (no tilt trip: deleted
+    # 2026-10-05, section 15 has what a tilt does now)
     bent = LAW.BalanceLaw()
     bent.arm(0.0, crouch)
     wrong = state_at(cfg.H_CROUCH + 0.09)      # 90 mm from the commanded height
@@ -611,16 +606,16 @@ def main() -> int:
               armed_sp.ramp.at(0.0), tilted.R), armed_sp.R_des,
               armed_sp.gains).b_d[3:], np.zeros(3), 1e-9, "N*m")
 
-    check("the tilt trip measures FROM the setpoint, not from true level",
+    check("the fall hold measures FROM the setpoint, not from true level",
           abs(armed_sp.tilt_from_setpoint_deg(tilted)) < 1e-9
           and abs(tilted.tilt_deg - 3.0) < 1e-9,
           "state.tilt_deg still reports %.1f deg for the log" % tilted.tilt_deg)
-    check("...so the stop is reached %.0f deg from where the run began"
-          % cfg.TILT_STOP_DEG,
+    check("...so it is reached %.0f deg from where the run began"
+          % cfg.FALL_HOLD_DEG,
           abs(armed_sp.tilt_from_setpoint_deg(
               state_at(cfg.H_CROUCH,
-                       R=C.rot_x(np.deg2rad(3.0 + cfg.TILT_STOP_DEG))))
-              - cfg.TILT_STOP_DEG) < 1e-9)
+                       R=C.rot_x(np.deg2rad(3.0 + cfg.FALL_HOLD_DEG))))
+              - cfg.FALL_HOLD_DEG) < 1e-9)
 
     close("level_attitude is latched_attitude at a zero setpoint",
           CTRL.level_attitude(0.7), CTRL.latched_attitude(0.0, 0.0, 0.7), 1e-15)
@@ -875,26 +870,6 @@ def main() -> int:
           abs(srb.hold.moment_nm[1]) > 0.5,
           "M_y %+.2f N*m against %+.2f deg of pitch error"
           % (srb.hold.moment_nm[1], err[1]))
-
-    # -- the tilt stop is a PARAMETER, and still a trip -------------------
-    check("tilt_stop_deg defaults to the config value",
-          LAW.BalanceLaw().tilt_stop_deg == cfg.TILT_STOP_DEG,
-          "%.0f deg" % cfg.TILT_STOP_DEG)
-    tipped = state_at(cfg.H_CROUCH, R=C.rot_x(np.deg2rad(20.0)))
-    strict = LAW.BalanceLaw(); strict.arm(0.0, crouch)
-    loose = LAW.BalanceLaw(tilt_stop_deg=45.0); loose.arm(0.0, crouch)
-    check("20 deg trips the 12 deg stop and NOT a 45 deg one",
-          "tilt" in (strict.update(0.0, tipped).trip or "")
-          and "tilt" not in (loose.update(0.0, tipped).trip or ""),
-          "raising it is what lets a steady-state tilt be READ")
-    check("...but 50 deg still trips the raised one -- it is a trip, not off",
-          "tilt" in (loose.update(
-              0.0, state_at(cfg.H_CROUCH,
-                            R=C.rot_x(np.deg2rad(50.0)))).trip or ""))
-    check("hw.fold_stand raises it deliberately, and says so",
-          FS.TILT_STOP_DEG == 45.0 and FS.TILT_STOP_DEG > cfg.TILT_STOP_DEG,
-          "%.0f deg against the %.0f deg default"
-          % (FS.TILT_STOP_DEG, cfg.TILT_STOP_DEG))
 
     # -- the TRACKING stop is a switch, and switching it changes no torque --
     check("track_stop_deg defaults to config.TRACK_STOP_RAD",
@@ -1500,12 +1475,10 @@ def main() -> int:
     fold_gains.kp_att[0], fold_gains.kd_att[0] = FS.ROLL_GAINS
     runs = {"fold": _tracked_trot(fold, fold_gains,
                                   period=FT.PERIOD_S,
-                                  swing_height=FT.SWING_HEIGHT,
-                                  tilt_stop_deg=FS.TILT_STOP_DEG),
+                                  swing_height=FT.SWING_HEIGHT),
             "fold2": _tracked_trot(POSE.FOLD2, fold_gains,
                                    period=F2.PERIOD_S,
-                                   swing_height=F2.SWING_HEIGHT,
-                                   tilt_stop_deg=FS.TILT_STOP_DEG),
+                                   swing_height=F2.SWING_HEIGHT),
             "nominal": _tracked_trot(POSE.NOMINAL, CTRL.BalanceGains())}
     for name, (trips, taus, fz_sum, heights, moment) in runs.items():
         step = float(np.abs(np.diff(taus, axis=0)).max())
@@ -2111,6 +2084,88 @@ def main() -> int:
           seq.phase_name == "park" and seq.feet_home,
           "%s after %.2f s" % (seq.phase_name, t - 2.0))
 
+    # PER-LEG SWING GAINS, 2026-10-05, on request: one leg whose swing is
+    # weak tuned alone (`--kp-swing-rl` etc.).  (3,) is every leg's; a
+    # (4, 3) table is a row per leg, and only that leg's swing feels it.
+    kp_rows = np.tile(cfg.KP_SWING, (C.N_LEGS, 1))
+    kd_rows = np.tile(cfg.KD_SWING, (C.N_LEGS, 1))
+    kp_rows[rl] = [10.0, 10.0, 600.0]
+    kd_rows[rl] = [5.0, 5.0, 60.0]
+    up10 = rest + np.array([0.0, 0.0, 0.010])
+    v_up = np.array([0.0, 0.0, 0.3])
+    close("swing gains per leg: a (4, 3) table is each leg's own row in the "
+          "impedance",
+          [SWING.swing_torque(at_fold, i, up10[i], v_up, kp=kp_rows,
+                              kd=kd_rows) for i in range(C.N_LEGS)],
+          [SWING.swing_torque(at_fold, i, up10[i], v_up, kp=kp_rows[i],
+                              kd=kd_rows[i]) for i in range(C.N_LEGS)],
+          0.0, " N*m")
+
+    def _leg_law(kp, kd):
+        law = LAW.BalanceLaw(foot_xy=fold.foot_xy, dynamic_setpoint=False,
+                             srb=fold.srb, track_stop_deg=0.0,
+                             kp_swing=kp, kd_swing=kd)
+        law.arm(0.0, at_fold)
+        return law
+    l_shared = _leg_law(cfg.KP_SWING, cfg.KD_SWING)
+    l_rows = _leg_law(kp_rows, kd_rows)
+    l_tiled = _leg_law(np.tile(cfg.KP_SWING, (C.N_LEGS, 1)),
+                       np.tile(cfg.KD_SWING, (C.N_LEGS, 1)))
+    g_leg = _gait()
+    rl_up = rl_down = others = tiled = 0.0
+    for t_l in np.arange(0.0, 2.0 * g_leg.period, 0.004):
+        o_s = l_shared.update(t_l, at_fold, gait=g_leg)
+        d = C.unflat(l_rows.update(t_l, at_fold, gait=g_leg).tau - o_s.tau)
+        tiled = max(tiled, float(np.abs(
+            l_tiled.update(t_l, at_fold, gait=g_leg).tau - o_s.tau).max()))
+        if not g_leg.sample(t_l).contact[rl]:       # the law's own test
+            rl_up = max(rl_up, float(np.abs(d[rl]).max()))
+        else:
+            rl_down = max(rl_down, float(np.abs(d[rl]).max()))
+        others = max(others, float(np.abs(np.delete(d, rl, axis=0)).max()))
+    check("the law with RL's own row: RL's swing torque moves, RL in stance "
+          "and the other three legs do not",
+          rl_up > 0.05 and rl_down == 0.0 and others == 0.0,
+          "RL swinging up to %.2f N*m apart; down %.1e, others %.1e"
+          % (rl_up, rl_down, others))
+    check("...every row the shared gains is the shared law, bit for bit",
+          tiled == 0.0, "%.1e N*m" % tiled)
+    try:
+        LAW.BalanceLaw(kp_swing=np.zeros((3, C.N_LEGS)))
+        refused = False
+    except ValueError:
+        refused = True
+    check("...a table of the wrong shape is refused when the law is built",
+          refused)
+    import argparse
+    import contextlib
+    import io
+    from .. import stand as STAND
+    kp_cli, kd_cli, own_cli = STAND.swing_leg_gains(argparse.Namespace(
+        kp_swing=list(cfg.KP_SWING), kd_swing=list(cfg.KD_SWING),
+        kp_swing_rl=[10.0, 10.0, 600.0], kd_swing_rr=[5.0, 5.0, 60.0]))
+    check("the flags: --kp-swing in every row, --kp-swing-rl in RL's, "
+          "--kd-swing-rr in RR's",
+          own_cli == ["RL", "RR"]
+          and np.array_equal(kp_cli[rl], [10.0, 10.0, 600.0])
+          and np.array_equal(np.delete(kp_cli, rl, axis=0),
+                             np.tile(cfg.KP_SWING, (C.N_LEGS - 1, 1)))
+          and np.array_equal(kd_cli[rr], [5.0, 5.0, 60.0])
+          and np.array_equal(np.delete(kd_cli, rr, axis=0),
+                             np.tile(cfg.KD_SWING, (C.N_LEGS - 1, 1))),
+          "own %s" % own_cli)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            FT.main(["--fake", "--swing", "joint",
+                     "--kp-swing-rl", "10", "10", "600"])
+        exit_code = None
+    except SystemExit as refusal_exit:
+        exit_code = refusal_exit.code
+    check("hw.fold_trot takes --kp-swing-rl, and refuses it on the joint "
+          "swing before the bus", exit_code == 2
+          and "the Cartesian swing's" in err.getvalue(), "exit %r" % exit_code)
+
     # =====================================================================
     print("\n13. the state estimator in the hold's and the trot's x/y "
           "(hw.fully_trot)")
@@ -2348,15 +2403,17 @@ def main() -> int:
     check("reference: reset ON the robot -- the first sweep has no error",
           np.array_equal(s0.p, p_a) and s0.yaw == yaw_a and not s0.v.any()
           and not s0.a.any())
-    fwd = WTRAJ.Command(vx=0.10, vy=0.0, yaw_rate=0.0)
+    # Inside the keys' box, whatever it is (60 % of doc/walk's since
+    # 2026-10-05): this is the generator's arithmetic, not the box.
+    fwd = WTRAJ.Command(vx=cfg.WALK_VX_MAX, vy=0.0, yaw_rate=0.0)
     run = [wref.update(0.004 * k, fwd) for k in range(1, 151)]
-    k_half = int(round(0.5 * 0.10 / cfg.WALK_ACC_MAX / 0.004))
+    k_half = int(round(0.5 * fwd.vx / cfg.WALK_ACC_MAX / 0.004))
     close("...a key's step is a ramp at WALK_ACC_MAX, and its rate is fed "
           "forward as a", [run[k_half - 1].command.vx,
                            float(np.linalg.norm(run[k_half - 1].a))],
           [cfg.WALK_ACC_MAX * 0.004 * k_half, cfg.WALK_ACC_MAX], 1e-12)
     close("...turned by the REFERENCE heading: body x at 90 deg is world +y",
-          run[-1].v, [0.0, 0.10], 1e-12, " m/s")
+          run[-1].v, [0.0, fwd.vx], 1e-12, " m/s")
     dist = 0.004 * sum(r.command.vx for r in run)
     close("...and integrated: the position is the slewed velocity's sum",
           run[-1].p - p_a, [0.0, dist], 1e-12, " m")
@@ -2387,7 +2444,7 @@ def main() -> int:
     wref.command = fwd                              # past the slew
     s_late = wref.update(1.0, fwd)                  # a sweep 1 s late
     close("...a sweep 1 s late integrates DT_MAX and no more", s_late.p[0],
-          0.10 * WTRAJ.DT_MAX, 1e-15, " m")
+          fwd.vx * WTRAJ.DT_MAX, 1e-15, " m")
 
     # -- qp.py: the cone inside the problem ---------------------------------
     plain = LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb)
@@ -2579,6 +2636,69 @@ def main() -> int:
                     abs(mine.p[2] - ref_z[0][2]), abs(mine.a[2] - ref_z[2][2]))
     check("...and its scalar arcs ARE sim.cmpc.swing.SwingTrajectory's",
           arc_w < 1e-12, "worst %.1e" % arc_w)
+    # AT REST (v_ref 0, r 0) the arc is hw.fold_trot's in-place target, in
+    # the TRUNK frame from the foot to the site; the filter is not in it
+    # (footstep.py, 2026-10-05).
+    rest_rs = rs._replace(v=np.zeros(2), yaw_rate=0.0)
+    still = WFOOT.TrunkXY(p=np.zeros(2), v=np.zeros(2), yaw=0.0,
+                          yaw_rate=0.0, measured=True)
+    noisy = WFOOT.TrunkXY(p=np.array([0.03, -0.01]),
+                          v=np.array([0.30, -0.20]), yaw=0.2, yaw_rate=0.5,
+                          measured=True)
+
+    def _fp(**kw):
+        return WFOOT.FootstepPlanner(sites, t_stance=t_st, t_swing=t_sw,
+                                     height=0.02, kv=cfg.STEP_KV,
+                                     step_max=cfg.STEP_MAX_XY, **kw)
+    fa, fb = _fp(), _fp()
+    dev = 0.0
+    for s in np.linspace(0.0, 1.0, 21):
+        ra = fa.plan(0, float(s), still, rest_rs, x_lift, -0.165)
+        rb = fb.plan(0, float(s), noisy, rest_rs, x_lift, -0.165)
+        dev = max(dev, float(np.abs(np.r_[ra.p - rb.p, ra.v - rb.v,
+                                          ra.a - rb.a]).max()))
+    check("footstep AT REST (v_ref 0, r 0): the swing is the same whatever "
+          "the filter says -- 32 mm off, 0.36 m/s, 11 deg turned, turning",
+          dev == 0.0 and bool(fa.rest_swing[0] and fb.rest_swing[0]),
+          "worst %.1e" % dev)
+    r0 = fa.plan(0, 0.0, still, rest_rs, x_lift, -0.165)
+    r1 = fa.plan(0, 1.0, still, rest_rs, x_lift, -0.165)
+    close("...it starts on the foot, lands on the site at rest height, and "
+          "is at zero trunk-frame speed at both ends",
+          np.r_[r0.p, r1.p, r0.v[:2], r1.v[:2]],
+          np.r_[x_lift, sites[0], -0.165, np.zeros(4)], 1e-15)
+    fd_rv = fd_ra = 0.0
+    for s in (0.2, 0.4, 0.7, 0.9):
+        hh = 1e-4
+        lo, mid, hi = (fa.plan(0, s + d / t_sw, still, rest_rs, x_lift,
+                               -0.165) for d in (-hh, 0.0, hh))
+        fd_rv = max(fd_rv, float(np.abs((hi.p - lo.p) / (2 * hh)
+                                        - mid.v).max()))
+        fd_ra = max(fd_ra, float(np.abs((hi.p - 2 * mid.p + lo.p) / hh ** 2
+                                        - mid.a).max()))
+    check("...v and a are its derivatives (finite differences)",
+          fd_rv < 1e-5 and fd_ra < 1e-3,
+          "worst %.1e m/s, %.1e m/s^2" % (fd_rv, fd_ra))
+    fc = _fp()
+    fc.plan(0, 0.0, still, rest_rs, x_lift, -0.165)
+    late = fc.plan(0, 1.0, tr, rs, x_lift, -0.165)
+    fc.release(0)
+    fc.plan(0, 0.0, tr, rs, x_lift, -0.165)
+    check("...decided at liftoff: a command that arrives mid-swing does not "
+          "move its landing off the site, and the next swing is placed",
+          bool(np.allclose(late.p[:2], sites[0], 0.0, 1e-15))
+          and not fc.rest_swing[0]
+          and (fc.swings_at_rest, fc.swings_placed) == (1, 1),
+          "lands %s mm off the site" % np.round(1e3 * (late.p[:2]
+                                                     - sites[0]), 3))
+    fo = _fp(place_at_rest=True)
+    slow = noisy._replace(v=np.array([0.10, -0.05]))
+    fo.plan(0, 0.0, slow, rest_rs, x_lift, -0.165)
+    old = fo.plan(0, 1.0, slow, rest_rs, x_lift, -0.165)
+    close("...place_at_rest: the placement at rest as flown before, the site "
+          "plus (T_st / 2 + STEP_KV) v_hat",
+          old.land_w, slow.p + C.rot_z(0.2)[:2, :2] @ sites[0]
+          + (0.5 * t_st + cfg.STEP_KV) * slow.v, 1e-15, " m")
 
     # -- swing_control.py ---------------------------------------------------
     sw_state = replace(at_fold, qd=np.full(C.N_JOINTS, 1.5))
@@ -2607,8 +2727,8 @@ def main() -> int:
                 np.zeros(3)], 1e-12, " N*m")
 
     # -- walk.py: one reference, every target from it -----------------------
-    def _walk_law(swing_law="osc", alloc="qp"):
-        plan = WWALK.WalkPlan(swing_law=swing_law)
+    def _walk_law(swing_law="osc", alloc="qp", **plan_kw):
+        plan = WWALK.WalkPlan(swing_law=swing_law, **plan_kw)
         law = LAW.BalanceLaw(gains=_xy_gains(), foot_xy=fold.foot_xy.copy(),
                              dynamic_setpoint=False, srb=fold.srb,
                              track_stop_deg=0.0, est_xy=True,
@@ -2705,6 +2825,28 @@ def main() -> int:
           "p_hat + R x_b", wp.anchor_w[[1, 2]], feet_w[[1, 2]], 1e-15, " m")
     check("...and the feet that stayed down keep theirs",
           np.array_equal(wp.anchor_w[[0, 3]], before[[0, 3]]))
+    # The placement reads the filter's x/y velocity LOW-PASSED (2026-10-05).
+    lp = WWALK.WalkPlan(v_filter_hz=1.0)
+    tau_lp = 1.0 / (2.0 * np.pi)
+    v_stp = np.array([0.10, -0.05, 0.0])
+    lp._low_pass(_est(0.0, v=v_stp))             # starts the clock, at rest
+    t_k = 0.0
+    while t_k < tau_lp - 1e-12:
+        t_k = min(tau_lp, t_k + 0.004)
+        lp._low_pass(_est(t_k, v=v_stp))
+    once = lp.v_lp.copy()
+    lp._low_pass(_est(t_k, v=5.0 * v_stp))       # the same estimate again
+    close("walk: the placement's x/y velocity is the filter's low-passed at "
+          "v_filter_hz -- 63 % of a step after one time constant, and an "
+          "estimate read twice counts once",
+          np.r_[once, lp.v_lp - once],
+          np.r_[(1.0 - np.exp(-1.0)) * v_stp[:2], 0.0, 0.0], 1e-12, " m/s")
+    tx_lp = lp.trunk_xy(wl, at_fold, out_w.ref, _est(1.0, v=v_stp))
+    tx_raw = WWALK.WalkPlan(v_filter_hz=0.0).trunk_xy(wl, at_fold, out_w.ref,
+                                                      _est(1.0, v=v_stp))
+    check("...the planner reads that; v_filter_hz 0 reads the estimate raw",
+          np.array_equal(tx_lp.v, lp.v_lp)
+          and np.array_equal(tx_raw.v, v_stp[:2]))
     # Two cycles through the law at zero command on the static fixture.
     wl2, wp2 = _walk_law()
     tg2 = GAIT.TrotGait()
@@ -2732,6 +2874,11 @@ def main() -> int:
           "; ".join(sorted(trips2))[:60])
     check("...the QP gives every swinging foot exactly zero force",
           swing_f == 0.0)
+    check("...and every one of its swings flew AT REST: onto the site, "
+          "trunk frame, no velocity term",
+          wp2.planner.swings_at_rest > 0 and wp2.planner.swings_placed == 0,
+          "%d at rest, %d placed" % (wp2.planner.swings_at_rest,
+                                     wp2.planner.swings_placed))
     rep = wl2.report()
     check("...and the exit report has the QP and the walk",
           "qp allocator" in rep and "touchdowns anchored" in rep)
@@ -2765,6 +2912,88 @@ def main() -> int:
           and built.zeta_swing == cfg.ZETA_SWING_OSC
           and built.reference.vx_max == cfg.WALK_VX_MAX,
           "wn %s rad/s" % np.array2string(built.wn_swing, precision=0))
+    a_r = ap_w.parse_args(["--place-at-rest"])
+    a_r.ff_armature, a_r.swing_ff = None, False
+    opts["hook"].configure(a_r)
+    check("...at zero command its swings land on their sites, trunk frame "
+          "(the default); --place-at-rest is the placement as flown before",
+          not built.place_at_rest and cfg.WALK_PLACE_AT_REST is False
+          and opts["hook"].law_kwargs(a_r)["walk"].place_at_rest)
+    a_f = ap_w.parse_args(["--v-filter-hz", "0"])
+    a_f.ff_armature, a_f.swing_ff = None, False
+    opts["hook"].configure(a_f)
+    check("...its placement velocity is low-passed at WALK_V_FILTER_HZ; "
+          "--v-filter-hz 0 reads it raw",
+          built.v_filter_hz == cfg.WALK_V_FILTER_HZ > 0.0
+          and opts["hook"].law_kwargs(a_f)["walk"].v_filter_hz == 0.0)
+    # ONE LEG'S OWN IMPEDANCE, 2026-10-05, on request (`--kp-swing-walk-rl`
+    # etc.): a (4, 3) table in the plan, and only that leg's swing feels it.
+    walk_kp = np.tile(cfg.KP_SWING_WALK, (C.N_LEGS, 1))
+    walk_kd = np.tile(cfg.KD_SWING_WALK, (C.N_LEGS, 1))
+    walk_kp[rl] = [150.0, 150.0, 600.0]
+    walk_kd[rl] = [6.0, 6.0, 60.0]
+    a_l = ap_w.parse_args(["--swing-law", "impedance",
+                           "--kp-swing-walk-rl", "150", "150", "600",
+                           "--kd-swing-walk-rl", "6", "6", "60"])
+    a_l.ff_armature, a_l.swing_ff = None, False
+    opts["hook"].configure(a_l)
+    plan_l = opts["hook"].law_kwargs(a_l)["walk"]
+    check("--kp/--kd-swing-walk-rl: RL's own row in the walk's impedance, "
+          "--kp/--kd-swing-walk in the other three",
+          plan_l.swing_law == "impedance"
+          and np.array_equal(plan_l.kp_swing, walk_kp)
+          and np.array_equal(plan_l.kd_swing, walk_kd)
+          and opts["hook"].own_swing == ["RL"],
+          "own %s" % opts["hook"].own_swing)
+    a_o = ap_w.parse_args(["--kp-swing-walk-rl", "150", "150", "600"])
+    a_o.ff_armature, a_o.swing_ff = None, False
+    try:
+        opts["hook"].configure(a_o)
+        refused = False
+    except ValueError:
+        refused = True
+    check("...refused on the osc law, which has no Kp/Kd to take", refused)
+    err_w = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err_w):
+            FW.main(["--fake", "--kp-swing-walk-rl", "150", "150", "600"])
+        exit_w = None
+    except SystemExit as refusal_exit:
+        exit_w = refusal_exit.code
+    check("...hw.fold_walk at its default osc swing refuses them before the "
+          "bus", exit_w == 2 and "the impedance's gains" in err_w.getvalue(),
+          "exit %r" % exit_w)
+    sw_ref = argparse.Namespace(p=rest[rl] + [0.0, 0.0, 0.010],
+                                v=np.array([0.0, 0.0, 0.3]), a=np.zeros(3))
+    close("...the impedance takes each leg's own row",
+          WSC.swing_control_torque(at_fold, rl, sw_ref, kp=walk_kp,
+                                   kd=walk_kd)[0],
+          WSC.swing_control_torque(at_fold, rl, sw_ref, kp=walk_kp[rl],
+                                   kd=walk_kd[rl])[0], 0.0, " N*m")
+    wl_s, _ = _walk_law(swing_law="impedance")
+    wl_r, _ = _walk_law(swing_law="impedance", kp_swing=walk_kp,
+                        kd_swing=walk_kd)
+    tg_l = GAIT.TrotGait()
+    tg_l.reset(1.0)
+    t = 1.0
+    rl_up = rl_down = others = 0.0
+    while t < 1.0 + 2.0 * tg_l.period:
+        wl_s.feed_estimate(_est(t - 0.004))
+        wl_r.feed_estimate(_est(t - 0.004))
+        o_s = wl_s.update(t, at_fold, gait=tg_l, xy_hold=True)
+        d = C.unflat(wl_r.update(t, at_fold, gait=tg_l, xy_hold=True).tau
+                     - o_s.tau)
+        if not tg_l.sample(t).contact[rl]:       # the law's own test
+            rl_up = max(rl_up, float(np.abs(d[rl]).max()))
+        else:
+            rl_down = max(rl_down, float(np.abs(d[rl]).max()))
+        others = max(others, float(np.abs(np.delete(d, rl, axis=0)).max()))
+        t += 0.004
+    check("...the walking law with RL's own row: RL's swing torque moves, RL "
+          "in stance and the other three legs do not",
+          rl_up > 0.05 and rl_down == 0.0 and others == 0.0,
+          "RL swinging up to %.2f N*m apart; down %.1e, others %.1e"
+          % (rl_up, rl_down, others))
     # hw.fold2_walk: the same walk over hw.fold2_trot (fold_walk.walking).
     from .. import fold2_trot as F2T
     from .. import fold2_walk as F2W
@@ -2810,6 +3039,140 @@ def main() -> int:
     close("...and its footholds are placed about FOLD2's OWN sites, trunk x "
           "+-219.5 mm", np.abs(lw2.walk.sites_b),
           np.tile([0.2195, 0.065], (4, 1)), 5e-4, " m")
+
+    # =====================================================================
+    print("\n15. the fall hold: past 45 deg the joints hold the stand, "
+          "nothing e-stops")
+    # =====================================================================
+    import contextlib
+    import io
+
+    from .. import stand as STAND
+
+    def _tipped(deg, dq=None, qd=None, rot=C.rot_x):
+        """`at_fold`'s legs (plus `dq`) under a trunk tipped `deg`."""
+        R = rot(np.deg2rad(deg))
+        roll, pitch, yaw = C.zyx_from_rot(R)
+        orientation = IMU.TrunkOrientation(R=R, omega_b=np.zeros(3),
+                                           roll=roll, pitch=pitch, yaw=yaw,
+                                           age_s=0.0)
+        return STATE.read(at_fold.q + (0.0 if dq is None else dq),
+                          np.zeros(C.N_JOINTS) if qd is None else qd,
+                          orientation, srb=fold.srb)
+
+    def _fall_law(**kw):
+        law = LAW.BalanceLaw(**dict(dict(
+            foot_xy=fold.foot_xy, dynamic_setpoint=False, srb=fold.srb,
+            track_stop_deg=0.0,
+            fall_hold_deg=cfg.FALL_HOLD_DEG, kp_joint=cfg.KP_JOINT_HOLD,
+            kd_joint=cfg.KD_JOINT_HOLD), **kw))
+        law.arm(0.0, at_fold)
+        return law
+
+    fh = _fall_law()
+    fh.hold_joints(at_fold.q)                    # the first HOLD
+    below = fh.update(0.1, _tipped(cfg.FALL_HOLD_DEG - 5.0))
+    check("5 deg short of the fall hold: the balance law, no trip",
+          below.trip is None and not below.fallen and not fh.fallen)
+    dq = np.deg2rad(np.linspace(-6.0, 6.0, C.N_JOINTS))
+    qd = np.linspace(-1.0, 1.0, C.N_JOINTS)
+    over = _tipped(cfg.FALL_HOLD_DEG + 5.0, dq=dq, qd=qd)
+    fell = fh.update(0.2, over, gait=GAIT.TrotGait())
+    check("5 deg past it: NO trip -- the fall hold, on that very sweep",
+          fell.trip is None and fell.fallen and fh.fallen, fell.trip)
+    close("...its torque is the joint PD to the stand plus the legs' weight, "
+          "nothing else", fell.tau,
+          cfg.KP_FALL_HOLD * (at_fold.q - over.q) - cfg.KD_FALL_HOLD * qd
+          + C.flat(TRQ.all_leg_gravity_torque(over.q, over.R)), 1e-12,
+          " N*m")
+    check("...no wrench, no forces, no swing, whatever the gait says",
+          not fell.wrench.b_d.any() and not fell.allocation.f_w.any()
+          and fell.swing_s is None and fell.contact is None)
+    level = fh.update(0.3, at_fold)
+    check("...and it stays: a level trunk on the next sweep is still the "
+          "hold", level.fallen and np.array_equal(level.q_ref, at_fold.q)
+          and abs(np.abs(level.tau
+                         - C.flat(TRQ.all_leg_gravity_torque(at_fold.q,
+                                                             at_fold.R))
+                         ).max()) < 1e-12)
+    check("...and the exit report says at what tilt FROM THE SETPOINT",
+          abs(fh.fall_tilt_deg - fh.tilt_from_setpoint_deg(over)) < 1e-9
+          and "ENGAGED at %.1f deg" % fh.fall_tilt_deg in fh.report(),
+          "%.2f deg" % fh.fall_tilt_deg)
+
+    later = _fall_law()
+    later.hold_joints(at_fold.q)
+    later.hold_joints(at_fold.q + dq)            # a W step's re-latch
+    later.update(0.1, _tipped(cfg.FALL_HOLD_DEG + 5.0))
+    check("the stand is the FIRST HOLD's pose: a W re-latch does not move it",
+          np.array_equal(later.q_fall, at_fold.q)
+          and np.array_equal(later.q_hold, at_fold.q + dq))
+    early = _fall_law()                          # nothing latched: the rise
+    early.update(0.1, _tipped(cfg.FALL_HOLD_DEG + 5.0))
+    close("fallen in the rise: the IK at h_lift on the stand's sites",
+          early.q_fall, C.flat(LAW.ik_reference(early.h_lift,
+                                                C.unflat(at_fold.q),
+                                                early.home_xy)), 1e-12, " rad")
+    pitched = _fall_law()
+    pitched.hold_joints(at_fold.q)
+    check("pitch past it falls too, not only roll",
+          pitched.update(0.1, _tipped(cfg.FALL_HOLD_DEG + 5.0,
+                                      rot=C.rot_y)).fallen)
+
+    off = _fall_law(fall_hold_deg=None)
+    gone = off.update(0.1, _tipped(cfg.FALL_HOLD_DEG + 5.0))
+    check("no tilt e-stop (deleted): with the fall hold OFF, nothing acts",
+          gone.trip is None and not gone.fallen, gone.trip)
+
+    # -- the sequence -------------------------------------------------------
+    fs = SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                           balance=_fall_law(), gait=GAIT.TrotGait(),
+                           step_to=TR.STEP_FOOT_XY,
+                           step_gait=GAIT.TrotGait(period=TR.STEP_PERIOD_S))
+    fs.phase = SEQ.PHASES.index("hold")
+    fs.body = at_fold
+    fs.gate.start(0.0, q=at_fold.q)
+    fs.balance.hold_joints(at_fold.q)
+    fs.toggle_trot(1.0)
+    fs.update(1.1, at_fold)
+    mode, _, trip = fs.update(1.2, _tipped(cfg.FALL_HOLD_DEG + 5.0))
+    said = fs.take_notice() or ""
+    check("a trot tipped past it: phase 'fall', the trot dropped, still "
+          "torque, no trip", fs.phase_name == "fall" and not fs.trotting
+          and mode == "torque" and trip is None, fs.phase_name)
+    check("...the operator is told, in the notice", "FALL HOLD in trot" in said,
+          said[:60])
+    mode, _, trip = fs.update(1.3, at_fold)
+    check("...a level sweep after: still the fall hold, through the gate",
+          fs.phase_name == "fall" and mode == "torque" and trip is None
+          and fs.out.fallen)
+    check("...T and W are refused in it",
+          "ignored" in fs.toggle_trot(1.4) and "ignored" in fs.toggle_step(1.4))
+    refused = fs.advance(1.5, at_fold.q + dq)
+    check("...and ENTER PARKS, from where the legs are -- no step home first",
+          refused is None and fs.phase_name == "park" and not fs.fallen
+          and np.array_equal(C.flat(fs.q_ref0), at_fold.q + dq)
+          and fs.update(1.6, at_fold)[0] == "position", fs.phase_name)
+
+    # -- the entry points -----------------------------------------------------
+    check("every trot entry point flies it at 45 deg (trot.trot_options)",
+          TR.trot_options()["fall_hold"] == cfg.FALL_HOLD_DEG
+          and FT.stand_options()["fall_hold"] == cfg.FALL_HOLD_DEG
+          and F2T.stand_options()["fall_hold"] == cfg.FALL_HOLD_DEG
+          and FW.walk_options()["fall_hold"] == cfg.FALL_HOLD_DEG)
+    check("...the trot's slew can carry it; the stand's cannot",
+          cfg.TAU_SLEW_TROT_NM_S >= cfg.FALL_HOLD_MIN_SLEW_NM_S
+          > SAFE.DEFAULT_TAU_SLEW_NM_S)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            STAND.main(["--fake", "--fall-hold", "45"])
+        refused_code = None
+    except SystemExit as stop:
+        refused_code = stop.code
+    check("hw.stand REFUSES --fall-hold on the stand's 5 N*m/s slew, before "
+          "the bus", refused_code == 2 and "--fall-hold on a 5 N*m/s slew"
+          in err.getvalue(), "exit %r" % refused_code)
 
     # =====================================================================
     print("\n" + "=" * 78)

@@ -68,7 +68,7 @@ and `r_w` are never spelled the same way.
 | `qp.py` | stage 4 as a QP, **the default** (`--alloc wls` for the least squares): the pyramid and the contact box *inside* the problem, a dense primal active set from the projected unconstrained optimum, capped at 20 iterations (~1.5 ms) |
 | `trajectory.py` | walking: `sim.cmpc.trajectory`'s reference generator, the command slewed, clipped to the hardware box and leashed to the filter |
 | `keys.py` | walking: W/S x, A/D y, Q/E yaw, SPACE stop |
-| `footstep.py` | walking: eq (33) + Raibert's term for the foothold; the arc in the world (x/y) and the trunk (z) |
+| `footstep.py` | walking: eq (33) + Raibert's term for the foothold; the arc in the world (x/y) and the trunk (z). At rest (zero command) the arc is in the trunk frame onto the leg's own site, no velocity term -- hw.fold_trot's in-place target (2026-10-05; `place_at_rest` undoes it) |
 | `swing_control.py` | walking: the swing leg's law — task-space computed torque, or the Cartesian impedance |
 | `walk.py` | walking: ONE reference, and every target taken from it — x/y rows, heading, the joint layer's world-anchored stance targets, the footholds. [doc/walk](../../doc/walk/README.md) |
 | `selftest.py` | gates the lot offline |
@@ -304,8 +304,8 @@ measured yet, so there is nothing to split it on.
 
 Two entry points, one trot (`hw.trot.trot_options`). `hw.trot` is `hw.stand`
 at its own defaults from the **nominal** crouch — setpoint latched, roll
-90/17 — with the tilt stop at 45°, the torque-phase tracking trip off (it
-feeds no torque), and a faster 0.8 s cycle
+90/17 — with the fall hold at 45° (no tilt stop: deleted 2026-10-05), the
+torque-phase tracking trip off (it feeds no torque), and a faster 0.8 s cycle
 (`--period`, `--duty`, `--settle`, `--settle-every` on both entry points).
 `hw.fold_trot` is `hw.fold_stand`'s, at 1.2 s. The fold
 trot tipped in roll on the robot on 2026-09-17; the nominal stance puts both
@@ -335,8 +335,8 @@ imported. The gains are DOG5's 140/140/180 N/m, 8/8/15 N s/m.
 **Operator decisions, 2026-09-16.** No foot placement: the foot rises 40 mm
 in the trunk frame and lands where it left. Torque cap 9 N·m (`TAU_HARD_NM`);
 `SafetyGate(ceiling=...)` is the only way past 3.0, and only `hw.fold_trot`
-passes it. Tilt stop 45°, roll gains and tracking-off as `hw.fold_stand`.
-Slew 60 N·m/s, DOG5's.
+passes it. Tilt stop 45° (deleted 2026-10-05: the fall hold), roll gains and
+tracking-off as `hw.fold_stand`. Slew 60 N·m/s, DOG5's.
 
 **Two things this port had to do that neither source did:**
 
@@ -397,6 +397,38 @@ In the 145 mm stance whose front feet slide, the filter read the walk with the
 wrong sign and the loop made it 40 % worse. `hw.fully_trot`'s docstring has the
 table.
 
+## The fall hold: past 45° the joints hold the stand, nothing e-stops
+
+On request (2026-10-05): an e-stop is a limp robot, and from a 45° attitude
+that drops it. **The tilt e-stop is deleted** — `TILT_STOP_DEG`,
+`--tilt-stop` and the law's tilt trip are gone from every entry point, and no
+tilt stops a run. In every trot entry point (`hw.trot.trot_options`,
+`--fall-hold 45`), past 45° **from the setpoint**, the law stops balancing
+from that sweep on. There is no wrench, no swing, no walk and no x/y. Every
+joint is held at the stand by a joint PD alone (`law.BalanceLaw.fall_hold_deg`):
+
+```
+tau = KP_FALL_HOLD (q_stand - q) - KD_FALL_HOLD qd + tau_grav(q, R)     5 / 0.2, then the gate
+```
+
+`q_stand` is the pose the first HOLD latched. A fall in the rise uses the IK
+the rise is heading to. `sequence` drops the trot or the step on that sweep,
+and the phase reads `fall` until ENTER, which parks. T and W are refused.
+`--fall-hold 0` leaves nothing acting on a tilt, which is also what the stands
+(`hw.stand`, `hw.fold_stand`, `hw.sway`) now have. They keep their tracking
+trip.
+
+**The gate's slew decides whether it holds.** A joint PD behind a rate limiter
+stays linear only while `Kp·|q̇|` fits the slew. Past that, the torque lags
+the request and the leg limit-cycles. In MuJoCo, `hw.fold_trot` was pushed
+over mid-trot (slew 120). At 5 / 0.2 all 8 falls settled within 1.8° rms of
+the stand a second after. A 150 N forward throw tried later took 1.7 s to
+come within 5°, decaying the whole time. At 10 / 0.4, 2 of 8 whirled. At 30 / 0.8, all 3 falls tried
+whirled, asking 20–150 N·m of the gate's 9. `hw.fold_stand`'s 5 N·m/s whirled
+the legs at any gain, so the stands leave it off. `hw.stand` refuses
+`--fall-hold` below `FALL_HOLD_MIN_SLEW_NM_S` = 60. The model's legs do not
+collide with the floor; only the feet and the trunk do.
+
 ## What "level" means: the setpoint is latched, not assumed
 
 DOG5's `SETPOINT_DYNAMIC`, ported whole — the IMU is the same board in the
@@ -411,7 +443,7 @@ same orientation on both robots, so the convention ports with it. The rule is
 The asymmetry is the point. Heading has no truth to return to, so yaw re-locks
 whenever torque re-arms. **Level does**, so re-latching roll/pitch mid-run
 would redefine level as whatever tilt the robot was limping at — and drag
-`TILT_STOP_DEG`'s reference along with it.
+the fall hold's reference along with it.
 
 What it absorbs, per run, with nothing to measure or transcribe: the IMU mount
 tilt, the floor's slope, and the resting pose's lean, all three at once. What
@@ -428,8 +460,8 @@ Two details that are not cosmetic:
   `controller.latched_attitude` builds it in, so the error stays one log map
   with nothing subtracted anywhere. At the latch attitude `e_R` is **exactly**
   zero, so arming can never step the wrench.
-- **The tilt trip measures from the setpoint** (`law.tilt_from_setpoint_deg`),
-  because the trip has to mean "the robot has left the attitude the law is
+- **The fall hold measures from the setpoint** (`law.tilt_from_setpoint_deg`),
+  because it has to mean "the robot has left the attitude the law is
   holding it at". `state.tilt_deg` still measures from true level and is what
   the log and the status line report; on a sloped floor the two differ by the
   slope.
