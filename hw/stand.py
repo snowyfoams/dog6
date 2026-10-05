@@ -1122,14 +1122,15 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           "what the floor gives")
     law.add_argument("--com-offset", type=float, nargs=2, default=[0.0, 0.0],
                      metavar=("DX_MM", "DY_MM"),
-                     help="shift the SRB model's pinned CoM by this much, "
-                          "trunk x / y, mm -- the MEASURED offset of the "
-                          "built robot's CoM from the CAD's (hw.com_check "
-                          "reads it off a HOLD log).  In MuJoCo a 5 mm "
-                          "lateral error alone turns the trot in place into "
-                          "a roll that grows for 30 s and fells every walk "
-                          "within 5 s; corrected here, both are the ideal "
-                          "plant's again (2026-10-05)")
+                     help="the MEASURED offset of the built robot's CoM from "
+                          "the CAD's, trunk x / y, mm (hw.com_check reads it "
+                          "off a HOLD log).  Shifts the SRB pin by it AND the "
+                          "stance the other way, so the trunk stands over "
+                          "the real CoM.  In MuJoCo a 3 / 5 mm error alone "
+                          "turns the trot in place into a roll that grows "
+                          "for 30 s and fells every walk within 5 s; the pin "
+                          "alone does not cure it, the stance does "
+                          "(2026-10-05)")
     law.add_argument("--alloc", choices=("qp", "wls"), default=alloc,
                      help="the force allocator, every phase the SRB law "
                           "drives: 'qp' (default) the friction pyramid and "
@@ -1494,6 +1495,22 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         print("  NOTE: the stand's own foot sites need the tracked joint layer "
               "(--rise-track with the layer on); without it the rise is "
               "straight, on the crouch's feet")
+    if any(args.com_offset):
+        # THE STANCE RE-CENTRED ON THE REAL CoM: the stand's sites move WITH
+        # the offset, so both trot diagonals pass where the real CoM is.  In
+        # MuJoCo the pin alone bought almost nothing (a 3 / 5 mm plant error:
+        # hw.fold_trot in place 9.7 -> 7.9 deg, still growing); the trunk
+        # rocks about whichever diagonal the real CoM is further from, and
+        # no model fixes geometry.  doc/walk/README.md section 11.
+        shift = 1e-3 * np.asarray(args.com_offset, dtype=float)
+        if slide:
+            stand_xy = np.asarray(stand_xy, float) + shift[None, :]
+        else:
+            feet = np.zeros((C.N_LEGS, 3))
+            feet[:, :2] = np.asarray(crouch.foot_xy, float) + shift[None, :]
+            feet[:, 2] = P.FOOT_RADIUS - crouch.z_origin
+            crouch = POSE.CrouchPose.from_hip_sites(
+                crouch.name, feet, q_seed=crouch.q, note=crouch.note)
     srb = crouch.srb_at(1e-3 * args.height,
                         np.asarray(stand_xy, float) if slide else None)
     if any(args.com_offset):

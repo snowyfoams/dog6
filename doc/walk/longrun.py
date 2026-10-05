@@ -146,6 +146,24 @@ for case, ckw in BOXCASES.items():
         **ckw, com_offset_mm=(3.0, 5.0), **CONFIGS["walk_imp150_d80"], **HWLIKE)
 W.SCENARIOS.update(CORR)
 
+#: THE STANCE RE-CENTRED ON THE REAL CoM: the pin shifted AND the stand's
+#: sites moved WITH it by the same 3 / 5 mm, so both trot diagonals pass
+#: where the real CoM is -- `hw.stand --com-offset 3 5` as it shifts both.
+#: (Moved the other way, first try, every case fell on its first swing: the
+#: CoM then sits 10 mm off centre instead of 5.)
+CENT = {}
+for cname in ("trot", "walk_osc", "walk_imp150_d80", "walk_imp10_d80"):
+    CENT["K_%s_inplace" % cname] = dict(
+        schedule=INPLACE, trot_s=T_INPLACE,
+        opts=dict(CONFIGS[cname], com_offset_mm=(3.0, 5.0),
+                  stance_shift=True, **HWLIKE))
+for case, ckw in BOXCASES.items():
+    for cname in ("walk_osc", "walk_imp150_d80"):
+        CENT["K_%s_%s" % (cname, case)] = _box(
+            **ckw, com_offset_mm=(3.0, 5.0), stance_shift=True,
+            **CONFIGS[cname], **HWLIKE)
+W.SCENARIOS.update(CENT)
+
 W.SCENARIOS.update(LONG)
 W.SCENARIOS.update(BOX)
 
@@ -167,6 +185,7 @@ def run(name: str) -> dict:
         BCFG.KP_SWING = np.array(trot_kp, dtype=float)
         BCFG.KD_SWING = np.array(trot_kd, dtype=float)
     com_offset = opts.pop("com_offset_mm", None)
+    stance_shift = opts.pop("stance_shift", False)
     try:
         e, plan = W.entry(**opts)
     finally:
@@ -178,6 +197,11 @@ def run(name: str) -> dict:
         com[:2] += 1e-3 * np.asarray(com_offset, dtype=float)
         com.flags.writeable = False
         e.law_kw["srb"] = dataclasses.replace(srb, com_body=com)
+        if stance_shift:
+            # the stand's sites WITH the CoM: the stance centred on the real one
+            xy = np.array(e.law_kw["stand_xy"], dtype=float)
+            xy[:, :2] += 1e-3 * np.asarray(com_offset, dtype=float)
+            e.law_kw["stand_xy"] = xy
     sim = H.HwSim(e, H.HwParams(**hwkw))
     sim.place(e.crouch.q, e.crouch.z_origin)
     pushes = [(-1.0, -1.0, (0.0, 0.0, 0.0))]
@@ -252,6 +276,8 @@ def main(argv) -> int:
         names += list(BOX)
     if "single" in argv:
         names += list(SINGLE)
+    if "cent" in argv:
+        names += list(CENT)
     if "corr" in argv:
         names += list(CORR)
     if "extra" in argv:
