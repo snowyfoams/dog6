@@ -418,7 +418,13 @@ class HwSim:
                                           pitch=pitch, yaw=yaw,
                                           age_s=max(0.0, now - ta))
             packets = packets[last:]          # keep the newest arrived and later
-            body = BSTATE.read(q, qd_ctrl, orient, srb=stand.crouch.srb)
+            # THE LAW'S OWN PIN, as `hw.stand.run` reads it (stand.balance.srb):
+            # with `--height` and the stand's feet the law pins at a different
+            # model from the crouch's (fold: c^b x -17.8 against -6.9 mm, z
+            # -27.2 against -31.3), and the measurement must use the SAME one
+            # or the CoM offset stops cancelling out of the height error and
+            # the moment arms are taken about a point 11 mm off (2026-10-05).
+            body = BSTATE.read(q, qd_ctrl, orient, srb=stand.balance.srb)
             stand.body = body
 
             mode, values = "keepalive", None

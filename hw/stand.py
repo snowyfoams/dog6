@@ -200,6 +200,7 @@ THE MAP
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 import time
 
@@ -1119,6 +1120,16 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           "QP's pyramid, or the round cone the least squares "
                           "projects onto); it bounds what is asked for, not "
                           "what the floor gives")
+    law.add_argument("--com-offset", type=float, nargs=2, default=[0.0, 0.0],
+                     metavar=("DX_MM", "DY_MM"),
+                     help="shift the SRB model's pinned CoM by this much, "
+                          "trunk x / y, mm -- the MEASURED offset of the "
+                          "built robot's CoM from the CAD's (hw.com_check "
+                          "reads it off a HOLD log).  In MuJoCo a 5 mm "
+                          "lateral error alone turns the trot in place into "
+                          "a roll that grows for 30 s and fells every walk "
+                          "within 5 s; corrected here, both are the ideal "
+                          "plant's again (2026-10-05)")
     law.add_argument("--alloc", choices=("qp", "wls"), default=alloc,
                      help="the force allocator, every phase the SRB law "
                           "drives: 'qp' (default) the friction pyramid and "
@@ -1485,6 +1496,16 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
               "straight, on the crouch's feet")
     srb = crouch.srb_at(1e-3 * args.height,
                         np.asarray(stand_xy, float) if slide else None)
+    if any(args.com_offset):
+        # ONE object, shifted once, before anything reads it: `state.read`
+        # and the law must share it or the CoM offset stops cancelling out
+        # of the height error (config.SrbModel).
+        com = np.array(srb.com_body, dtype=float)
+        com[:2] += 1e-3 * np.asarray(args.com_offset, dtype=float)
+        com.flags.writeable = False
+        srb = dataclasses.replace(
+            srb, name="%s, CoM %+.1f/%+.1f mm" % (srb.name, *args.com_offset),
+            com_body=com)
     knee_plan = None
     if gait is not None and swing == "knee":
         # THE KNEE SWING'S PLAN AT THE HOLD, BEFORE THE BUS OPENS: every leg
