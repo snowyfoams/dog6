@@ -59,10 +59,22 @@ WHAT IS HERE
                       as m*g rather than as a fixed mg/4 per foot.  78 checks
                       of its own, no robot needed.  See balance/README.md.
 
+    cmpc/             [RUNS]  `sim.cmpc`'s convex MPC on the robot, as ONE
+                      PHASE of the stand between lift and park -- the five
+                      0xA4 joint-hold phases around it are hw.stand's,
+                      inherited.  Stand gait by default (the staging ladder
+                      cannot carry a trot diagonal), the controller's state
+                      from a kinematic estimator, its kinematics from
+                      hw.kinematics.  73 checks of its own; the central one
+                      is that it computes the simulator's torques from the
+                      same state.  See cmpc/README.md.
+
     stand.py          the six-phase sequence on the real drivers, and the
                       only file that decides WHEN anything runs.  Carries
                       both lift laws: `--law srb` and `--law per-leg`, the
                       second unchanged and kept as the A/B baseline.
+                      `hw.cmpc.run.HardwareCmpc` subclasses its phase
+                      machine and its loop drives either.
     safety.py         [REFUSES]  torque ramp, cap, limit block, slew and the
                       e-stop trips.  Cannot be constructed on an empty map,
                       with no override -- there are no signs to shape through.

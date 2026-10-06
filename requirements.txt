@@ -1,13 +1,16 @@
 # DOG6 dependencies.
 #
-# The project is sim-only right now -- `hw/` is empty because the robot is
-# being assembled -- so this list is short and will grow when it isn't.
-# `hw/README.md` names what is coming: python-can and pyserial land here the
-# day hw/motorbus.py does, not before.
-#
-# There is an interpreter that already satisfies this:
+# There is an interpreter that already satisfies the sim half:
 #     D:\mujoco\.venv\Scripts\python.exe
-# which is also the one the model's build pipeline runs under.
+# which is also the one the model's build pipeline runs under.  The robot's
+# own interpreter is named at the top of hw/stand.py.
 
+# sim -- the model and the controller
 numpy>=1.24
-mujoco>=3.0
+mujoco>=3.0          # sim.selftest, sim.cmpc.run, sim.stand; not needed by hw
+scipy>=1.10          # sim.cmpc.qp (sparse matrices)
+osqp>=0.6            # sim.cmpc.qp; hw.cmpc runs it on the robot
+
+# hw -- the drivers and the IMU.  Not needed to run the simulator.
+python-can>=4.0      # hw.motor; hw.fake_bus stands in for the adapter
+pyserial>=3.5        # hw.imu (DETA10)

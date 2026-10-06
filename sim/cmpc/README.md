@@ -320,3 +320,23 @@ equation (33) — is not part of the optimisation at all. The convexity is real,
 but it is convexity of a subproblem, and the placement heuristic feeding it is
 the part of this method that is still a heuristic. When this controller falls
 over, look there first.
+
+## On the robot
+
+`hw.cmpc` runs this controller — the same `Controller` object — as one phase
+of `hw.stand`'s sequence, between the lift and the park. Four keyword
+arguments were added for it, and every default reproduces the simulator
+exactly:
+
+| | default (sim) | robot |
+|---|---|---|
+| `schedule` | `gait.TROT` | `gait.STAND`: four feet down at every step of the horizon, because the 3.0 N·m staging cap stands and cannot carry a trot diagonal |
+| `mpc_dt` | `cfg.MPC_DT` | whatever the Pi can afford — a stand has no diagonal pendulum mode, a trot must stay at 40 Hz |
+| `sensor_split` | `True` | `False`: the IMU hold is real, so it is not emulated on top |
+| `solver_settings` | `{}` | `polishing=False`: OSQP 1.x prints from C on every solve with no active set |
+
+`BodyState` also takes optional `feet_body` / `jacobians_body`, so the
+250 Hz half can run on `hw.kinematics`' closed forms instead of this module's
+810 µs chain walk; `swing.stance_torque` accepts the Jacobian for the same
+reason. `hw.cmpc.selftest` gates the hardware path's torques against this
+path's at 1e-12 N·m from the same state. `hw/cmpc/README.md` has the rest.

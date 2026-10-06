@@ -27,6 +27,8 @@ WHY THE HORIZON QUERY IS ITS OWN FUNCTION
 """
 from __future__ import annotations
 
+from typing import Callable, NamedTuple
+
 import numpy as np
 
 from .. import coordinates as C
@@ -113,6 +115,51 @@ def horizon_contacts(t, horizon: int | None = None, dt: float | None = None):
     dt = cfg.MPC_DT if dt is None else float(dt)
     times = float(t) + dt * np.arange(1, horizon + 1)
     return contact(times)
+
+
+# ===========================================================================
+# the two schedules, as one object the controller can be handed
+# ===========================================================================
+class Schedule(NamedTuple):
+    """The three functions a controller reads the gait through.
+
+    ADDED FOR THE HARDWARE PATH, AND IT CHANGES NOTHING ABOVE.  `TROT` is the
+    module's own functions, bound by name, so `Controller()` with no argument
+    runs exactly the timetable it always has.  `STAND` is the degenerate
+    schedule with every foot down at every time, which is the gait a robot
+    under `hw.safety.TAU_STAGED_MAX` is allowed to have: 3.0 N*m stands on
+    four feet (2.20 measured) and does not carry a trot diagonal (4.46).
+
+    A standing MPC is still the MPC -- the same QP, horizon and torque map --
+    with the constraint structure constant over the horizon and the swing law
+    never reached.  It is the A/B against `hw.balance`'s closed-form SRB law,
+    and the first thing to run on the robot before any foot leaves the floor.
+    """
+
+    name: str
+    contact: Callable          # t -> (4,) bool
+    horizon_contacts: Callable  # (t, horizon, dt) -> (horizon, 4) bool
+    swing_phase: Callable      # t -> (4,) progress in [0, 1)
+
+
+def _stand_contact(t) -> np.ndarray:
+    return np.ones(np.shape(np.asarray(t, float)) + (C.N_LEGS,), dtype=bool)
+
+
+def _stand_horizon_contacts(t, horizon: int | None = None,
+                            dt: float | None = None) -> np.ndarray:
+    horizon = cfg.HORIZON if horizon is None else int(horizon)
+    return np.ones((horizon, C.N_LEGS), dtype=bool)
+
+
+def _stand_swing_phase(t) -> np.ndarray:
+    return np.zeros(np.shape(np.asarray(t, float)) + (C.N_LEGS,))
+
+
+TROT = Schedule("trot", contact, horizon_contacts, swing_phase)
+STAND = Schedule("stand", _stand_contact, _stand_horizon_contacts,
+                 _stand_swing_phase)
+SCHEDULES = {"trot": TROT, "stand": STAND}
 
 
 def describe(t: float = 0.0) -> str:

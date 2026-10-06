@@ -261,7 +261,7 @@ def body_frame_force(force_world, rotation) -> np.ndarray:
     return force @ rot_t.T if force.ndim == 2 else rot_t @ force
 
 
-def stance_torque(leg, q, force_body) -> np.ndarray:
+def stance_torque(leg, q, force_body, jacobian=None) -> np.ndarray:
     """Joint torques that deliver an already-rotated ground reaction force.
 
     THE SIGN IS THE WHOLE CONTENT OF THIS FUNCTION.  `force_body` is the force
@@ -278,8 +278,18 @@ def stance_torque(leg, q, force_body) -> np.ndarray:
 
     `q` is fresh encoder data every sweep; `force_body` is whatever
     `body_frame_force` last produced, up to one IMU period old.
+
+    `jacobian` is the 3x3 foot Jacobian at `q` if the caller already has it.
+    THE HARDWARE PATH PASSES IT: `sim.kinematics.foot_jacobian` is a chain
+    walk at 144 us a leg, and the robot's sweep computes the same matrix in
+    closed form (`hw.kinematics`, 17 us a leg) for its own state estimate.
+    Left None it is computed here, and the simulator never passes one -- so
+    the two paths are the same equation fed the same matrix from two sources,
+    which `sim.selftest` gates equal to 1e-12.
     """
-    jacobian = K.foot_jacobian(leg, np.asarray(q, dtype=float).reshape(3))
+    if jacobian is None:
+        jacobian = K.foot_jacobian(leg, np.asarray(q, dtype=float).reshape(3))
+    jacobian = np.asarray(jacobian, dtype=float).reshape(3, 3)
     return jacobian.T @ (-np.asarray(force_body, dtype=float).reshape(3))
 
 

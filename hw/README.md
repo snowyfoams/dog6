@@ -3,8 +3,11 @@
 ```
 python -m hw.selftest              gate the plumbing, no robot needed  (53 checks)
 python -m hw.balance.selftest      gate the balance controller         (78 checks)
+python -m hw.cmpc.selftest         gate the MPC on the hardware path   (73 checks)
 python -m hw.bringup plan          where the bring-up has got to
 python -m hw.bringup scan --fake   run the whole CAN path against software drivers
+python -m hw.stand --fake --auto 1 --no-imu --law per-leg      the stand, no robot
+python -m hw.cmpc.run --fake --auto 1 --no-imu --law per-leg   the stand + MPC, no robot
 ```
 
 DOG5's **protocol** has been ported across — same gearmotors, same drivers,
@@ -86,7 +89,8 @@ collapsed the two and the check lived in an operator's memory.
 | `calibration.py` | **half** | motor frame runs; joint coordinates raise |
 | `imu.py` | **runs** (signs unverified) | DETA10 → trunk frame; `orientation()` gives R and ω^b in SI |
 | `balance/` | **runs** | the stand's SRB balance controller + force allocator. [README](balance/README.md) |
-| `stand.py` | — | the six-phase sequence on the drivers. Both lift laws, `--law srb` / `--law per-leg` |
+| `cmpc/` | **runs** | `sim.cmpc`'s convex MPC as **one phase of the stand**, between lift and park; stand gait by default, kinematic odometry for the state. [README](cmpc/README.md) |
+| `stand.py` | — | the six-phase sequence on the drivers. Both lift laws, `--law srb` / `--law per-leg`. `hw.cmpc.run` subclasses its phase machine |
 | `safety.py` | **refuses** | ramp, cap, limit block, slew, e-stop trips |
 | `fake_bus.py` | needs explicit ids | twelve drivers in software, same protocol |
 | `bringup.py` | — | scan / spin / check / setzero / imu / plan |
@@ -105,7 +109,10 @@ Measured through `hw.kinematics`' Jᵀ over a ±0.6 rad envelope around `Q_STAND
 
 So `TAU_STAGED_MAX = 3.0` is enough to **stand** and deliberately not enough to
 **trot**. `params.TAU_MAX_SIM` is 8.0 and is a *simulation* number —
-`SafetyGate` refuses it by name.
+`SafetyGate` refuses it by name. It is also why `hw.cmpc` runs the MPC in a
+**stand gait** first: the same QP with four feet down at every step of the
+horizon, which the ladder allows, before any gait that lifts a foot, which it
+does not.
 
 ## Two values `sim` is still holding a place for
 

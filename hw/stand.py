@@ -158,7 +158,7 @@ from .balance import state as BSTATE  # noqa: E402
 from .motor import MAX_SPEED_POS     # noqa: E402
 
 __all__ = ["PHASES", "GAP_ESTOP_S", "LAWS", "HardwareStand", "StandLog",
-           "run", "main"]
+           "KeyPoller", "run", "open_bus", "open_imu", "main"]
 
 #: The two lift laws, and the whole point of there being two.
 #:
@@ -175,6 +175,11 @@ __all__ = ["PHASES", "GAP_ESTOP_S", "LAWS", "HardwareStand", "StandLog",
 #: PER-LEG law misbehaves too, nothing a controller swap can do will fix it.
 LAWS = ("srb", "per-leg")
 
+#: The sequence.  `HardwareStand.PHASES` is the one the phase machine reads;
+#: this module-level name is the same tuple, kept for callers.  A subclass
+#: INSERTS a phase (hw.cmpc puts "mpc" between lift and park) and the
+#: position-mode phases around it -- the drivers' own 0xA4 loops holding the
+#: joints -- are inherited, not re-implemented.
 PHASES = ("limp", "settle", "crouch", "lift", "park", "done")
 BLURB = {
     "limp":   "NO TORQUE -- check the angles, move a foot by hand",
@@ -242,7 +247,18 @@ class HardwareStand:
     `update` is called once per sweep with the measured state and returns
     what every motor should be sent this sweep.  Keeping it free of I/O is what
     lets `--fake` exercise exactly the object the robot runs.
+
+    SUBCLASSING IT IS HOW A CONTROLLER GETS ONTO THE ROBOT.  `hw.cmpc.run`
+    overrides `PHASES` to insert a torque phase after the lift and `update`
+    to serve it; everything else -- limp, settle, crouch, park, done, the
+    0xA4 joint hold in each of them, the trips -- is this class's and runs
+    unchanged.  The four hooks `blurb`, `on_key`, `log_extra` and
+    `status_extra` are what `run` reads so that it does not need to know
+    which subclass it is driving.
     """
+
+    PHASES = PHASES
+    BLURB = BLURB
 
     def __init__(self, gate: SAFE.SafetyGate, *, law: str = "srb",
                  balance: BLAW.BalanceLaw | None = None):
@@ -269,11 +285,32 @@ class HardwareStand:
 
     @property
     def phase_name(self) -> str:
-        return PHASES[self.phase]
+        return self.PHASES[self.phase]
 
     @property
     def finished(self) -> bool:
         return self.phase_name == "done"
+
+    # -- the hooks `run` reads ---------------------------------------------
+    def blurb(self) -> str:
+        """What the phase banner says this phase is doing."""
+        if self.phase_name == "lift":
+            return LIFT_BLURB[self.law]
+        return self.BLURB[self.phase_name]
+
+    def on_key(self, key: str) -> None:
+        """A key that is neither ENTER nor X.  The stand has none."""
+
+    def log_extra(self) -> dict:
+        """Columns a subclass adds to every logged torque-mode sweep."""
+        return {}
+
+    def status_extra(self) -> str:
+        """Appended to the 2 Hz status line."""
+        if self.out is None:
+            return ""
+        return "  res %.1fN/%.2fNm" % (self.out.allocation.residual_force,
+                                       self.out.allocation.residual_moment)
 
     def ramp_remaining(self, now: float) -> float:
         """Seconds until the current position ramp has arrived; 0 if none."""
@@ -432,8 +469,15 @@ class StandLog:
         "tau_req": (C.N_JOINTS,),
     }
 
+    #: A subclass sets this to its own extra columns; `FIELDS` stays the
+    #: stand's so the two files an A/B compares keep the same leading columns.
+    EXTRA_FIELDS: dict = {}
+
     def __init__(self) -> None:
         self.rows: list[dict] = []
+
+    def fields(self) -> dict:
+        return {**self.FIELDS, **self.EXTRA_FIELDS}
 
     def add(self, **row) -> None:
         self.rows.append(row)
@@ -443,7 +487,7 @@ class StandLog:
             return "nothing to save -- the run never reached a torque phase"
         columns = {"phase": np.array([row.get("phase", "") for row in self.rows],
                                      dtype="U8")}
-        for field, shape in self.FIELDS.items():
+        for field, shape in self.fields().items():
             blank = np.full(shape, np.nan)
             columns[field] = np.array(
                 [blank if row.get(field) is None else row[field]
@@ -497,10 +541,8 @@ class KeyPoller:
 
 
 def _print_phase(stand: HardwareStand) -> None:
-    blurb = (LIFT_BLURB[stand.law] if stand.phase_name == "lift"
-             else BLURB[stand.phase_name])
-    print("\n>> phase %d %-6s : %s" % (stand.phase, stand.phase_name, blurb),
-          flush=True)
+    print("\n>> phase %d %-6s : %s" % (stand.phase, stand.phase_name,
+                                       stand.blurb()), flush=True)
 
 
 def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
@@ -582,6 +624,8 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
                     print("\n   ENTER ignored: " + refused, flush=True)
                 else:
                     _print_phase(stand)
+            elif pressed is not None:
+                stand.on_key(pressed)
 
             # -- the law ----------------------------------------------------
             mode, values, trip = stand.update(now, body)
@@ -628,7 +672,7 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
                         residual=None if out is None else out.allocation.residual,
                         q=body.q, qd=body.qd, q_ref=stand.q_des,
                         tau_cmd=stand.tau, tau_meas=tau_meas,
-                        tau_req=stand.tau_request)
+                        tau_req=stand.tau_request, **stand.log_extra())
 
             if now - last_status >= STATUS_PERIOD_S:
                 last_status = now
@@ -639,10 +683,7 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
                          body.status(),
                          float(np.abs(stand.tau).max()), stand.tau_peak,
                          1e3 * worst_gap.max(), overruns,
-                         "" if stand.out is None else
-                         "  res %.1fN/%.2fNm" % (
-                             stand.out.allocation.residual_force,
-                             stand.out.allocation.residual_moment)),
+                         stand.status_extra()),
                       flush=True)
             sweep += 1
 
@@ -677,6 +718,26 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
             overruns += 1
             deadline = clock() + slot
     # unreachable
+
+
+def open_bus(ids, *, fake: bool, bitrate: int = 1_000_000):
+    """A `MotorBus` on can0, or on `hw.fake_bus` -- NOT yet armed."""
+    from .motor import motorbus
+    if fake:
+        from .fake_bus import FakeDriverBus
+        return motorbus.MotorBus(ids, bus=FakeDriverBus(ids=ids),
+                                 dirs=HM.motor_directions())
+    return motorbus.MotorBus(ids, bitrate=bitrate, dirs=HM.motor_directions())
+
+
+def open_imu(port: str, wait_s: float = 3.0):
+    """A started `ImuDog` that has produced at least one packet.  Raises --
+    and stops the device -- if it has not within `wait_s`."""
+    imu = IMU.ImuDog(port=port).start()
+    if not imu.wait_for_data(wait_s):
+        imu.stop()
+        raise RuntimeError("no AHRS packet in %.0f s on %s" % (wait_s, port))
+    return imu
 
 
 def main(argv=None) -> int:
@@ -832,14 +893,7 @@ def main(argv=None) -> int:
               "the per-leg law runs")
         print("  the whole sequence there only because it has no such trip.")
 
-    from .motor import motorbus
-    if args.fake:
-        from .fake_bus import FakeDriverBus
-        bus = FakeDriverBus(ids=ids)
-        mb = motorbus.MotorBus(ids, bus=bus, dirs=HM.motor_directions())
-    else:
-        mb = motorbus.MotorBus(ids, bitrate=args.bitrate,
-                               dirs=HM.motor_directions())
+    mb = open_bus(ids, fake=args.fake, bitrate=args.bitrate)
 
     # The IMU is opened BEFORE the bus and started before arming: its stream
     # takes a moment to come up, and the one place that must not wait for a
@@ -847,12 +901,8 @@ def main(argv=None) -> int:
     imu = None
     if not args.no_imu:
         try:
-            imu = IMU.ImuDog(port=args.imu_port).start()
-            if not imu.wait_for_data(3.0):
-                raise RuntimeError("no AHRS packet in 3 s on %s" % args.imu_port)
+            imu = open_imu(args.imu_port)
         except Exception as failure:                     # noqa: BLE001
-            if imu is not None:
-                imu.stop()
             print("[stand] no IMU: %s\n[stand] pass --no-imu to run the "
                   "level-trunk ablation deliberately." % failure,
                   file=sys.stderr)

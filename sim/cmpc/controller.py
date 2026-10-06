@@ -81,6 +81,15 @@ class BodyState:
     omega: np.ndarray                    # world axes
     q: np.ndarray                        # (4, 3) joint angles
     qd: np.ndarray                       # (4, 3) joint rates
+    #: OPTIONAL, AND THE SIMULATOR NEVER FILLS THEM.  The hardware path
+    #: already has the four foot positions and Jacobians in the trunk frame
+    #: from its own closed-form kinematics (`hw.kinematics`, 68 us for four
+    #: legs) by the time it builds this state; recomputing them here through
+    #: `sim.kinematics`' chain walk costs 810 us a sweep, which is 2.4 of the
+    #: robot's 333 us CAN slots.  Left None, `foot_world` and the stance
+    #: torque map compute them as they always have.
+    feet_body: np.ndarray | None = None        # (4, 3) foot sites, trunk frame
+    jacobians_body: np.ndarray | None = None   # (4, 3, 3) d(foot)/dq
 
     def com_position(self) -> np.ndarray:
         return self.position + self.rotation @ dyn.COM_OFFSET_BODY
@@ -92,7 +101,14 @@ class BodyState:
                                         self.rotation @ dyn.COM_OFFSET_BODY)
 
     def foot_world(self, leg: int) -> np.ndarray:
-        return self.position + self.rotation @ K.foot_position(leg, self.q[leg])
+        foot_body = (K.foot_position(leg, self.q[leg]) if self.feet_body is None
+                     else self.feet_body[leg])
+        return self.position + self.rotation @ foot_body
+
+    def foot_jacobian(self, leg: int):
+        """The leg's 3x3 Jacobian if it was supplied, else None -- which lets
+        `swing.stance_torque` compute its own, exactly as the simulator does."""
+        return None if self.jacobians_body is None else self.jacobians_body[leg]
 
     def hip_world(self, leg: int) -> np.ndarray:
         return self.position + self.rotation @ P.HIP_OFFSET[leg]
@@ -162,14 +178,46 @@ class Controller:
     attitude up to 8 ms old.  See `cfg.IMU_HZ`.
     """
 
-    def __init__(self, horizon: int | None = None):
+    def __init__(self, horizon: int | None = None, *,
+                 schedule: "gait.Schedule | None" = None,
+                 mpc_dt: float | None = None,
+                 sensor_split: bool = True,
+                 solver_settings: dict | None = None):
+        """Defaults reproduce the simulator exactly.  The keywords are the
+        hardware path's, and each one is a fact about the robot rather than a
+        tuning:
+
+        schedule      `gait.TROT` (the timetable) or `gait.STAND` (four feet
+                      down, always).  A robot under `hw.safety.TAU_STAGED_MAX`
+                      cannot carry a trot diagonal, so it stands first.
+        mpc_dt        the solve period.  `cfg.MPC_DT` by default; the robot's
+                      CPU decides what it can afford, and `cfg.MPC_HZ`
+                      explains why a TROT must not go below 40 Hz while a
+                      four-foot stand has no such mode to excite.
+        sensor_split  True: `_sensed` emulates the 200 Hz IMU hold on top of a
+                      perfectly current simulator state.  False: the state
+                      handed in IS what the sensors produced and the caller
+                      says, through `update(imu_fresh=...)`, whether this
+                      sweep carried a new IMU packet.  Emulating the hold on
+                      top of a real IMU would hold its samples twice.
+        solver_settings  OSQP settings laid over `qp.Solver`'s defaults.
+                      The robot turns polishing off: OSQP 1.x prints
+                      "Polishing not needed" from C on every solve whose
+                      optimum has no active constraint, `verbose` or not,
+                      and a standing QP's optimum never has one -- so on the
+                      robot that is forty console lines a second from a
+                      step that does nothing there.
+        """
         self.horizon = cfg.HORIZON if horizon is None else int(horizon)
-        self.solver = qp.Solver(horizon=self.horizon)
+        self.schedule = gait.TROT if schedule is None else schedule
+        self.mpc_dt = cfg.MPC_DT if mpc_dt is None else float(mpc_dt)
+        self.sensor_split = bool(sensor_split)
+        self.solver = qp.Solver(horizon=self.horizon, **(solver_settings or {}))
         self.reference = trajectory.ReferenceTrajectory()
         self.command = trajectory.Command()
         self.telemetry = Telemetry()
 
-        self._mpc_tick = Ticker(cfg.MPC_DT)      # 20 Hz
+        self._mpc_tick = Ticker(self.mpc_dt)     # 40 Hz
         self._imu_tick = Ticker(cfg.IMU_DT)      # 200 Hz
 
         self._forces = np.zeros((4, 3))          # MPC solution, WORLD axes
@@ -183,7 +231,8 @@ class Controller:
         self._started_body = False
 
     # -- the sensor split --------------------------------------------------
-    def _sensed(self, truth: BodyState, t: float) -> tuple[BodyState, bool]:
+    def _sensed(self, truth: BodyState, t: float,
+                imu_fresh: bool | None = None) -> tuple[BodyState, bool]:
         """One sweep's view of the robot: held IMU fields, fresh encoder fields.
 
         `truth` is everything the simulator can report, all of it perfectly
@@ -199,7 +248,15 @@ class Controller:
                 q, qd
 
         Returns the merged state and whether the IMU refreshed this sweep.
+
+        With `sensor_split` off (the robot), `truth` is already what the
+        sensors delivered and is returned as it is; `imu_fresh` is then the
+        caller's word on whether a new IMU packet arrived this sweep, and
+        None means it did.
         """
+        if not self.sensor_split:
+            self._imu = truth
+            return truth, (True if imu_fresh is None else bool(imu_fresh))
         fresh = self._imu_tick.due(t)
         if fresh or self._imu is None:
             self._imu = truth
@@ -228,7 +285,7 @@ class Controller:
 
         out = np.zeros((self.horizon, 4, 3))
         for step in range(self.horizon):
-            com_at = com + velocity * (step + 1) * cfg.MPC_DT
+            com_at = com + velocity * (step + 1) * self.mpc_dt
             for leg in range(C.N_LEGS):
                 if contacts[step, leg] and not self._contact_prev[leg]:
                     point = self._target[leg]       # will have landed by then
@@ -256,9 +313,9 @@ class Controller:
     def solve(self, state: BodyState, t: float) -> None:
         """Run one MPC solve and latch its first force vector."""
         started = time.perf_counter()
-        contacts = gait.horizon_contacts(t, self.horizon, cfg.MPC_DT)
+        contacts = self.schedule.horizon_contacts(t, self.horizon, self.mpc_dt)
         reference = self.reference.horizon(self._command_for_body_model(),
-                                           self.horizon, cfg.MPC_DT)
+                                           self.horizon, self.mpc_dt)
 
         # WRAP THE REFERENCE YAW ONTO THE MEASURED YAW'S BRANCH.
         #
@@ -283,12 +340,13 @@ class Controller:
         x0 = trajectory.initial_state(state.com_position(), state.rpy,
                                       state.com_velocity(), state.omega)
         r_feet = self._predict_feet(state, contacts)
-        a_seq, b_seq = dyn.discrete_sequence(reference[:, cfg.RPY][:, 2], r_feet)
+        a_seq, b_seq = dyn.discrete_sequence(reference[:, cfg.RPY][:, 2], r_feet,
+                                             dt=self.mpc_dt)
 
         forces, _ = qp.solve_once(x0, reference, a_seq, b_seq, contacts,
                                   solver=self.solver)
         self._forces = forces
-        self.reference.advance(self.command, cfg.MPC_DT)
+        self.reference.advance(self.command, self.mpc_dt)
 
         self.telemetry.solved = True
         self.telemetry.status = self.solver.last_status
@@ -324,20 +382,22 @@ class Controller:
                 self._target[leg] = state.foot_world(leg)
         self._contact_prev = np.asarray(contacts, dtype=bool).copy()
 
-    def update(self, truth: BodyState, t: float) -> np.ndarray:
+    def update(self, truth: BodyState, t: float,
+               imu_fresh: bool | None = None) -> np.ndarray:
         """One 250 Hz sweep.  Returns (4, 3) joint torques, already clamped.
 
         `truth` is the simulator's full state; what the controller then works
         from is `_sensed`, which holds the IMU fields at 200 Hz and takes the
-        encoder fields fresh.
+        encoder fields fresh.  `imu_fresh` is read only with `sensor_split`
+        off -- see `_sensed`.
         """
-        state, imu_fresh = self._sensed(truth, t)
+        state, imu_fresh = self._sensed(truth, t, imu_fresh)
 
         if not self._started:
             self.reference.anchor(state.com_position(), state.rpy[2])
             self._q_hold = np.asarray(state.q, dtype=float).copy()
 
-        contacts = gait.contact(t)
+        contacts = self.schedule.contact(t)
         self._update_swing_plan(state, t, contacts)
         self._started = True
 
@@ -358,14 +418,15 @@ class Controller:
             self._started_body = True
             self.telemetry.imu_ticks += 1
 
-        progress = gait.swing_phase(t)
+        progress = self.schedule.swing_phase(t)
         torque = np.zeros((4, 3))
         for leg in range(C.N_LEGS):
             q, qd = state.q[leg], state.qd[leg]
             if contacts[leg]:
                 # 250 Hz: fresh encoder q, against the body-frame force that
                 # the 200 Hz IMU tick last produced.
-                torque[leg] = swing.stance_torque(leg, q, self._forces_body[leg])
+                torque[leg] = swing.stance_torque(leg, q, self._forces_body[leg],
+                                                  jacobian=state.foot_jacobian(leg))
                 # THE JOINT FLOOR IS ON STANCE LEGS ONLY, AND IT IS PURE
                 # DAMPING.  A stance leg is driven by a force law, which is
                 # velocity-level and says nothing about where the joint should

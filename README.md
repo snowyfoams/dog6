@@ -9,7 +9,9 @@ that has already been checked.
 dog6/
   sim/     the robot as a model — geometry, mass, frames, kinematics
     cmpc/  convex MPC, reproducing MIT Cheetah 3 (IROS 2018)
-  hw/      empty, on purpose. The robot does not exist yet.
+  hw/      the protocol, the measured map, the stand, and the MPC on the drivers
+    balance/  the stand's SRB balance law
+    cmpc/     sim.cmpc as one phase of the stand
 ```
 
 ```
@@ -124,9 +126,15 @@ written against one reads the other correctly.
 - [x] `sim` — model, frames, parameters, kinematics, leg dynamics. 62 gates.
 - [x] `sim.cmpc` — convex MPC: linearised body model, condensed QP, timetable
       gait, swing law. 83 gates. Trots, strafes and turns, from an Xbox pad.
-- [ ] state estimation — the controller is handed ground truth. Everything it
-      achieves is an upper bound on what it does behind a real filter.
-- [ ] `hw` — waiting on the assembly. See `hw/README.md`.
+- [ ] state estimation — in sim the controller is handed ground truth, so
+      everything it achieves there is an upper bound. `hw.cmpc.state` is a
+      kinematic odometry (IMU attitude, gyro yaw, stance feet for height and
+      velocity) — the simplest thing that closes the loop, and labelled so.
+- [x] `hw` — the map is measured and confirmed (2026-09-15), `hw.stand`
+      runs the sequence, `hw.balance` is the lift law. See `hw/README.md`.
+- [ ] `hw.cmpc` — `sim.cmpc` on the robot as one phase of the stand, stand
+      gait under the 3.0 N·m staging cap. 73 gates, **no motor has seen it**.
+      See `hw/cmpc/README.md`.
 
 An older trot stack exists against this model in `D:\mujoco\dog6_trot`; it has
 not been folded in here, and `sim.cmpc` does not depend on it.
