@@ -283,19 +283,22 @@ def stance_torque(leg, q, force_body) -> np.ndarray:
     return jacobian.T @ (-np.asarray(force_body, dtype=float).reshape(3))
 
 
-def joint_pd(q, qd, q_ref, qd_ref=None, kp=None, kd=None) -> np.ndarray:
-    """The joint-space floor under everything.
+def joint_damping(qd, kd=None) -> np.ndarray:
+    """The joint-space floor under the stance legs: viscous damping, nothing else.
 
-    A pure force law says nothing about where a joint should BE, so a leg that
-    loses its contact -- or a swing whose Cartesian error is momentarily
-    small in a direction the Jacobian cannot see -- has no restoring term.
-    Small enough not to fight the MPC.
+        tau = -Kd qd
+
+    A pure force law is velocity-level: it says nothing about where a joint
+    should BE, and a stance leg that loses its contact has nothing holding it.
+    What this adds is a small drag that opposes whatever rate it has, and only
+    that.  THERE IS DELIBERATELY NO POSITION TERM.  A Kp (q_ref - q) under a
+    stance leg needs a joint-angle reference, and the MPC does not supply one
+    -- the reference would be a pose latched at some earlier instant, and a
+    spring to it fights the MPC's force every time the body moves.  Damping
+    needs no reference.  Small enough not to fight the MPC.
     """
-    kp = cfg.KP_JOINT if kp is None else kp
     kd = cfg.KD_JOINT if kd is None else kd
-    qd_ref = np.zeros(3) if qd_ref is None else np.asarray(qd_ref, dtype=float)
-    return (kp * (np.asarray(q_ref, float) - np.asarray(q, float))
-            + kd * (qd_ref - np.asarray(qd, float)))
+    return -kd * np.asarray(qd, dtype=float)
 
 
 def describe() -> str:

@@ -178,7 +178,6 @@ class Controller:
         self._liftoff = np.zeros((4, 3))         # world, latched at liftoff
         self._target = np.zeros((4, 3))          # world, planned touchdown
         self._contact_prev = np.ones(4, dtype=bool)
-        self._q_hold = C.Q_STAND.copy()          # joint PD reference
         self._started = False
         self._started_body = False
 
@@ -335,7 +334,6 @@ class Controller:
 
         if not self._started:
             self.reference.anchor(state.com_position(), state.rpy[2])
-            self._q_hold = np.asarray(state.q, dtype=float).copy()
 
         contacts = gait.contact(t)
         self._update_swing_plan(state, t, contacts)
@@ -367,15 +365,18 @@ class Controller:
                 # the 200 Hz IMU tick last produced.
                 torque[leg] = swing.stance_torque(leg, q, self._forces_body[leg])
                 # THE JOINT FLOOR IS ON STANCE LEGS ONLY, AND IT IS PURE
-                # DAMPING.  A stance leg is driven by a force law, which is
+                # DAMPING -- there is no joint-angle term and no reference
+                # pose.  A stance leg is driven by a force law, which is
                 # velocity-level and says nothing about where the joint should
-                # be; a little damping is what keeps it from drifting.  A
-                # SWING leg already has a complete operational-space law --
-                # Cartesian PD plus Lambda plus the bias -- and adding joint
-                # damping there opposes qd, which during a swing is several
-                # rad/s.  That is a drag the feedforward does not know about,
-                # so the swing tracks worse with the floor than without it.
-                torque[leg] = torque[leg] + swing.joint_pd(q, qd, q)
+                # be; a little damping is what keeps it from drifting, and a
+                # spring to a latched pose would fight the MPC's force every
+                # time the body moves.  A SWING leg already has a complete
+                # operational-space law -- Cartesian PD plus Lambda plus the
+                # bias -- and adding joint damping there opposes qd, which
+                # during a swing is several rad/s.  That is a drag the
+                # feedforward does not know about, so the swing tracks worse
+                # with the floor than without it.
+                torque[leg] = torque[leg] + swing.joint_damping(qd)
             else:
                 arc = swing.SwingTrajectory(self._liftoff[leg], self._target[leg])
                 p_w, v_w, a_w = arc.at(progress[leg])

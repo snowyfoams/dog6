@@ -302,11 +302,14 @@ SWING_HEIGHT = 0.030                                 # m   [DOG6]
 KP_SWING = np.diag([500.0, 500.0, 500.0])            # N/m   [TUNED]
 KD_SWING = np.diag([20.0, 20.0, 20.0])               # N s/m [TUNED]
 
-#: A joint-space PD floor under the stance legs.  A pure force law is
-#: velocity-level: it says nothing about where the joint should BE, so a leg
-#: that loses its contact integrates away without bound.  Small enough not to
-#: fight the MPC's forces.
-KP_JOINT = 5.0                                       # N*m/rad   [TUNED]
+#: Joint viscous damping under the stance legs, tau = -KD_JOINT qd.  A pure
+#: force law is velocity-level: it says nothing about where the joint should
+#: BE, so a leg that loses its contact integrates away without bound.  A
+#: little damping is what keeps it from drifting.  THERE IS NO KP_JOINT: a
+#: joint-angle spring needs a reference the MPC never supplies, and a pose
+#: latched at some earlier instant fights the MPC's force whenever the body
+#: moves.  `swing.joint_damping` is the one place this number is used.  Small
+#: enough not to fight the MPC.
 KD_JOINT = 0.2                                       # N*m*s/rad [TUNED]
 
 # ===========================================================================
