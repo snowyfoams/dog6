@@ -5,6 +5,8 @@ python -m hw.selftest              gate the plumbing, no robot needed  (48 check
 python -m hw.balance.selftest      gate the balance controller         (78 checks)
 python -m hw.bringup plan          where the bring-up has got to
 python -m hw.bringup scan --fake   run the whole CAN path against software drivers
+python -m hw.stand                 stand up, six phases, ENTER steps them
+python -m hw.stand --wave FL       ...and stand on three legs, waving that paw
 ```
 
 DOG5's **protocol** has been ported across — same gearmotors, same drivers,
@@ -120,7 +122,7 @@ the table for the length of a `with` block.
 | `bringup.py` | scan/spin no, check/setzero yes | scan / spin / check / setzero / imu / plan |
 | `record.py` | yes | the twelve joint angles, read and kept. **Zero torque** — 0xA1 iq=0 keep-alives only, so the legs stay back-drivable and a pose put in by hand can be read off. Live line, ENTER for a pose table, `--out FILE.csv` streams every sweep. `--fake` too |
 | `swing_bench.py` | yes, **robot hung up** | the swing leg on its own: position ramp to the lift pose, torque hold of every foot at its site (swing PD + gravity, no balance law, no IMU), ENTER runs the gait clock and the legs in `--legs` follow the arc — `hw.trot`'s swing law and flags exactly. One line per swing from the FK: apex asked vs reached, x/y excursion, touchdown speed, tau_ff / PD / slew-clip peaks. `--log FILE.npz`, `--fake --auto 1 --swings 4` |
-| `stand.py` | yes | `sim.stand`'s limp → settle → crouch → lift → park on the robot. Driver 0xA4 for position, `SafetyGate` for the lift, every motor re-sent inside the 50 ms input-lost window. Both lift laws, `--law srb` / `--law per-leg`. `--fake` runs it against `fake_bus` |
+| `stand.py` | yes | `sim.stand`'s limp → settle → crouch → lift → park on the robot. Driver 0xA4 for position, `SafetyGate` for the lift, every motor re-sent inside the 50 ms input-lost window. Both lift laws, `--law srb` / `--law per-leg`. `--fake` runs it against `fake_bus`. `--wave LEG` splices `sim.wave`'s shift → raise → wave → lower → unshift after the hold (plain `hw.stand` only): torque phases on `hw.kinematics`, refused unless the lift arrived; the paw's and the joints' tracking trips, no tilt trip. **Simulated, not flown** |
 | `wide_trot.py` | yes | `hw.fold_trot`'s run from `posture.WIDE` at 160 mm, the stance xy spring on, 0.5 s / 20 mm — the stand posture the 2026-10-01 simulation study (`doc/trot_posture/`) found best for the trot in place; `--track 95 / 105` for the feet further out |
 | `fold_walk.py` | yes | `hw.fold_trot` steered from the keyboard while trotting: W/S x, A/D y, Q/E yaw, SPACE stop. One walking reference feeds the x/y rows, the heading, the joint layer's (world-anchored) stance targets and the footholds; at zero command each swing lands on its own site in the trunk frame, hw.fold_trot's in-place target (`--place-at-rest`: placed as before); the QP allocator by default; the trot at duty 0.70. **Simulated, not flown** — what MuJoCo says it can and cannot do is [doc/walk/README.md](../doc/walk/README.md) |
 | `fold2_walk.py` | yes | the same walk over `hw.fold2_trot` (knees out, CoM on both diagonals): `fold_walk.walking` around FOLD2's stand. **Simulated, not flown** — [doc/walk/README.md](../doc/walk/README.md) |

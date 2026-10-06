@@ -33,6 +33,18 @@ THE TROT IS A SUB-STATE OF HOLD, NOT AN EIGHTH PHASE
     position ramp to the crouch, from wherever the legs are.  T and W are
     refused; there is no way back into the balance law in the same run.
 
+THE THREE-LEG STANCE IS FIVE MORE PHASES, NOT A SUB-STATE
+    A sequence built with `wave="FL"` (`hw.stand --wave FL`) splices
+    `sim.wave`'s five between HOLD and PARK -- `phases_for`:
+
+        ... rise hold [shift raise wave lower unshift] park done
+
+    They are torque phases on `sim.wave.ThreeLegStance` with `kin=hw.kinematics`,
+    whatever `--law` lifted, entered by ENTER from HOLD and left by their own
+    reference arriving.  The SRB law is not called in them.  Their trips are
+    the paw's and the joints' tracking against the wave's targets, both off at
+    `track_stop_deg` 0; there is no tilt trip (deleted 2026-10-05).
+
 `mode` is the whole interface to the bus: "keepalive" (values None), "position"
 (values: (12,) joint rad, capped by `max_dps`) or "torque" (values: (12,) N*m,
 already through `safety.SafetyGate`).  `hw.stand` sends it and does not
@@ -146,6 +158,7 @@ from sim import coordinates as C     # noqa: E402
 from sim import kinematics as SK     # noqa: E402
 from sim import params as P          # noqa: E402
 from sim import stand as ST          # noqa: E402
+from sim import wave as WV           # noqa: E402
 
 from .. import hardware_map as HM    # noqa: E402
 from .. import kinematics as HK      # noqa: E402
@@ -155,10 +168,12 @@ from . import config as BCFG         # noqa: E402
 from . import law as BLAW            # noqa: E402
 from . import posture as POSE        # noqa: E402
 from . import state as BSTATE        # noqa: E402
+from . import torque as TRQ          # noqa: E402
 
 __all__ = ["LAWS", "PHASES", "BLURB", "LIFT_BLURB", "phase_blurb",
-           "ramp_motor_dps", "StandSequence",
-           "SETTLE_MOTOR_DPS", "SETTLE_TRACK_ESTOP", "TRACK_ESTOP"]
+           "phases_for", "ramp_motor_dps", "StandSequence",
+           "SETTLE_MOTOR_DPS", "SETTLE_TRACK_ESTOP", "TRACK_ESTOP",
+           "WAVE_MIN_HEIGHT"]
 
 #: The two lift laws, and the whole point of there being two.
 #:
@@ -192,6 +207,31 @@ BLURB = {
     "park":   "driver position mode -> crouch",
     "done":   "driver position mode, holding crouch.  ENTER exits",
 }
+BLURB.update({name: WV.WaveController.BLURB[name] for name in WV.WAVE_PHASES})
+
+
+def phases_for(wave: str | None) -> tuple[str, ...]:
+    """The phase list: PHASES, or with `sim.wave`'s five spliced after hold.
+
+        limp settle crouch rise hold [shift raise wave lower unshift] park done
+
+    THE WAVE PHASES ARE TORQUE PHASES AND THEY RUN `sim.wave.ThreeLegStance`
+    WHATEVER `--law` WAS.  The hold hands over to them at the standing pose
+    exactly as it hands over to park -- from where the robot is -- and they
+    are the law the simulator validated, on `hw.kinematics`.  The SRB
+    controller stays a four-foot law until its allocator carries contact
+    weights on the robot; `config.CONTACT_WEIGHT` is where that goes, and
+    `sim.wave.check` already gates the two load splits agree.
+    """
+    if wave is None:
+        return PHASES
+    at = PHASES.index("hold") + 1
+    return PHASES[:at] + WV.WAVE_PHASES + PHASES[at:]
+
+
+#: The lift must have got at least this far (trunk-ORIGIN height) before a
+#: wave phase is entered: halfway from the crouch to the lift target.
+WAVE_MIN_HEIGHT = 0.5 * (ST.CROUCH_HEIGHT + ST.LIFT_HEIGHT)
 
 #: What the lift phase is actually doing, which depends on `--law`.  The
 #: phase banner is the one place an operator reads it, so it says which.
@@ -374,9 +414,21 @@ class StandSequence:
                  balance: BLAW.BalanceLaw | None = None,
                  crouch: POSE.CrouchPose = POSE.NOMINAL, gait=None,
                  step_to=None, step_gait=None, trot_swings: int = 0,
-                 position_trips: bool = True):
+                 position_trips: bool = True, wave: str | None = None,
+                 wave_com_xy=None):
         if law not in LAWS:
             raise ValueError("law must be one of %s, got %r" % (LAWS, law))
+        # THE WAVE IS ONLY VALIDATED FROM THE NOMINAL STAND.  `sim.wave`'s
+        # raised point, its CoM and its three-foot z spring were all derived
+        # at `sim.stand`'s stance; the feet and the height are latched from
+        # the measured pose, but nothing has checked a paw lifted out of any
+        # other.  By name, not identity: `--com-offset` rebuilds the nominal
+        # crouch on re-centred sites and that is still the nominal stand.
+        if wave is not None and crouch.name != POSE.NOMINAL.name:
+            raise ValueError(
+                "--wave is validated from the nominal stand only "
+                "(sim.wave --check / --headless); this crouch is %r"
+                % crouch.name)
         # THE PER-LEG BASELINE IS ONLY A BASELINE AT THE NOMINAL CROUCH.
         # `sim.stand.compliance_torque` pins its springs at `sim.stand.FOOT_XY`
         # and takes no posture -- from any other crouch it would spend the lift
@@ -469,6 +521,15 @@ class StandSequence:
         #: leg that cannot follow the ramp is then pushed by the driver's own
         #: position loop and nothing here stops it.
         self.position_trips = bool(position_trips)
+        #: `sim.wave`'s law on `hw.kinematics`, or None for the plain stand.
+        #: `wave_com_xy` is the CoM it shifts over and splits the load about,
+        #: trunk frame -- `sim.wave.COM_XY_LIFT` plus `--com-offset`.
+        self.wave = (None if wave is None else
+                     WV.ThreeLegStance(wave, kin=HK, com_xy=wave_com_xy))
+        self.phases = phases_for(wave)
+        #: True when the last refusal from `advance` will not clear by
+        #: waiting -- `--auto` stops on it instead of asking forever.
+        self.refusal_final = False
 
     @property
     def phase_name(self) -> str:
@@ -476,7 +537,7 @@ class StandSequence:
             return "fall"
         if self.stepping:
             return "step"
-        return "trot" if self.trotting else PHASES[self.phase]
+        return "trot" if self.trotting else self.phases[self.phase]
 
     @property
     def yaw_offset(self) -> float:
@@ -642,9 +703,13 @@ class StandSequence:
         return self.phase_name == "done"
 
     def ramp_remaining(self, now: float) -> float:
-        """Seconds until the current position ramp has arrived; 0 if none."""
-        seconds = {"crouch": ST.RAMP_POSITION, "park": ST.RAMP_POSITION,
-                   "rise": ST.RAMP_LIFT}.get(self.phase_name, 0.0)
+        """Seconds until the current phase's reference has arrived; 0 if none."""
+        name = self.phase_name
+        if self.wave is not None and name in WV.WAVE_PHASES:
+            seconds = self.wave.duration(name)
+        else:
+            seconds = {"crouch": ST.RAMP_POSITION, "park": ST.RAMP_POSITION,
+                       "rise": ST.RAMP_LIFT}.get(name, 0.0)
         return max(0.0, seconds - (now - self.t_phase))
 
     def advance(self, now: float, q) -> str | None:
@@ -659,9 +724,10 @@ class StandSequence:
         # feet wherever they are: no step home first, nothing back into the
         # balance law.  The park's ramp starts from the measured pose below.
         from_fall = self.fallen
+        self.refusal_final = False
         if from_fall:
             self.fallen = False
-            self.phase = PHASES.index("hold")
+            self.phase = self.phases.index("hold")
         if self.trotting:
             return ("trotting -- press T to latch the exit, then ENTER parks "
                     "from HOLD")
@@ -675,7 +741,12 @@ class StandSequence:
             self.notice = self._start_step(now, self.home_xy,
                                            park_after=True)
             return None
-        if self.phase_name in ("crouch", "park") and self.ramp_remaining(now) > 0:
+        # A position ramp, or a wave phase with its reference still moving,
+        # is not interrupted: the next phase latches FROM WHERE THE ROBOT IS,
+        # and where it is mid-ramp is not a pose the next reference starts at.
+        held = (("crouch", "park") + WV.WAVE_PHASES if self.wave is not None
+                else ("crouch", "park"))
+        if self.phase_name in held and self.ramp_remaining(now) > 0:
             return ("%s ramp still running, %.1f s left"
                     % (self.phase_name, self.ramp_remaining(now)))
         # RISE IS NOT STEPPED BY HAND.  It ends when the S-curve arrives and
@@ -686,7 +757,23 @@ class StandSequence:
         if self.phase_name == "rise":
             return ("the rise ends on its own in %.1f s, then HOLD"
                     % self.ramp_remaining(now))
-        self.phase += 1
+        if (self.wave is not None and not from_fall
+                and self.phases[self.phase + 1] == "shift"):
+            # A three-leg stance starts from a robot that is STANDING.  With
+            # the first-run cap of 1.0 N*m the lift pushes, saturates and
+            # leaves the trunk on the floor -- and a weight shift on the
+            # floor is thirty degrees of abduction for nothing.  Read the
+            # legs, not the IMU: the crouch is level too.
+            h_now = ST.height_from_fk(C.unflat(q))
+            if h_now < WAVE_MIN_HEIGHT:
+                self.refusal_final = True
+                return ("shift refused: the trunk is at %.0f mm (floor to "
+                        "bottom), the lift did not arrive (needs %.0f).  Park."
+                        % (1e3 * BSTATE.origin_to_height(h_now),
+                           1e3 * BSTATE.origin_to_height(WAVE_MIN_HEIGHT)))
+        # FROM THE FALL HOLD THE NEXT PHASE IS PARK, not HOLD's successor --
+        # with the wave spliced in that would be `shift`.
+        self.phase = self.phases.index("park") if from_fall else self.phase + 1
         self.t_phase = now
         # From WHERE THE ROBOT IS, as in sim.stand -- after the lift that is
         # wherever the compliance law settled, not Q_CROUCH.
@@ -723,6 +810,10 @@ class StandSequence:
                     "magnetometer's reading and is now 0 -- world x is where "
                     "the trunk points, and yaw from here is drift off it"
                     % np.degrees(self.yaw_offset))
+        elif self.wave is not None and name in WV.WAVE_PHASES:
+            # Foot xy, the lift height and the shift are latched from the
+            # MEASURED feet at `shift`; the paw's floor spot at `raise`.
+            self.wave.enter(name, q)
         elif name == "done":
             self.max_dps = np.full(C.N_JOINTS, SETTLE_MOTOR_DPS)
         return None
@@ -845,6 +936,9 @@ class StandSequence:
                                   "steps back and parks." if not self.feet_home
                                   else "ENTER parks."))
 
+        if self.wave is not None and name in WV.WAVE_PHASES:
+            return self._wave(now, elapsed, body)
+
         if name in ("rise", "hold", "trot", "step", "fall"):
             if self.law == "srb":
                 result = self._lift_srb(
@@ -957,5 +1051,48 @@ class StandSequence:
         self.tau = self.gate.apply(self.tau_request, q, now)
         self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))
         return "torque", self.tau, None
+
+    # -- the three-leg stance --------------------------------------------
+    def _wave(self, now: float, elapsed: float, body):
+        """`sim.wave.ThreeLegStance.torque`, on `hw.kinematics`, every sweep.
+
+        All four leg-gravity terms are refreshed every sweep with
+        `torque.all_leg_gravity_torque`'s closed form (36 us), at a LEVEL
+        trunk, as the law the simulator ran has them.  Two trips, both
+        tracking and both off at `track_stop_deg` 0 (`--no-limits`): the paw
+        far from its reference (it hit something or a motor is gone), and a
+        joint far from the IK at the commanded targets.  NO TILT TRIP: the
+        tilt stop is deleted everywhere (2026-10-05), and a stand has
+        nothing on tilt.
+        """
+        q, qd = body.q, body.qd
+        self.gravity = TRQ.all_leg_gravity_torque(q)
+        request = self.wave.torque(self.phase_name, elapsed, C.unflat(q),
+                                   C.unflat(qd), gravity=self.gravity)
+        self.h_cmd = self.wave.height_cmd
+        self.q_des = C.flat(self.wave.q_ref(q))
+        self.tau_request = C.flat(request)
+        self.tau = self.gate.apply(self.tau_request, q, now)
+        self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))
+        self.out = None
+
+        trip = None
+        track_deg = float(self.balance.track_stop_deg)
+        if track_deg > 0.0:
+            error = np.abs(q - self.q_des)
+            if self.wave.swing_error > WV.SWING_TRACK_STOP:
+                trip = ("%s: the %s paw is %.0f mm from its reference (limit "
+                        "%.0f) -- it hit something, or a motor is not "
+                        "following"
+                        % (self.phase_name, self.wave.leg_name,
+                           1e3 * self.wave.swing_error,
+                           1e3 * WV.SWING_TRACK_STOP))
+            elif np.any(error > np.deg2rad(track_deg)):
+                index = int(np.argmax(error))
+                trip = ("%s: %s is %.1f deg from the IK at the commanded "
+                        "targets (limit %.0f)"
+                        % (self.phase_name, HM.JOINT_LABELS[index],
+                           np.rad2deg(error[index]), track_deg))
+        return "torque", self.tau, trip
 
 

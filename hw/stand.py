@@ -45,6 +45,16 @@ X is an E-STOP at any point:
 `sim.stand` explains why the sequence is shaped this way.  This file only
 explains what is different about running it on twelve MG5010 drivers.
 
+    $V -m hw.stand --wave FL                  twelve phases: after `hold`,
+             shift    TORQUE, the trunk slides over the feet
+             raise    TORQUE, the FL paw is unloaded, then lifted
+             wave     TORQUE, three feet; the paw waves, then holds
+             lower    TORQUE, the paw goes back and is reloaded
+             unshift  TORQUE, the trunk slides back
+    `sim.wave` owns all five -- the targets, the load split and the law --
+    and `balance.sequence.phases_for` says what they inherit from the hold.
+    Plain `hw.stand` only: the nominal stand.
+
 
 WHAT IS IN THIS FILE, AND WHAT IS IN `hw.balance`
     This file is the RUNNER: the CAN loop and its slots, the key poller, the
@@ -212,7 +222,10 @@ if __package__ in (None, ""):        # allow `python hw/stand.py` too
     __package__ = "hw"
 
 from sim import coordinates as C     # noqa: E402
+from sim import kinematics as SK     # noqa: E402
 from sim import params as P          # noqa: E402
+from sim import stand as ST          # noqa: E402
+from sim import wave as WV           # noqa: E402
 
 from . import CONFIRMED_ON_DOG6      # noqa: E402
 from . import calibration as CAL     # noqa: E402
@@ -711,6 +724,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 if stand.finished:
                     return None
                 refused = stand.advance(now, q)
+                if refused and stand.refusal_final and auto_s is not None:
+                    return "refused to advance: " + refused
                 if refused:
                     print("\n   ENTER ignored: " + refused, flush=True)
 
@@ -767,6 +782,10 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 out = stand.out
                 if out is not None and out.state is not None:
                     body = out.state          # the height the law acted on
+                # The three-leg stance has no `out`: its load split and its
+                # contact weights go in the same two columns.
+                wave = (stand.wave if stand.wave is not None
+                        and stand.phase_name in WV.WAVE_PHASES else None)
                 log.add(t=now - stand.t_phase, phase=stand.phase_name,
                         h_cmd=BSTATE.origin_to_height(stand.h_cmd), h=body.h,
                         p_cz=body.p_cz, p_cz_dot=body.p_cz_dot,
@@ -774,14 +793,16 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                         omega_b=body.omega_b, imu_age=body.imu_age_s,
                         b_d=None if out is None else out.wrench.b_d,
                         e_R=None if out is None else out.wrench.e_R,
-                        fz=None if out is None else out.allocation.fz,
+                        fz=(wave.fz if wave is not None else
+                            None if out is None else out.allocation.fz),
                         f_w=None if out is None else out.allocation.f_w,
                         residual=None if out is None else out.allocation.residual,
                         q=body.q, qd=body.qd, q_ref=stand.q_des,
                         tau_cmd=stand.tau, tau_meas=tau_meas,
                         tau_req=stand.tau_request,
                         tau_ff=None if out is None else out.tau_ff,
-                        contact_w=None if out is None else out.contact,
+                        contact_w=(wave.contact if wave is not None else
+                                   None if out is None else out.contact),
                         swing_s=None if out is None else out.swing_s,
                         p_swing=None if out is None else out.p_swing,
                         x_b=body.x_b,
@@ -854,10 +875,14 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                         worst = int(np.argmax(err))
                         track = "  track %.1f deg (%s)" % (np.degrees(err[worst]),
                                                            HM.JOINT_LABELS[worst])
-                    print("   %-6s t=%5.1f  h_cmd=%6.1f  %s%s%s"
+                    print("   %-7s t=%5.1f  h_cmd=%6.1f  %s%s%s"
                           % (stand.phase_name, now - stand.t_phase,
                              1e3 * BSTATE.origin_to_height(stand.h_cmd),
                              body.status(), track, tail), flush=True)
+                    if (stand.wave is not None
+                            and stand.phase_name in WV.WAVE_PHASES):
+                        # `body.h` averages the paw in; the law's h3 does not.
+                        print("          " + stand.wave.status(), flush=True)
                 if velocity is not None and not terse:
                     print("          " + velocity.status(), flush=True)
                 if estimator is not None:
@@ -867,7 +892,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                         and stand.phase_name in ("hold", "trot")):
                     print("          " + hook.status(now, stand), flush=True)
                 if (stand.phase_name in ("rise", "hold", "trot", "step",
-                                         "fall") and not terse):
+                                         "fall") + WV.WAVE_PHASES
+                        and not terse):
                     print(_torque_lines(stand.tau, tau_meas), flush=True)
             sweep += 1
 
@@ -1357,6 +1383,24 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                      metavar="N", help="leg-gravity terms refreshed per sweep; "
                                        "4 removes the 12 ms cross-leg skew")
 
+    # THE WAVE IS THE PLAIN STAND'S ONLY: `sim.wave` validated it from the
+    # nominal stance at the default height, with no gait and no hook in the
+    # hold it starts from.  Every other entry point flies without it.
+    if (crouch is POSE.NOMINAL and gait is None and hook is None
+            and step_to is None and stand_xy is None and height is None):
+        wave = ap.add_argument_group(
+            "the three-leg stance",
+            "`--wave LEG` splices sim.wave's five phases after the hold: "
+            "shift the trunk, unload and raise that paw, wave it, put it "
+            "back, shift back.  ENTER from HOLD starts them.  Torque phases, "
+            "sim.wave.ThreeLegStance on hw.kinematics, whatever --law lifted "
+            "the robot.  `python -m sim.wave --check` first.")
+        wave.add_argument("--wave", choices=C.LEGS, default=None,
+                          metavar="LEG",
+                          help="which paw leaves the floor (FL FR RL RR)")
+    else:
+        ap.set_defaults(wave=None)
+
     sensing = ap.add_argument_group("sensing and recording")
     sensing.add_argument("--imu-port", default=IMU.DEFAULT_PORT,
                          help="DETA10 serial port")
@@ -1603,7 +1647,12 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           gait=gait, step_to=step_to, step_gait=step_gait,
                           trot_swings=(1 if gait is not None and args.half_gait
                                        else 0),
-                          position_trips=args.limits)
+                          position_trips=args.limits, wave=args.wave,
+                          # The wave shifts over, and splits the load about,
+                          # the same CoM the SRB pin was moved to.
+                          wave_com_xy=(WV.COM_XY_LIFT
+                                       + 1e-3 * np.asarray(args.com_offset,
+                                                           dtype=float)))
     log = StandLog() if args.log else None
     key = KeyPoller()
     if not key.ok and not args.fake:
@@ -1807,6 +1856,33 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
               "anywhere in it that names")
         print("       the trunk's orientation.  If THIS misbehaves too, the "
               "fault is below the model.")
+    if args.wave:
+        print("  WAVE: after the hold, the %s paw.  Trunk shifts (%+.0f, %+.0f) "
+              "mm, the CoM %.0f mm inside the"
+              % (args.wave, *(1e3 * WV.support_shift(
+                  args.wave,
+                  SK.all_foot_positions(WV._POSE_LIFT)[:, :2]
+                  + 1e-3 * np.asarray(args.com_offset, dtype=float),
+                  stand.wave.com_xy)),
+                 1e3 * WV.SUPPORT_MARGIN))
+        print("       other three feet; the paw is unloaded, raised to %.0f mm "
+              "off the floor, waves +-%.0f mm"
+              % (1e3 * (WV.raised_point(args.wave)[2] + ST.LIFT_HEIGHT
+                        - P.FOOT_RADIUS), 1e3 * WV.WAVE_AMPLITUDE))
+        print("       at %.1f Hz x %d, comes back, is reloaded, and the trunk "
+              "shifts back.  z spring %.0f -> %.0f N/m"
+              % (WV.WAVE_HZ, WV.WAVE_CYCLES, ST.KP_CART[2], WV.KP_THREE[2]))
+        print("       on three feet (sim.wave says why).  TORQUE phases on "
+              "sim.wave's law, whatever --law lifted.")
+        if any(args.com_offset):
+            print("       CoM taken at the CAD's %+.1f/%+.1f mm (--com-offset): "
+                  "the shift and the load split use it"
+                  % tuple(args.com_offset))
+        print("       Trips: %s.  No tilt trip (deleted 2026-10-05)."
+              % ("paw %.0f mm off its reference, joint %.0f deg off the IK"
+                 % (1e3 * WV.SWING_TRACK_STOP, args.track_stop)
+                 if args.track_stop > 0.0 else
+                 "NONE -- --track-stop 0 / --no-limits turns both off"))
     print("  %.0f Hz per motor, %.1f ms sweep; stop line %.0f ms of the "
           "drivers' %.0f ms input-lost window"
           % (args.rate, 1e3 / args.rate, 1e3 * GAP_ESTOP_S,
@@ -1847,6 +1923,14 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         print("  the lift.  That is the trip working, not the law failing -- "
               "the per-leg law runs")
         print("  the whole sequence there only because it has no such trip.")
+    if args.fake and args.wave:
+        print("  NOTE: on hw.fake_bus the lift never arrives, so `shift` is "
+              "REFUSED and under --auto")
+        print("  the run stops there.  That is the guard working; "
+              "`python -m sim.wave --headless`")
+        print("  is where the sequence runs to the end, and `python -m "
+              "hw.selftest` drives these")
+        print("  phases through this file against a robot that follows.")
 
     from .motor import motorbus
     if args.fake:
@@ -1976,7 +2060,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         print("[stand] done; motors stopped in the crouch.  Peak lift torque "
               "%.2f N*m." % stand.tau_peak)
         return 0
-    print("[stand] E-STOP in phase %s: %s" % (stand.phase_name, stop))
+    print("[stand] %s in phase %s: %s"
+          % ("STOPPED" if stop.startswith("refused") else "E-STOP",
+             stand.phase_name, stop))
     print("[stand] motors stopped.")
     return 0 if stop == "operator X" else 1
 
