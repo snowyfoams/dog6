@@ -394,28 +394,37 @@ class StandController:
             self._enter_next(data, q)
 
         elapsed = float(data.time) - self.t_phase
-        name = self.phase_name
-
-        if name == "settle":
-            self.h_cmd = height_from_fk(self.q_ref0)   # whatever it started at
-            tau = self._position(self.q_ref0, q, qd)
-        elif name in ("crouch", "park"):
-            alpha = smoothstep(elapsed / RAMP_POSITION)
-            self.h_cmd = CROUCH_HEIGHT
-            tau = self._position(self.q_ref0 + alpha * (self.q_crouch - self.q_ref0),
-                                 q, qd)
-        elif name == "lift":
-            alpha = smoothstep(elapsed / RAMP_LIFT)
-            self.h_cmd = CROUCH_HEIGHT + alpha * (LIFT_HEIGHT - CROUCH_HEIGHT)
-            tau = self._compliance(q, qd, self.h_cmd)
-        else:                                            # done
-            self.h_cmd = CROUCH_HEIGHT
-            tau = self._position(self.q_crouch, q, qd)
+        tau = self._law(self.phase_name, elapsed, q, qd)
 
         # params.JOINT_LIMITS is a policy the MJCF does not enforce; the torque
         # cap is the one limit this loop is responsible for.
         self.tau = np.clip(tau, -P.TAU_MAX_SIM, P.TAU_MAX_SIM)
         data.ctrl[:] = self.tau.reshape(-1)
+
+    def _law(self, name: str, elapsed: float, q, qd) -> np.ndarray:
+        """(4, 3) torque for phase `name`, `elapsed` seconds into it.
+
+        THE ONE PLACE A PHASE NAME MEETS A LAW.  Split out of `__call__` so a
+        sequence that adds phases (`sim.wave`) extends this and inherits the
+        reset, the advance flag and the clamp unchanged, rather than copying
+        the callback and letting the two drift.
+        """
+        if name == "settle":
+            self.h_cmd = height_from_fk(self.q_ref0)   # whatever it started at
+            return self._position(self.q_ref0, q, qd)
+        if name in ("crouch", "park"):
+            alpha = smoothstep(elapsed / RAMP_POSITION)
+            self.h_cmd = CROUCH_HEIGHT
+            return self._position(self.q_ref0 + alpha * (self.q_crouch - self.q_ref0),
+                                  q, qd)
+        if name == "lift":
+            alpha = smoothstep(elapsed / RAMP_LIFT)
+            self.h_cmd = CROUCH_HEIGHT + alpha * (LIFT_HEIGHT - CROUCH_HEIGHT)
+            return self._compliance(q, qd, self.h_cmd)
+        if name == "done":
+            self.h_cmd = CROUCH_HEIGHT
+            return self._position(self.q_crouch, q, qd)
+        raise ValueError("no law for phase %r" % name)
 
     # -- reporting ---------------------------------------------------------
     def status(self, data) -> str:
@@ -438,26 +447,42 @@ def _load():
     return model, data
 
 
-def run_headless(seconds_per_phase: float = 4.0, quiet: bool = False):
+def run_headless(seconds_per_phase: float = 4.0, quiet: bool = False,
+                 controller=None, on_step=None):
     """Auto-step the whole sequence with no window.  Returns the controller.
 
     This is the form the self-test and any regression check should use: it is
     deterministic, it needs no display, and it exercises exactly the callback
     the viewer runs.
+
+    `controller` is a `StandController` (or a subclass -- `sim.wave` passes
+    its own); `seconds_per_phase` may be a float or a ``{phase: seconds}``
+    dict for sequences whose phases are not all the same length.  `on_step`,
+    if given, is called as ``on_step(ctrl, model, data)`` after every step.
     """
     import mujoco
 
     model, data = _load()
-    ctrl = StandController()
+    ctrl = StandController() if controller is None else controller
     ctrl.reset(data)
-    steps = int(round(seconds_per_phase / model.opt.timestep))
+
+    def steps_for(name: str) -> int:
+        seconds = (seconds_per_phase.get(name, 4.0)
+                   if isinstance(seconds_per_phase, dict) else seconds_per_phase)
+        return max(1, int(round(seconds / model.opt.timestep)))
 
     rows = []
-    for _ in range(len(StandController.PHASES)):
+    upcoming = ctrl.phase_name
+    for _ in range(len(ctrl.PHASES)):
+        # `request_advance` is consumed at the NEXT step, so `phase_name` is
+        # still the previous phase here; the dwell is the one coming.
+        steps = steps_for(upcoming)
         for k in range(steps):
             ctrl(model, data)                    # called directly: no callback
             mujoco.mj_step(model, data)
-            if not quiet and k % (steps // 2) == 0:
+            if on_step is not None:
+                on_step(ctrl, model, data)
+            if not quiet and k % max(1, steps // 2) == 0:
                 print("   " + ctrl.status(data))
         rows.append((ctrl.phase_name, ctrl.h_cmd, ctrl.h_fk, float(data.qpos[2])))
         if ctrl.finished:
@@ -465,6 +490,7 @@ def run_headless(seconds_per_phase: float = 4.0, quiet: bool = False):
         if not quiet:
             print("-- ENTER --")
         ctrl.request_advance()
+        upcoming = ctrl.PHASES[ctrl.phase + 1]
     return ctrl, data, rows
 
 
@@ -474,7 +500,7 @@ def run_headless(seconds_per_phase: float = 4.0, quiet: bool = False):
 KEY_ENTER = (257, 335)                  # Return, keypad Return
 
 
-def run():
+def run(controller=None):
     """Open the viewer and step the sequence with ENTER.
 
     ENTER is wired up TWO ways, because neither alone survives every way this
@@ -495,7 +521,7 @@ def run():
     import mujoco.viewer
 
     model, data = _load()
-    ctrl = StandController()
+    ctrl = StandController() if controller is None else controller
     ctrl.reset(data)
     mujoco.set_mjcb_control(ctrl)
 
@@ -506,8 +532,8 @@ def run():
         ctrl.request_advance()
         time.sleep(0.05)                 # let the control callback consume it
         print("\n>> phase %d %s : %s"
-              % (ctrl.phase, ctrl.phase_name,
-                 StandController.BLURB[ctrl.phase_name]), flush=True)
+              % (ctrl.phase, ctrl.phase_name, ctrl.BLURB[ctrl.phase_name]),
+              flush=True)
 
     def on_key(keycode):
         if keycode in KEY_ENTER:
@@ -527,7 +553,7 @@ def run():
 
     print("DOG6 stand -- ENTER steps the phase, IN THE WINDOW or on this terminal.")
     print("Close the window to quit.")
-    print("   phase 0 settle : " + StandController.BLURB["settle"], flush=True)
+    print("   phase 0 settle : " + ctrl.BLURB["settle"], flush=True)
 
     for target in (on_stdin, report):
         threading.Thread(target=target, daemon=True).start()

@@ -1,10 +1,12 @@
 # `hw` — the protocol is here, the wiring is not
 
 ```
-python -m hw.selftest              gate the plumbing, no robot needed  (53 checks)
+python -m hw.selftest              gate the plumbing, no robot needed  (69 checks)
 python -m hw.balance.selftest      gate the balance controller         (78 checks)
 python -m hw.bringup plan          where the bring-up has got to
 python -m hw.bringup scan --fake   run the whole CAN path against software drivers
+python -m hw.stand                 stand up, six phases, ENTER steps them
+python -m hw.stand --wave FL       ...and stand on three legs, waving that paw
 ```
 
 DOG5's **protocol** has been ported across — same gearmotors, same drivers,
@@ -90,8 +92,8 @@ collapsed the two and the check lived in an operator's memory.
 | `safety.py` | **refuses** | ramp, cap, limit block, slew, e-stop trips |
 | `fake_bus.py` | needs explicit ids | twelve drivers in software, same protocol |
 | `bringup.py` | — | scan / spin / check / setzero / imu / plan |
-| `stand.py` | **refuses** | `sim.stand`'s limp → settle → crouch → lift → park on the robot. Driver 0xA4 for position, `SafetyGate` for the lift, every motor re-sent inside the 50 ms input-lost window. `--fake` runs it against `fake_bus` |
-| `selftest.py` | — | 53 checks, no robot |
+| `stand.py` | **refuses** | `sim.stand`'s limp → settle → crouch → lift → park on the robot. Driver 0xA4 for position, `SafetyGate` for the lift, every motor re-sent inside the 50 ms input-lost window. `--fake` runs it against `fake_bus`. `--wave LEG` splices `sim.wave`'s shift → raise → wave → lower → unshift after the lift: torque phases on `hw.kinematics`, refused unless the lift arrived, three trips of their own |
+| `selftest.py` | — | 69 checks, no robot |
 
 ## The staging ladder, with DOG6's own numbers
 

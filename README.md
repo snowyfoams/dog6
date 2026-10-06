@@ -17,9 +17,11 @@ D:\mujoco\.venv\Scripts\python.exe -m sim.selftest        # 62 gates, the model
 D:\mujoco\.venv\Scripts\python.exe -m sim.cmpc.selftest   # 83 gates, the controller
 D:\mujoco\.venv\Scripts\python.exe -m sim.cmpc.run        # drive it: Xbox pad, or WASD + QE
 D:\mujoco\.venv\Scripts\python.exe -m sim.cmpc.teleop     # the reference alone, animated
+D:\mujoco\.venv\Scripts\python.exe -m sim.stand           # stand up from the belly, ENTER steps it
+D:\mujoco\.venv\Scripts\python.exe -m sim.wave --headless # stand on three legs and WAVE; 22 gates
 ```
 
-145 gates, all passing. Run them after touching anything here.
+167 gates, all passing. Run them after touching anything here.
 
 The robot trots at **0.4 m/s** and turns at **90 °/s** in simulation, on
 ground-truth state and a timetable gait. Above 0.4 m/s the 8 N·m torque clamp
@@ -59,6 +61,8 @@ sim/
   params.py        masses, inertias, lengths, limits, motors. no logic
   kinematics.py    FK, Jacobians, IK, leg statics, composite inertia
   selftest.py      all three, gated against model/dog6.xml
+  stand.py         belly -> crouch -> lift -> park, the sequence hw.stand runs
+  wave.py          the same, with a three-leg stance in the middle: one paw waves
   model/           dog6.xml, 20 meshes, robot_export.json — GENERATED
 ```
 
@@ -124,6 +128,13 @@ written against one reads the other correctly.
 - [x] `sim` — model, frames, parameters, kinematics, leg dynamics. 62 gates.
 - [x] `sim.cmpc` — convex MPC: linearised body model, condensed QP, timetable
       gait, swing law. 83 gates. Trots, strafes and turns, from an Xbox pad.
+- [x] `sim.stand` / `sim.wave` — the stand sequence, and a three-leg stance
+      spliced into it: the trunk shifts over the feet, one paw is unloaded,
+      raised and waved, put back, reloaded. 22 gates, every leg, in MuJoCo;
+      `hw.stand --wave FL` runs the same law on the robot. The one thing it
+      found: horizontal foot forces cannot stop a tip about an edge that
+      lies on the floor, so on three feet the vertical spring is what holds
+      the trunk up, and the stand's 500 N/m is exactly marginal there.
 - [ ] state estimation — the controller is handed ground truth. Everything it
       achieves is an upper bound on what it does behind a real filter.
 - [ ] `hw` — waiting on the assembly. See `hw/README.md`.

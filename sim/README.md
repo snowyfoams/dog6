@@ -11,6 +11,8 @@ sim/
   kinematics.py    FK, Jacobians, IK, leg statics, composite inertia
   leg_dynamics.py  one leg's M, C qd + G and Lambda, by RNEA
   selftest.py      the description, gated against model/dog6.xml
+  stand.py         belly -> crouch -> lift -> park: position mode, compliance, position mode
+  wave.py          stand.py with a THREE-LEG STANCE spliced in; one paw waves
   cmpc/            convex MPC -- see sim/cmpc/README.md
   model/
     dog6.xml           GENERATED — see "the model is an artifact" below
@@ -26,6 +28,8 @@ D:\mujoco\.venv\Scripts\python.exe -m sim.cmpc.selftest   # 83 gates
 D:\mujoco\.venv\Scripts\python.exe -m sim.cmpc.run        # drive it
 D:\mujoco\.venv\Scripts\python.exe -m sim.params          # the numbers
 D:\mujoco\.venv\Scripts\python.exe -m sim.kinematics      # the stance
+D:\mujoco\.venv\Scripts\python.exe -m sim.stand           # stand up; ENTER steps the phases
+D:\mujoco\.venv\Scripts\python.exe -m sim.wave            # ...and wave a paw.  --headless gates it
 ```
 
 The first four files are the robot as a **description** — they say what is
@@ -103,6 +107,43 @@ and `hip_to_pitch` rounds down by the same amount. Their sum, which is the point
 the chain actually propagates, is bit-identical. `selftest` gates the sum
 separately at 1e-15 to make that explicit; it is why FK agrees to 4e-16 and not
 to 2.9e-9.
+
+## Three legs, one paw waving
+
+`sim.wave` takes `sim.stand`'s sequence and inserts five torque phases after
+the lift: **shift** the trunk over the feet, **raise** a paw (unload it first,
+then lift it), **wave** it side to side, **lower** it (and reload it), and
+**unshift**. One formula for all four legs — `sim.stand`'s Cartesian
+compliance — with only the targets, the analytic target rates and the per-foot
+vertical feedforward changing. The feedforward is **solved**, not assumed: the
+three statics equations about the CoM, closed by weighted minimum norm with a
+contact weight per foot that fades the paw's share out continuously before it
+leaves the floor and back in after it lands.
+
+```
+python -m sim.wave --check          14 offline gates: geometry, reachability, continuity
+python -m sim.wave --headless       + 8 physical gates in MuJoCo (--leg FR RL RR too)
+python -m hw.stand --wave FL        the same law on the robot, hw.kinematics
+```
+
+| gate, in MuJoCo, every leg | measured |
+|---|---|
+| paw clearance through the wave | 99 mm |
+| lateral travel against ±40 mm commanded | 83 mm peak to peak |
+| trunk roll / pitch on three feet | < 2.4° / < 0.5° |
+| trunk height | within 1.3 mm |
+| stance foot slide | 4.2 mm |
+| peak torque | 1.47 N·m, under the 3.0 N·m staging cap |
+
+**What the first run taught.** It tipped over the FR–RL diagonal. A tip is a
+rotation about an edge of the support polygon, and that edge lies *on the
+floor* — so every horizontal foot force, however stiff the xy springs, has zero
+moment about it. The tipping stiffness about an edge is `k_z d_far² − W h`,
+and with the paw up the far foot is 125 mm from the diagonal and the CoM 135 mm
+off the floor: at the stand's 500 N/m the two terms are 7.8 N·m/rad each.
+Exactly marginal. On three feet the z spring is blended up to 2000 N/m over the
+shift (31 against 7.8, about 2 Hz) and back down over the unshift.
+`sim/wave.py` carries the derivation beside the number.
 
 ## Two numbers that are placeholders
 

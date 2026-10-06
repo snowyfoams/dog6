@@ -421,6 +421,10 @@ def main() -> int:
     close("...at the stance the kinematics still agrees with sim's Q_STAND",
           np.abs(stance), np.abs(stance[0]), 1e-12, " m")
 
+    # -- 8. hw.stand's wave phases, against a robot that follows -----------
+    print("\nhw.stand --wave: sim.wave's five phases through the phase machine")
+    _wave_phases()
+
     # ----------------------------------------------------------------------
     print("\n%d checks, %d failed" % (_PASSES + len(_FAILURES), len(_FAILURES)))
     print("The stand's balance controller is gated separately, and this file "
@@ -440,6 +444,132 @@ def _refuses(fn) -> bool:
     except Exception:                # noqa: BLE001
         return True
     return False
+
+
+def _wave_phases() -> None:
+    """Drive `hw.stand.HardwareStand` with `--wave FL` through shift, raise,
+    wave, lower and unshift on a SYNTHETIC robot that sits exactly on the IK
+    of every target -- the same fixture `hw.balance.selftest` uses for the
+    lift.  No bus: `update` is pure, which is why it can be done at all.
+
+    What this proves: the phase list is spliced right, the latches happen at
+    the right entries, a perfectly tracking robot trips nothing, every
+    torque is inside the gate's cap, and each of the three trips fires on
+    the state that should fire it.  What it cannot: that the robot stays up.
+    `python -m sim.wave --headless` is that.
+    """
+    from sim import stand as ST
+    from sim import wave as WV
+    from . import stand as HST
+    from .balance import state as BSTATE
+    from .balance import config as BCFG
+
+    level = IMU.TrunkOrientation.level()
+
+    def body_at(q, R=None):
+        if R is None:
+            orientation = level
+        else:
+            roll, pitch, yaw = C.zyx_from_rot(R)
+            orientation = IMU.TrunkOrientation(R=R, omega_b=np.zeros(3),
+                                               roll=roll, pitch=pitch, yaw=yaw,
+                                               age_s=0.0)
+        return BSTATE.read(C.flat(q), np.zeros(C.N_JOINTS), orientation)
+
+    with _synthetic_map():
+        gate = SAFE.SafetyGate(2.0, unconfirmed_reason="hw.selftest")
+        stand = HST.HardwareStand(gate, law="per-leg", wave="FL")
+        check("--wave splices the five phases between lift and park",
+              stand.phases == ("limp", "settle", "crouch", "lift") + WV.WAVE_PHASES
+              + ("park", "done"), " ".join(stand.phases))
+        check("...and without it the list is the plain six",
+              HST.phases_for(None) == HST.PHASES)
+
+        # walk to the lift, as a run does: settle, crouch, lift
+        q_lift = WV._POSE_LIFT
+        now = 0.0
+        stand.t_phase = now
+        for expect in ("settle", "crouch", "lift"):
+            now += 10.0                              # every ramp has arrived
+            stand.advance(now, C.flat(ST.Q_CROUCH if expect != "lift" else q_lift))
+            stand.update(now, body_at(C.unflat(ST.Q_CROUCH)))
+        check("the walk reaches lift", stand.phase_name == "lift")
+
+        # the guard: a shift from the crouch is refused, and finally
+        refused = stand.advance(now + 10.0, C.flat(ST.Q_CROUCH))
+        check("shift is REFUSED while the trunk is still on the floor",
+              bool(refused) and stand.refusal_final and stand.phase_name == "lift",
+              refused or "")
+        # ...and allowed from the standing pose, latching from it
+        now += 10.0
+        refused = stand.advance(now, C.flat(q_lift))
+        check("...and entered from the standing pose", refused is None
+              and stand.phase_name == "shift")
+        check("shift latches the feet from the MEASURED pose",
+              np.allclose(stand.wave.z0, K.all_foot_positions(q_lift)[:, 2])
+              and np.linalg.norm(stand.wave.shift) > 0.03,
+              "z0 %.4f m, shift %s mm" % (stand.wave.z0.mean(),
+                                          np.array2string(1e3 * stand.wave.shift,
+                                                          precision=1)))
+
+        # a robot that sits on the IK of every target, phase by phase
+        trips, modes, peak = [], set(), 0.0
+        q = q_lift.copy()
+        dt = 0.004
+        for phase in WV.WAVE_PHASES:
+            if stand.phase_name != phase:
+                refused = stand.advance(now, C.flat(q))
+                trips.append(refused)
+            t0 = now
+            while now - t0 <= stand.wave.duration(phase) + 0.1:
+                p_des, _, _ = stand.wave.targets(phase, now - t0)
+                q = K.all_leg_ik(p_des, q_seed=q)
+                mode, values, trip = stand.update(now, body_at(q))
+                modes.add(mode)
+                trips.append(trip)
+                peak = max(peak, float(np.abs(values).max()))
+                now += dt
+        check("a perfectly tracking robot trips nowhere through all five",
+              all(t is None for t in trips),
+              next((t for t in trips if t), "") or "shift raise wave lower unshift")
+        check("...every wave phase is a TORQUE phase", modes == {"torque"})
+        check("...and every torque is inside the gate's cap",
+              peak <= gate.tau_cap + 1e-9, "peak %.2f N*m" % peak)
+        check("the paw's own floor spot was latched at raise",
+              np.allclose(stand.wave.p_floor[2], stand.wave.z0[0], atol=1e-6))
+        check("the status line carries the three-foot height, not the paw",
+              abs(stand.wave.h_stance - ST.LIFT_HEIGHT) < 2e-3
+              and "h3" in stand.wave.status(),
+              "h3 %.4f m" % stand.wave.h_stance)
+
+        # the three trips, each on the state that should fire it
+        refused = stand.advance(now, C.flat(q))
+        check("after unshift the next phase is park", refused is None
+              and stand.phase_name == "park")
+        gate2 = SAFE.SafetyGate(2.0, unconfirmed_reason="hw.selftest")
+        s2 = HST.HardwareStand(gate2, law="per-leg", wave="FL")
+        s2.phases = ("wave",) + s2.phases[1:]
+        s2.t_phase = 0.0
+        gate2.start(0.0, q=C.flat(q_lift))
+        s2.wave.enter("shift", q_lift)
+        s2.wave.enter("raise", q_lift)
+        p_des, _, _ = s2.wave.targets("wave", 1.0)
+        q_wave = K.all_leg_ik(p_des, q_seed=q_lift)
+        _, _, trip = s2.update(1.0, body_at(q_wave))
+        check("on the IK of the wave targets: no trip", trip is None, trip or "")
+        tilted = body_at(q_wave, R=C.rot_x(np.deg2rad(BCFG.TILT_STOP_DEG + 3)))
+        _, _, trip = s2.update(1.0, tilted)
+        check("the tilt trip fires on three feet", "tilt" in (trip or ""), trip or "")
+        far = p_des.copy()
+        far[0] += (0.0, 0.0, -0.08)                  # the paw 80 mm low
+        _, _, trip = s2.update(1.0, body_at(K.all_leg_ik(far, q_seed=q_wave)))
+        check("the paw trip fires when the paw is far from its reference",
+              "paw" in (trip or ""), trip or "")
+        off = q_wave.copy()
+        off[1, 0] += np.deg2rad(30.0)               # FR abduction 30 deg off
+        _, _, trip = s2.update(1.0, body_at(off))
+        check("the joint trip fires on a stance leg off the IK",
+              "from the IK" in (trip or ""), trip or "")
 
 
 if __name__ == "__main__":
