@@ -92,7 +92,7 @@ TWO HALVES, BOTH IMPORTED, NEITHER COPIED
                    the roll gains (`fold_stand.ROLL_GAINS`, 290 / 23).
     THE TROT       `hw.trot`'s, the one `hw.trot_esti` flies:
                    `trot.trot_options` -- DOG5's gait (duty 0.80, contact ramp
-                   0.15, the 0.2 s four-foot settle every 2 cycles), the 9
+                   0.15, no four-foot settle since 2026-10-20), the 9
                    N*m cap and its ceiling, the 120 N*m/s slew, no overspeed
                    trip -- and the swing at `hw.stand`'s default: the
                    CARTESIAN impedance, `--kd-swing`, `--kp-swing`,

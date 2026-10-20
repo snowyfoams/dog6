@@ -4,9 +4,12 @@
     $V -m hw.fold2_walk --fake --auto 1 --no-imu     the whole path, no robot
     $V -m hw.fold2_walk --log fold2_walk.npz         on the robot
     $V -m hw.fold2_walk --ff-armature 0.005          M0 with a fitted rotor
-    $V -m hw.fold2_walk --swing-law impedance --kp-swing-walk-rl 150 150 600
+    $V -m hw.fold2_walk --kp-swing-walk-rl 150 150 600
                                                      ONE LEG'S impedance, as in
                                                      `hw.fold_walk`
+    $V -m hw.fold2_walk --swing-law osc --settle 0.2 the task-space swing and
+                                                     DOG5's re-level, the
+                                                     defaults before 2026-10-20
 
     limp -> settle -> crouch -> rise -> hold --T--> trot (walk) --T--> hold -> park
 
@@ -15,8 +18,10 @@ straight rise, the 160 mm hold, the 20 mm apex, the estimator closing x/y,
 the joint layer -- walked exactly as `hw.fold_walk` walks `hw.fold_trot`:
 the same hook, keys and box (`fold_walk.walking`), the QP, one reference for
 the x/y rows, the heading, the joint layer's world-anchored stance targets
-and the footholds, the task-space swing at `config.WN_SWING_OSC`, and the
-walk's clock -- 0.6 s at duty 0.70, no settle.  `hw.fold_walk`'s docstring
+and the footholds, the Cartesian impedance swing (the default since
+2026-10-20, on the robot; `--swing-law osc` is the task-space swing at
+`config.WN_SWING_OSC`), and the walk's clock -- 0.6 s at duty 0.70, no
+settle (DOG6 needs none, the operator's test of 2026-10-20).  `hw.fold_walk`'s docstring
 says why each of those, and doc/walk/README.md has the runs.
 
 WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
@@ -37,14 +42,27 @@ WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
     forward); 0.20 m/s forward is the edge, 4 of 6 to the tilt stop.  Joint
     friction with a late IMU, a mu 0.5 floor, DOG6's lighter rotor with
     DOG5's M0 or a fitted one: none tipped.  The keys' box is the fold's,
-    since 2026-10-05 60 % of the simulated one: 0.06 / 0.03 m/s and 12 deg/s,
-    0.03 m/s or 6 deg/s a press (config.WALK_*); `--v-max 0.15 0.10
-    --yaw-rate-max 40` is still inside what MuJoCo walked.
+    0.12 / 0.06 m/s and 12 deg/s, 0.06 m/s or 6 deg/s a press (config.WALK_*;
+    x/y doubled 2026-10-20 on request from 0.06 / 0.03 and 0.03 a press);
+    `--v-max 0.15 0.10 --yaw-rate-max 40` is still inside what MuJoCo walked.
 
-THE ARMATURE IS THE SWING'S GAIN, here as in `hw.fold_walk`: fit it with
-`hw.swing_bench --analyse` and pass `--ff-armature` before walking.
+THE ARMATURE IS THE osc SWING'S GAIN, here as in `hw.fold_walk`: under
+`--swing-law osc`, fit it with `hw.swing_bench --analyse` and pass
+`--ff-armature` before walking.
 
-[SIM-TUNED, NOT FLOWN].
+THE BEST FLIGHT, 2026-10-07 (the operator's report: it ran a very long time
+with no fall -- the end state of DOG6):
+
+    $V -m hw.fold2_walk --kp-joint 4 --kp-joint-abd 5 --swing-law impedance \\
+        --duty 0.8 --contact-ramp 0.2 --settle 0.2 --swing-roll --tau-slew 300
+
+    The defaults are NOT this command: the walk's stance Kp is 0
+    (config.WALK_KP_JOINT), duty 0.70, slew 120.  Its swing law and its
+    settle are, since 2026-10-20: the impedance is the default, and the
+    operator's test that day dropped the settle (`--settle 0.2` is it).  `--swing-roll` (default on
+    since this day) does nothing in a walk -- the walk's swing replaces the
+    arc it levels.  Still open: walking with no joint hold, the kf problem,
+    the swing trajectory and its Kp/Kd.
 
 KEYS
     W / S  forward / back      A / D  left / right      Q / E  turn left / right

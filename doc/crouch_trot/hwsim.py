@@ -109,6 +109,8 @@ class Entry:
     gait_kw: dict = dataclasses.field(default_factory=dict)
     law_kw: dict = dataclasses.field(default_factory=dict)
     limits: object = None            # SafetyGate(limits=...), None = soft_limits()
+    #: the HOLD's CoM measured and applied at T (`hw.stand --com-auto`)
+    com_auto: bool = False
 
     def replace(self, **kw) -> "Entry":
         return dataclasses.replace(self, **kw)
@@ -136,7 +138,8 @@ class Entry:
                                           **self.gait_kw)
         stand = SEQ.StandSequence(gate, law="srb", balance=balance,
                                   crouch=self.crouch, gait=gait,
-                                  step_to=self.step_to, step_gait=step_gait)
+                                  step_to=self.step_to, step_gait=step_gait,
+                                  com_auto=self.com_auto)
         return stand, gate
 
 
@@ -253,7 +256,12 @@ class HwParams:
     frictionloss: float = 0.0          # joint Coulomb, N*m
     joint_damping: float | None = None
     post_stop_s: float = 1.5           # keep simulating after an e-stop
-    trunk_mass_add: float = 0.0
+    #: kg added to the trunk (at its origin).  THE DEFAULT IS THE WEIGHED
+    #: ROBOT: the model is the CAD's 5.883 kg and DOG6 weighed 5.210 on
+    #: 2026-10-06, which is the law's `config.MASS` -- so by default the plant
+    #: weighs what the law carries.  0.0 is the CAD's robot (every table in
+    #: doc/ before 2026-10-06 was run on it, with the law at the CAD's too).
+    trunk_mass_add: float = BCFG.MASS - P.MASS
     com_err_mm: tuple = (0.0, 0.0)
     #: EXPERIMENT, not the repo's behaviour: at the crouch->rise handover
     #: seed SafetyGate with the torque the drivers REPORT (the 0xA4 hold)
@@ -292,7 +300,9 @@ class HwSim:
             m.body_ipos[self.trunk] *= m0 / (m0 + self.hw.trunk_mass_add)
             m.body_mass[self.trunk] = m0 + self.hw.trunk_mass_add
         if any(self.hw.com_err_mm):
-            frac = m.body_mass[self.trunk] / m.body_subtreemass[self.trunk]
+            # the BODIES summed: body_subtreemass is a compile-time constant
+            # and does not see `trunk_mass_add` above.
+            frac = m.body_mass[self.trunk] / float(m.body_mass.sum())
             m.body_ipos[self.trunk, 0] += 1e-3 * self.hw.com_err_mm[0] / frac
             m.body_ipos[self.trunk, 1] += 1e-3 * self.hw.com_err_mm[1] / frac
         self.model = m
@@ -468,6 +478,11 @@ class HwSim:
                                              live=(mode == "torque"))
                     if reason:
                         stop, t_stop = reason, now
+                    # `hw.stand.run`'s COM_SLOT: the HOLD's CoM sample, on
+                    # this sweep's measurement and the drivers' readback.
+                    elif (getattr(stand, "com", None) is not None
+                          and stand.phase_name == "hold"):
+                        stand.feed_torque(now, body, tau_meas)
                 if stop is not None:
                     mode, values = "keepalive", None
                     if not quiet:
@@ -512,6 +527,11 @@ class HwSim:
                 x_b=body.x_b.copy(),
                 com_w=d.subtree_com[self.trunk].copy(),
                 qpos=d.qpos.copy(),
+                com_pin=np.array(stand.balance.srb.com_body[:2]),
+                com_meas=(stand.com.last.copy()
+                          if getattr(stand, "com", None) is not None
+                          and stand.phase_name == "hold"
+                          else np.full(2, np.nan)),
             )
             log.append(row)
             if record_frames is not None:

@@ -942,19 +942,186 @@ harness measuring on the law's own pin:
 
 ### 11.6 What to do on the robot, in order
 
-1. **Measure the CoM.**  `hw.fold_trot --log hold.npz`, ENTER to HOLD,
-   hold a few seconds, park; `python -m hw.com_check hold.npz`.  It reads
-   each foot's force off the measured torque through the leg's Jacobian,
-   balances the moments, and prints `--com-offset DX DY` (and the measured
-   vertical force over the weight, which is the drivers' torque constant
-   to within the friction).  In `hwsim` a 3 / 5 mm plant error reads back
-   as 2.5 / 4.5, a −4 / 8 as −3.9 / 7.0.
-2. **Fly it**: `hw.fold_trot --com-offset DX DY`, then the walk with the
-   same flag.  The banner prints the shifted pin and sites.
-3. **Until then**, the configurations that survive an uncorrected CoM in
-   place: `hw.fold_walk --swing-law impedance --duty 0.8 --contact-ramp
-   0.15 --settle 0.2` (the one that stood every 30 s run), and
-   `hw.fold_trot --kp-swing 150 150 400 --kd-swing 6 6 40`.
-4. **Fit the armature** (`hw.swing_bench --analyse`, `--ff-armature`) for
+*Rewritten 2026-10-06: the CoM is now measured by the run itself (11.7).*
+
+1. **Fly the trot and let the HOLD measure the CoM.**  `hw.fold_trot --log
+   <a new name>.npz`: hold still in HOLD for at least 1.5 s, then T.  The
+   notice at T says what the HOLD read (x/y, its p10..p90, Fz/W against the
+   pin) and that the stance is re-centring; the trot starts by itself 0.5 s
+   later.  `--com-auto` is the default on every trot that tracks its rise;
+   `--no-com-auto` is the run as it was.
+2. **Read every HOLD off the log**: `python -m hw.com_check <log>.npz` --
+   one row per HOLD, the pin the law flew there, and each T's re-centring.
+   If successive HOLDs read millimetres apart, joint stiction is the first
+   suspect (11.7), not the CoM moving.
+3. **The walk the same way, with the joint spring in its HOLD.**  Since
+   2026-10-06 the working tree defaults the walks' stance to damping-only
+   (`config.WALK_KP_JOINT` 0); on that HOLD `--com-auto` is off and
+   refused, and in MuJoCo that stance falls on the robot-like plant
+   uncorrected (11.7).  `hw.fold_walk --kp-joint 5 --kp-joint-abd 5
+   --swing-law impedance --duty 0.8 --contact-ramp 0.15 --settle 0.2` is
+   the walk as simulated, with the CoM measured and applied.
+4. **If T says NOT APPLIED** (torque readback not believed, the robot not
+   still, past 15 mm), the configurations that survive an uncorrected CoM
+   in place: the walk's line above, and `hw.fold_trot --kp-swing 150 150
+   400 --kd-swing 6 6 40`.
+5. **Fit the armature** (`hw.swing_bench --analyse`, `--ff-armature`) for
    the osc walk: with the rotor at 0.6x and M0 unfitted it is 3.9° in
    place against 2.7° fitted -- real, and a tenth of the CoM's effect.
+
+### 11.7 The CoM measured in every HOLD and applied at T (`--com-auto`)
+
+*2026-10-06, on request: "each hold will bring the new com shift, so why
+not directly read the com shift when hold and use it when I press T".*
+
+**What it does.**  Every HOLD sweep, `hw.balance.com_estimate` reads the
+CoM off the drivers' measured torque -- `hw.com_check`'s statics, one
+batched solve, 44 us on the Pi, in a CAN slot of its own (`hw.stand.COM_SLOT`)
+-- skipping the first 0.5 s.  T takes the HOLD's median (at least 1.0 s of
+it; T pressed sooner waits), moves the SRB pin and every stance site by
+measured - pinned, and slides the trunk over the four planted feet onto it
+for 0.5 s with the tracked layer (the slanted rise's mechanism); then the
+trot starts.  Not applied, with the reason in the notice, when Fz/W is
+outside 0.5..1.5, the HOLD's p10..p90 spans more than 15 mm, or the
+correction is past 15 mm.  The log carries `com_meas` and `com_pin`;
+phase `recentre` is the slide.  `python doc/walk/longrun.py auto` reruns it.
+
+**MuJoCo, the robot-like plant (11.1, the CoM 3 / 5 mm off), 30 s in
+place, nothing told to the law.**  The HOLD read +2.5 / +4.6 mm against the
+plant's true +2.7 / +5.0 (spread 1.2 mm, Fz/W 1.19 -- the plant's 0.9
+torque per amp); `A_` is the run with it applied at T, `L_` uncorrected,
+`K_` re-centred by hand on the true offset:
+
+| config | `L_` uncorrected | `A_` measured and applied at T | `K_` by hand |
+|---|---|---|---|
+| `hw.fold_trot` | 9.7°, rms 2.24 / 3.71 / 5.90 | **2.4°, rms 0.76 / 0.83 / 1.00** | 1.9°, 0.54 / 0.67 / 0.74 |
+| `hw.fold_walk` (osc) | 7.7°, drift 0.7 m | **4.1°**, drift 0.28 m | 3.8°, 0.25 m |
+| walk, impedance 150 on the trot's clock | 4.3° | **2.0°** | 1.4° |
+| walk, the trot's 10/10/400 on the trot's clock | fell, 5.7 s | **2.6°** | 2.4° |
+| `hw.fold_trot`, the IDEAL plant | -- | 2.2°, read 0.2 mm, nothing applied | (ideal 2.2°) |
+
+The keys' box (0.06 / 0.03 m/s, 12 °/s): every `A_` case stands -- osc
+4.5-5.7°, within 1.2° of `K_`; impedance 2.0-3.6° back, left and turning
+and 7.7° forward (`K_` 8.3°, both at the 9 N·m clip), and 11.7° forward
+with the turn against `K_`'s 8.5°.  Uncorrected (11.5) the osc fell in all
+five and the impedance in three.
+
+**The joint spring is what makes the reading true.**  The walks' new
+damping-only stance (`config.WALK_KP_JOINT` 0, uncommitted on 2026-10-06)
+holds its HOLD with no spring, the joints freeze where the rise left them,
+and stiction carries part of the load the drivers do not report: that HOLD
+read +1.2 mm in y where the truth was +5.0, and the walk fell at 6.8 s.
+`StandSequence` now refuses `com_auto` without the HOLD's spring.  The same
+damping-only stance with nothing auto about it, impedance 150 on the trot's
+clock:
+
+| plant | with the joint spring | damping-only |
+|---|---|---|
+| ideal | 2.2°, rms 0.66 | 2.8°, rms 1.03 / 1.04 / 1.06 |
+| ideal, osc | 2.8°, rms 1.13 | 6.1°, rms 1.92 / 1.91 / 2.05, drift 0.29 m |
+| robot-like, uncorrected | 4.3° | **fell, 5.3 s** |
+| robot-like, re-centred by hand | 1.4° | 7.5°, rms 3.11 / 4.19 / 4.69 -- growing |
+
+On the robot, a HOLD-to-HOLD difference of a few millimetres may be the
+same stiction rather than the CoM moving: the robot's own logs read the
+nominal stance at +2.7 / -0.8 mm (`trot_kd.npz`, first HOLD, 1.1 s) and
+the fold's at -6.7 / +2.3 (`fold_walk_bisect.npz`, 0.3 s) -- the fold's x
+the OPPOSITE sign to the 3 mm this section simulated, which is the point of
+measuring it every run.
+
+### 11.8 The robot weighs 5.210 kg
+
+*2026-10-06: the operator weighed DOG6 at 5.210 kg, 0.673 kg (11 %) under
+the CAD's 5.883.*  `hw.balance.config.MASS` is now the weighed mass -- the
+SRB law's m g and the force per m/s² of its PD, the allocator's box, the
+residual trip, `com_estimate`'s Fz/W -- and the per-leg baseline and the
+wave are handed it on the robot.  Where the 0.673 kg is missing from was not
+measured: c^b and I^b keep the CAD's shape, and `--com-auto` measures c^b's
+x/y in every HOLD.  **`hwsim`'s plant now weighs the same by default**
+(`HwParams.trunk_mass_add` = `MASS - P.MASS`, taken off the trunk);
+`trunk_mass_add=0.0` is the CAD's robot every table above was run on.
+
+On the weighed plant, 30 s in place, the law's m makes little difference --
+the joint layer holds the stance stiffly enough that a 6.6 N force error
+moves the trunk under a millimetre:
+
+| | law m 5.210 (now) | law m 5.883 (flown until now) |
+|---|---|---|
+| `hw.fold_trot` | 2.0°, rms 0.65 / 0.63 / 0.60, height −0.5 mm | 2.0°, 0.68 / 0.68 / 0.73, +0.1 mm |
+| … drivers delivering 0.886 of the torque | 1.7°, 0.51 / 0.50 / 0.49, −0.8 mm | 1.9°, 0.58 / 0.56 / 0.56, −0.2 mm |
+| … robot-like plant, `--com-auto` | 2.3°, 0.68 / 0.69 / 0.77, −1.0 mm | 2.3°, 0.70 / 0.73 / 0.80, −0.4 mm |
+| walk, impedance on the trot's clock, robot-like, `--com-auto` | 2.0°, 0.63 / 0.60 / 0.60, −0.9 mm | 2.1°, 0.59 / 0.52 / 0.52, −0.3 mm |
+
+(height: median of the legs' height minus the command over the trot.)  The
+same stiffness means a robot log's height says nothing about the drivers'
+torque constant.
+
+### 11.9 The second `hw.fold2_walk` flight, and the governor
+
+*2026-10-06, `fold2_walk_2.npz`: the joint spring and `--com-auto` on, the
+walk's impedance on the trot's clock.  17 minutes of trot: 413 s in place,
+then 630 s with 104 s of W/S/A/D/Q/E in it.  It fell walking left.  Times
+below are the log's own clock (`t`), not sweeps / 250: the loop runs 5.5 ms
+a sweep in every trot (tracker item).*
+
+**What the run did.**  HOLD 11.7 s; the CoM read −0.6 / −1.6 mm, applied as
+−0.3 / −1.4: FOLD2's CoM is on its pin.  In place the tilt peaked 3.5–7.7°
+per 15 s window and the trunk sat ~1° rolled with the right feet carrying
+26–28 N against the left's 20–23.  Walking at 0.015–0.03 m/s and 6 °/s the
+tilt peaked 7–12°; the operator pressed SPACE at 200, 329 and 539 s (tilt
+12.2, 9.0, 8.1°) and each time the trot in place had it back under 3° within
+1–2 s.
+
+**The fall (629 s), at 20 ms.**  A at 0.03 m/s for 4 s.  The FR/RL swing
+lags its arc 24–27 mm to the *right* (the trunk is going left) and lands
+late; the landing rolls the trunk right, +0.9 → +7.6° in 80 ms, and the
+left feet drop to 1 N.  The next FL/RR landing adds to it (9°), the one
+after (14°); by 629.8 s the robot stands on its right feet alone, rolling
+over them, and the fall hold takes it at 43°.  The operator's SPACE came at
+629.3 s; the tilt was back to 3° at 629.6 and the next landing threw it.
+Once the trunk is rolled, the trunk-frame arcs land the low-side foot early
+and the high-side foot late, which rolls it further: a loop that closes
+through the landings.  The swing's tracking error is not a trigger for
+this: walking, the swing lands 15 mm (median) and 27 mm (90th percentile)
+off its arc on this robot, and the fall's 25 mm is inside that.
+
+**The governor (`hw/balance/governor.py`), on request: "the script decides
+which time to stop the command to trot in place for stable".**  Every
+sweep the walk plan takes the roll and pitch *from the setpoint*, low-passes
+them at 1.5 Hz (the trot's own ±3–7° rocking at 1.7 Hz passes at a third,
+a lean passes whole) and calls the larger the **lean**.  Past 5° it
+**pauses** the keys: the reference gets zero (it slews to rest in ~60 ms and
+the next swing is the in-place arc), the keys are kept.  Under 3° for 1.0 s
+it resumes them.  A second pause within 5 s of a resume says the command
+itself tips the robot: the keys are **cleared** as SPACE would and the
+operator is told to press again.  `--pause-lean DEG` (0 off), `--calm-lean`,
+`--calm-s`; the status line shows the lean; the exit report counts the
+pauses.  Everything a tilt *rate* would add was tried on the log and refused
+(the rocking's ±60 °/s fires it hundreds of times).
+
+Replayed on the log through the real class: five pauses, at 82.4, 185.1,
+199.9, 539.9 and 629.1 s — the operator's own moments, 0.2 s before the
+operator at the fall — 9.2 s paused of 630, none in the 526 s of in-place
+trot.  Whether 0.2 s is enough to save that fall the robot decides.
+
+In MuJoCo (FOLD2, the robot-like plant, `--com-auto`, walking left at
+0.03 m/s, a 0.25 s sideways push 4 s in):
+
+| push | walking, governor on | walking, governor off | in place |
+|---|---|---|---|
+| none | 2.2°, no pause | 2.2° | 1.4° |
+| 4 N | 2.4°, no pause | 2.4° | 1.4° |
+| 8 N | 2.5°, no pause | 2.5° | 3.7° |
+| 12 N | 4.8°, no pause | 4.8° | 11.0°, one pause, 1.6 s |
+
+The governor is silent through a walk that stays under 5° of lean, which
+is what it should be: the model does not reproduce the robot's lagging
+swing, so the model does not reproduce the fall.  (The same plant with the
+CoM *not* re-centred fell walking left under a 4 N push, governor or no
+governor, where in place it survived 10 N: the lateral walk at the box
+speed has no margin without the re-centring.)
+
+**Next on the robot:** the same command line, the governor on by default;
+watch for `walk PAUSED`.  If pauses come and the robot still falls, the
+stage after this one is a HOLD at the next four-foot window instead of a
+trot in place — four feet down have the roll authority two do not.

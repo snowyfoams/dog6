@@ -85,6 +85,7 @@ from sim import params as P          # noqa: E402
 
 from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
+from . import governor as GOV        # noqa: E402
 from . import swing as SWING         # noqa: E402
 from .footstep import FootstepPlanner, TrunkXY, rot2   # noqa: E402
 from .trajectory import Command, WalkReference          # noqa: E402
@@ -104,8 +105,17 @@ class WalkPlan:
                  swing_law: str = cfg.WALK_SWING_LAW, wn_swing=None,
                  zeta_swing: float | None = None,
                  place_at_rest: bool = cfg.WALK_PLACE_AT_REST,
-                 v_filter_hz: float = cfg.WALK_V_FILTER_HZ):
+                 v_filter_hz: float = cfg.WALK_V_FILTER_HZ,
+                 governor="default"):
         self.reference = reference if reference is not None else WalkReference()
+        #: THE GOVERNOR (governor.py): the operator's SPACE, pressed by the
+        #: law when the trunk leans.  "default" builds one on config's
+        #: numbers; None is a walk with none (`--pause-lean 0`).  It sits
+        #: between `set_command` and the reference in `step`, and its
+        #: one-shot `notice` is handed up through `take_notice`.
+        self.governor = (GOV.WalkGovernor() if governor == "default"
+                         else governor)
+        self.notice: str | None = None
         #: False (the default): a swing that lifts with the reference at rest
         #: lands on its site, trunk frame, no velocity term (footstep.py).
         self.place_at_rest = bool(place_at_rest)
@@ -220,8 +230,22 @@ class WalkPlan:
         # The placement's low-pass starts AT REST: the trot starts from HOLD.
         self.v_lp = np.zeros(2)
         self.v_lp_t = float("nan")
+        if self.governor is not None:
+            self.governor.reset()          # a fresh trot: nothing paused
         self.engaged = True
         self.engaged_at = float(now)
+
+    def take_notice(self) -> str | None:
+        """The governor's one-shot text, if any; `sequence` drains it."""
+        if self.governor is None:
+            return None
+        return self.governor.take_notice()
+
+    def disengage(self) -> None:
+        """Forget the stance this walk engaged on; the next trot sweep engages
+        afresh, on whatever stance HOLD then holds.  `law.begin_recentre`
+        calls it: a re-centred stance has new sites and new anchors."""
+        self.engaged = False
 
     def _low_pass(self, est) -> None:
         """Step the planner's low-passed x/y velocity by the estimate `est`
@@ -252,6 +276,17 @@ class WalkPlan:
             self.engage(now, law, state, gait, est)
         self._low_pass(est)
         target = self.command if clock is not None else _ZERO
+        if self.governor is not None:
+            # THE GOVERNOR READS THE LEAN FROM THE SETPOINT the law holds --
+            # roll and pitch, as `law.tilt_from_setpoint_deg` does -- and
+            # hands back the command, or zero while it is pausing the walk.
+            # `walking` False (the trot's exit latched, `set_command(None)`)
+            # keeps the filter running and decides nothing.
+            dr, dp, _ = law.att_offset
+            target = self.governor.update(
+                now, float(state.roll) - law.sp_roll - dr,
+                float(state.pitch) - law.sp_pitch - dp, target,
+                walking=self.command is not _ZERO and clock is not None)
         p_hat = None
         if est is not None:
             c = state.R @ np.asarray(law.srb.com_body, dtype=float)
@@ -335,4 +370,6 @@ class WalkPlan:
                    " (--place-at-rest)" if self.place_at_rest else "")
                 + ("; placement velocity low-passed at %.1f Hz"
                    % self.v_filter_hz if self.v_filter_hz > 0.0 else
-                   "; placement velocity raw"))
+                   "; placement velocity raw")
+                + ("" if self.governor is None else
+                   "\n" + self.governor.report()))

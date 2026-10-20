@@ -4,10 +4,12 @@
     $V -m hw.fold_walk --fake --auto 1 --no-imu      the whole path, no robot
     $V -m hw.fold_walk --log fold_walk.npz           on the robot
     $V -m hw.fold_walk --alloc wls                   the least squares instead
-    $V -m hw.fold_walk --swing-law impedance --kd-swing-walk-rl 6 6 60
-                                                     ONE LEG'S impedance (RL's
+    $V -m hw.fold_walk --kd-swing-walk-rl 6 6 60    ONE LEG'S impedance (RL's
                                                      Kd), the other three on
                                                      --kd-swing-walk
+    $V -m hw.fold_walk --swing-law osc --settle 0.2  the task-space swing and
+                                                     DOG5's re-level, the
+                                                     defaults before 2026-10-20
 
     limp -> settle -> crouch -> rise -> hold --T--> trot (walk) --T--> hold -> park
 
@@ -18,13 +20,20 @@ estimator closing x/y, the joint layer -- with five things on top
     keys.py            W/S x, A/D y, Q/E yaw, SPACE stop -- `sim.cmpc.run`'s
     trajectory.py      `sim.cmpc.trajectory`'s generator, slewed and leashed
     footstep.py        eq (33) + feedback, the arc in the world
-    swing_control.py   the swing leg: task-space computed torque (`--swing-law
-                       osc`, the default) or the Cartesian impedance
+    swing_control.py   the swing leg: the Cartesian impedance (the default
+                       since 2026-10-20) or task-space computed torque
+                       (`--swing-law osc`)
     qp.py              the QP allocator -- every entry point's default since
                        2026-10-04 (--alloc wls is the least squares)
 
 and walk.py tying them to ONE reference: the x/y rows, the heading, the joint
 layer's targets and the footholds are all computed from the same sample.
+
+THE JOINT LAYER IS A DAMPER ON THE PLANTED LEGS, 2026-10-06, on request: Kp 0
+on every joint (config.WALK_KP_JOINT), Kd 0.2 against the anchor's rate -- no
+position term, as sim.cmpc's stance leg.  The tracked rise keeps its Kp 5
+(`--kp-rise`).  `--kp-joint 5 --kp-joint-abd 5` is the walk as flown before.
+`hw.fold2_walk` inherits all of it.
 
 THE CLOCK IS THE WALK'S, NOT THE TROT'S: 0.6 s at duty 0.70, so 180 ms of
 swing where `hw.fold_trot` has 120.  At 120 ms no swing law walked in MuJoCo:
@@ -32,16 +41,22 @@ the foot is 5.8 kg in z through the reflected rotor and the 20 mm arc then
 asks the knee for more torque rate than the gate's 120 N*m/s (config.py,
 WALK_DUTY; doc/walk/README.md).  `--duty 0.8` puts the trot's clock back.
 
-THE ARMATURE IS THE SWING'S GAIN.  The task-space law multiplies by M0, and
-M0's rotor is DOG5's -- the bench read DOG6's as ~1/1.7 of it.  Fit it with
-`hw.swing_bench --analyse` and pass `--ff-armature`; or fly `--swing-law
-impedance`, which does not read M0 unless `--swing-ff`.
+THE SWING LAW IS THE IMPEDANCE, 2026-10-20: the operator's test on the robot
+that day says the walk's swing must be the Cartesian impedance
+(config.WALK_SWING_LAW; --kp/--kd-swing-walk), and that DOG6 needs no settle
+(config.SETTLE_S, every trot).  `--swing-law osc --settle 0.2` is the walk's
+swing and the trot's clock as they were.
+
+THE ARMATURE IS THE osc SWING'S GAIN.  The task-space law multiplies by M0,
+and M0's rotor is DOG5's -- the bench read DOG6's as ~1/1.7 of it.  Under
+`--swing-law osc`, fit it with `hw.swing_bench --analyse` and pass
+`--ff-armature`; the impedance does not read M0 unless `--swing-ff`.
 
 ONE LEG'S OWN IMPEDANCE, 2026-10-05, on request: `--kp-swing-walk-fl` ..
 `--kd-swing-walk-rr` replace `--kp-swing-walk` / `--kd-swing-walk` on that
 leg alone -- `hw.trot`'s per-leg swing gains ("ONE LEG'S SWING GAINS"), on
-the walk's impedance.  `--swing-law osc` refuses them: its knobs are
-`--wn-swing` / `--zeta-swing`.  `hw.fold2_walk` has them through this hook.
+the walk's impedance (the default law since 2026-10-20).  `--swing-law osc`
+refuses them: its knobs are `--wn-swing` / `--zeta-swing`.  `hw.fold2_walk` has them through this hook.
 MuJoCo, on the next flight's flags (`--swing-law impedance --duty 0.8
 --contact-ramp 0.15 --settle 0.2`), RL's motors making 60 % of the torque:
 in place RL's trunk-frame apex 7.1 -> 3.1 mm, and RL's own Kp_z 700 / Kd_z
@@ -58,11 +73,12 @@ two -- the footholds come back to the stance's own sites -- then T, then
 ENTER: the park is a joint ramp to the crouch and drags any foot that is off
 its site.
 
-THE KEYS' BOX IS 60 % OF WHAT MUJOCO WALKED, since 2026-10-05 on request:
-0.06 m/s in x, 0.03 in y, 12 deg/s, and a press is 0.03 m/s or 6 deg/s
-(config.WALK_*; --v-max, --yaw-rate-max, --v-step, --yaw-step).  MuJoCo
-walked the 0.10 / 0.05 m/s and 20 deg/s box at 0.05 m/s and 10 deg/s a
-press.
+THE KEYS' BOX: 0.12 m/s in x, 0.06 in y, 12 deg/s, and a press is 0.06 m/s
+or 6 deg/s (config.WALK_*; --v-max, --yaw-rate-max, --v-step, --yaw-step).
+The x/y half is doubled since 2026-10-20 on request, from the 0.06 / 0.03
+m/s and 0.03 a press that were 60 % of what MuJoCo walked (2026-10-05, on
+request); yaw stays at that 60 %.  MuJoCo walked the 0.10 / 0.05 m/s and
+20 deg/s box at 0.05 m/s and 10 deg/s a press.
 
 AT ZERO COMMAND THE SWING IS hw.fold_trot's, 2026-10-05 (on request).  On the
 robot, standing, the filter's v_hat is rms 0.05-0.08 m/s with spikes to 0.4,
@@ -104,6 +120,7 @@ from .balance import config as BCFG  # noqa: E402
 from .balance import gait as GAIT    # noqa: E402
 from .balance import swing as BSWING  # noqa: E402
 from .balance import swing_control as SC   # noqa: E402
+from .balance.governor import WalkGovernor   # noqa: E402
 from .balance.keys import WalkKeys   # noqa: E402
 from .balance.trajectory import WalkReference   # noqa: E402
 from .balance.walk import WalkPlan   # noqa: E402
@@ -186,6 +203,23 @@ class WalkHook:
                             "filter's x/y velocity as the foot placement "
                             "reads it; 0 reads it raw.  The x/y rows read it "
                             "raw either way")
+        g.add_argument("--pause-lean", type=float,
+                       default=BCFG.WALK_PAUSE_LEAN_DEG, metavar="DEG",
+                       help="THE GOVERNOR (balance/governor.py): the law "
+                            "presses SPACE for you.  Roll/pitch from the "
+                            "setpoint, low-passed %.1f Hz, past this many "
+                            "degrees PAUSES the keys (the trot in place); "
+                            "they resume after --calm-s under --calm-lean; a "
+                            "re-pause within %.0f s of a resume CLEARS them.  "
+                            "0 turns it off.  2026-10-06, sized on the "
+                            "robot's log; not flown"
+                            % (BCFG.WALK_LEAN_HZ, BCFG.WALK_REPAUSE_S))
+        g.add_argument("--calm-lean", type=float,
+                       default=BCFG.WALK_CALM_LEAN_DEG, metavar="DEG",
+                       help="the governor resumes the keys once the lean "
+                            "has stayed under this")
+        g.add_argument("--calm-s", type=float, default=BCFG.WALK_CALM_S,
+                       metavar="S", help="...for this long")
 
     def configure(self, args) -> None:
         self.keys = WalkKeys(v_step=args.v_step,
@@ -207,6 +241,12 @@ class WalkHook:
                 "--kp/--kd-swing-walk-%s are the impedance's gains (--swing-law "
                 "impedance); the '%s' swing is tuned by --wn-swing / "
                 "--zeta-swing" % (self.own_swing[0].lower(), args.swing_law))
+        if args.pause_lean > 0.0 and not args.calm_lean < args.pause_lean:
+            raise ValueError("--calm-lean %.1f must be below --pause-lean %.1f"
+                             % (args.calm_lean, args.pause_lean))
+        governor = (None if args.pause_lean <= 0.0 else
+                    WalkGovernor(pause_deg=args.pause_lean,
+                                 calm_deg=args.calm_lean, calm_s=args.calm_s))
         self.plan = WalkPlan(reference=reference, kv=args.step_kv,
                              kp_swing=self.kp_rows,
                              kd_swing=self.kd_rows, swing_ff=ff,
@@ -217,7 +257,8 @@ class WalkHook:
                              wn_swing=args.wn_swing,
                              zeta_swing=args.zeta_swing,
                              place_at_rest=args.place_at_rest,
-                             v_filter_hz=args.v_filter_hz)
+                             v_filter_hz=args.v_filter_hz,
+                             governor=governor)
 
     def law_kwargs(self, args) -> dict:
         return dict(walk=self.plan)
@@ -258,7 +299,11 @@ class WalkHook:
                    "the x/y rows read it raw"
                    % (args.v_filter_hz, 1e3 / (2.0 * np.pi * args.v_filter_hz))
                    if args.v_filter_hz > 0.0 else
-                   "the filter's x/y, raw (--v-filter-hz 0)")]
+                   "the filter's x/y, raw (--v-filter-hz 0)"),
+                "     GOVERNOR: %s"
+                % ("OFF (--pause-lean 0): the keys reach the reference "
+                   "whatever the trunk does" if self.plan.governor is None
+                   else self.plan.governor.describe())]
 
     def owns(self, ch) -> bool:
         return self.keys.owns(ch)
@@ -278,6 +323,10 @@ class WalkHook:
         # to rest across the swing or two before the four-foot window.
         walking = stand.trotting and not getattr(stand, "trot_exit", False)
         if self.plan is not None:
+            gov = self.plan.governor
+            if gov is not None and gov.take_clear():
+                # The governor found the command itself at fault: SPACE.
+                self.keys.stop()
             self.plan.set_command(self.keys.command if walking else None)
 
     def status(self, now: float, stand) -> str:
@@ -296,6 +345,8 @@ class WalkHook:
                                              self.plan.v_lp[1])
         if ref.leashed:
             line += "  LEASHED"
+        if self.plan is not None and self.plan.governor is not None:
+            line += " | " + self.plan.governor.status()
         return line
 
 
@@ -305,7 +356,12 @@ def walking(trot_options: dict) -> dict:
     `config.WALK_DUTY`, the contact ramp fitted to its four-foot window, no
     settle (`--period`, `--duty`, `--contact-ramp`, `--settle` still
     override).  `hw.fold_walk` is this over `hw.fold_trot`, `hw.fold2_walk`
-    over `hw.fold2_trot`."""
+    over `hw.fold2_trot`.
+
+    THE PLANTED LEGS ARE DAMPED, NOT SPRUNG (config.WALK_KP_JOINT, 2026-10-06):
+    the joint layer's Kp is 0 on every joint, the tracked rise keeps its own
+    (`--kp-rise`, KP_JOINT_HOLD).  `--kp-joint 5 --kp-joint-abd 5` puts the
+    stance spring back."""
     opts = dict(trot_options)
     clock = opts["gait"]
     opts["gait"] = GAIT.TrotGait(period=clock.period, duty=BCFG.WALK_DUTY,
@@ -313,7 +369,9 @@ def walking(trot_options: dict) -> dict:
                                  ramp=BCFG.WALK_CONTACT_RAMP,
                                  settle_s=BCFG.WALK_SETTLE_S,
                                  settle_every=clock.settle_every)
-    return dict(opts, hook=WalkHook(), alloc="qp")
+    return dict(opts, hook=WalkHook(), alloc="qp",
+                kp_joint=BCFG.WALK_KP_JOINT, kp_joint_abd=BCFG.WALK_KP_JOINT,
+                kp_rise=BCFG.KP_JOINT_HOLD)
 
 
 def walk_options() -> dict:

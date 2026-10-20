@@ -6,6 +6,7 @@ does it.  doc/walk/README.md section 11 quotes the tables.
     python doc/walk/longrun.py box       the keys' box (0.06 / 0.03 m/s, 12 deg/s), robot-like
     python doc/walk/longrun.py single    ONE unknown at a time, 30 s in place
     python doc/walk/longrun.py corr      the robot-like plant with the CoM pin corrected
+    python doc/walk/longrun.py auto      the CoM MEASURED in HOLD and applied at T (--com-auto)
     python doc/walk/longrun.py all       inplace + box
     python doc/walk/longrun.py L_trot_hwlike C_walk_osc_fwd06 ...   named runs
 
@@ -164,6 +165,45 @@ for case, ckw in BOXCASES.items():
             **CONFIGS[cname], **HWLIKE)
 W.SCENARIOS.update(CENT)
 
+#: THE CoM MEASURED IN THE HOLD AND APPLIED AT T (`hw.stand --com-auto`,
+#: 2026-10-06): the robot-like plant, its CoM 3 / 5 mm off, NOTHING told to
+#: the law -- the HOLD reads the CoM off the drivers' torque and T slides the
+#: stance onto it.  Against L_ (uncorrected) and K_ (re-centred by hand on the
+#: true offset).  `_ideal` is the control: the CAD's CoM, nothing to correct.
+#: (Run once, 2026-10-06, before it was refused: the walk's DAMPING-ONLY
+#: stance -- config.WALK_KP_JOINT 0 -- read the CoM 3-4 mm off in its HOLD,
+#: stiction carrying what the drivers' torque did not, and fell at 6.8 s.
+#: `StandSequence` now refuses com_auto without the HOLD's joint spring.)
+AUTO = {}
+for cname in ("trot", "walk_osc", "walk_imp150_d80", "walk_imp10_d80"):
+    AUTO["A_%s_inplace" % cname] = dict(
+        schedule=INPLACE, trot_s=T_INPLACE,
+        opts=dict(CONFIGS[cname], com_auto=True, **HWLIKE))
+AUTO["A_trot_ideal"] = dict(schedule=INPLACE, trot_s=T_INPLACE,
+                            opts=dict(CONFIGS["trot"], com_auto=True))
+for case, ckw in BOXCASES.items():
+    for cname in ("walk_osc", "walk_imp150_d80"):
+        AUTO["A_%s_%s" % (cname, case)] = _box(
+            **ckw, com_auto=True, **CONFIGS[cname], **HWLIKE)
+W.SCENARIOS.update(AUTO)
+
+#: THE WALK'S DAMPING-ONLY STANCE (config.WALK_KP_JOINT 0, 2026-10-06) on its
+#: own, to tell what it does from what --com-auto does to it: uncorrected
+#: (L_), re-centred by hand on the true offset (K_), and the ideal plant (I_).
+DAMP_KW = dict(kp_joint=0.0, kp_joint_abd=0.0, kp_rise=BCFG.KP_JOINT_HOLD)
+DAMP = {
+    "L_walk_imp150_d80_damp": dict(schedule=INPLACE, trot_s=T_INPLACE, opts=dict(
+        CONFIGS["walk_imp150_d80"], law_over=DAMP_KW, **HWLIKE)),
+    "K_walk_imp150_d80_damp": dict(schedule=INPLACE, trot_s=T_INPLACE, opts=dict(
+        CONFIGS["walk_imp150_d80"], law_over=DAMP_KW, com_offset_mm=(3.0, 5.0),
+        stance_shift=True, **HWLIKE)),
+    "I_walk_imp150_d80_damp": dict(schedule=INPLACE, trot_s=T_INPLACE, opts=dict(
+        CONFIGS["walk_imp150_d80"], law_over=DAMP_KW)),
+    "I_walk_osc_damp": dict(schedule=INPLACE, trot_s=T_INPLACE, opts=dict(
+        CONFIGS["walk_osc"], law_over=DAMP_KW)),
+}
+W.SCENARIOS.update(DAMP)
+
 W.SCENARIOS.update(LONG)
 W.SCENARIOS.update(BOX)
 
@@ -177,15 +217,25 @@ def run(name: str) -> dict:
                 armature_scale=opts.pop("armature_scale", 1.0),
                 com_err_mm=tuple(opts.pop("com_err_mm", (0.0, 0.0))),
                 kt_scale=opts.pop("kt_scale", 1.0))
+    if "trunk_mass_add" in opts:
+        hwkw["trunk_mass_add"] = opts.pop("trunk_mass_add")
+    law_mass = opts.pop("law_mass", None)
     t0 = time.time()
     trot_kp = opts.pop("trot_kp", None)
     trot_kd = opts.pop("trot_kd", None)
     saved = (BCFG.KP_SWING, BCFG.KD_SWING)
+    saved_mass = (BCFG.MASS, BCFG.WEIGHT)
+    if law_mass is not None:
+        # THE LAW'S m, for an A/B against the weighed robot (2026-10-06):
+        # read by `controller.balance_wrench` and the allocator every sweep.
+        BCFG.MASS, BCFG.WEIGHT = float(law_mass), float(law_mass) * P.GRAVITY
     if trot_kp is not None:
         BCFG.KP_SWING = np.array(trot_kp, dtype=float)
         BCFG.KD_SWING = np.array(trot_kd, dtype=float)
     com_offset = opts.pop("com_offset_mm", None)
     stance_shift = opts.pop("stance_shift", False)
+    com_auto = opts.pop("com_auto", False)
+    law_over = opts.pop("law_over", None)
     try:
         e, plan = W.entry(**opts)
     finally:
@@ -202,24 +252,33 @@ def run(name: str) -> dict:
             xy = np.array(e.law_kw["stand_xy"], dtype=float)
             xy[:, :2] += 1e-3 * np.asarray(com_offset, dtype=float)
             e.law_kw["stand_xy"] = xy
+    if law_over:
+        e.law_kw.update(law_over)
+    if com_auto:
+        e = e.replace(com_auto=True)
     sim = H.HwSim(e, H.HwParams(**hwkw))
     sim.place(e.crouch.q, e.crouch.z_origin)
     pushes = [(-1.0, -1.0, (0.0, 0.0, 0.0))]
     drv = W.Driver(sim, sc["schedule"], push=None, pushes=pushes)
     op = H.Operator(hold_s=W.T_HOLD, trot_s=sc["trot_s"], park=False,
                     hold_after_s=1.5)
-    res = sim.run(op, t_max=3.0 + 1.0 + 3.0 + W.T_HOLD + sc["trot_s"] + 3.0,
-                  push=pushes, quiet=True, pre_update=drv)
+    try:
+        res = sim.run(op, t_max=3.0 + 1.0 + 3.0 + W.T_HOLD + sc["trot_s"] + 3.0,
+                      push=pushes, quiet=True, pre_update=drv)
+    finally:
+        BCFG.MASS, BCFG.WEIGHT = saved_mass
     out = W.metrics(name, res, drv, sim)
     out["t_tilt15"] = H.trot_metrics(res).get("t_tilt15_after_T")
     out.update(_time_course(res))
+    out.update(_com_course(res, sim))
     out["wall_s"] = round(time.time() - t0, 1)
     os.makedirs(OUT, exist_ok=True)
     with open(os.path.join(OUT, "%s.json" % name), "w") as fh:
         json.dump(out, fh, indent=1)
     keep = ("t", "phase", "roll", "pitch", "yaw", "xy_trunk", "z_trunk", "foot_w",
             "foot_fn", "tau_act", "tau_req", "swing_s", "x_b", "contact_w", "fz",
-            "b_d", "com_w", "q", "q_des")
+            "b_d", "com_w", "q", "q_des", "com_pin", "com_meas", "tau_meas",
+            "h_meas", "h_cmd")
     np.savez_compressed(os.path.join(OUT, "%s.npz" % name),
                         **{k: res[k] for k in keep if k in res})
     return out
@@ -245,6 +304,25 @@ def _time_course(res) -> dict:
                 drift_xy_mm=[round(1e3 * float(v), 0) for v in (xy[i1] - xy[i0])],
                 drift_yaw_deg=round(float(yaw[i1] - yaw[i0]), 1),
                 t_trot_end=round(float(tt[-1]), 1))
+
+
+def _com_course(res, sim) -> dict:
+    """What --com-auto read and did: the pin before and after each T's
+    slide (mm, trunk frame), the TRUE trunk-frame CoM offset the plant has
+    (`HwParams.com_err_mm`), and the sequence's own account."""
+    if "com_pin" not in res or sim.stand.com is None:
+        return {}
+    rows = []
+    for r in sim.stand.com_log:
+        rows.append(dict(t=round(r["t"], 2), read_mm=[round(1e3 * v, 2) for v in r["c"]],
+                         pin_mm=[round(1e3 * v, 2) for v in r["pin"]],
+                         d_mm=[round(1e3 * v, 2) for v in r["d"]],
+                         spread_mm=round(1e3 * float(np.hypot(*(r["p90"] - r["p10"]))), 2),
+                         kt=round(r["kt"], 3), applied=bool(r["applied"]),
+                         why=r["why"]))
+    return dict(com_auto=rows,
+                com_shift_mm=[round(1e3 * v, 2) for v in sim.stand.balance.com_shift],
+                com_true_mm=list(sim.hw.com_err_mm))
 
 
 def table(results) -> str:
@@ -280,6 +358,8 @@ def main(argv) -> int:
         names += list(CENT)
     if "corr" in argv:
         names += list(CORR)
+    if "auto" in argv:
+        names += list(AUTO)
     if "extra" in argv:
         names += ["L_trot150_ideal", "L_trot150_hwlike"]
     names += [a for a in argv if a in W.SCENARIOS]

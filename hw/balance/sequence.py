@@ -10,6 +10,20 @@
     StandSequence.feed_estimate(est)  the state estimator's answer, when the
                                       runner has one (a trot's `--est-xy`:
                                       the hold's and the trot's x/y)
+    StandSequence.feed_torque(now, body, tau_meas)
+                                      the drivers' measured torque, for the
+                                      CoM every HOLD measures (`com_auto`)
+
+THE CoM IS MEASURED IN EVERY HOLD AND APPLIED AT T, 2026-10-06
+    With `com_auto` (`hw.stand`'s default on every trot that tracks its rise),
+    each HOLD reads the CoM off the drivers' measured torques
+    (`com_estimate.py`, `hw.com_check`'s statics), and T does not start the
+    clock at once: it takes the HOLD's median, moves the SRB pin and the
+    stance sites by (measured - pinned), and SLIDES the trunk over the four
+    planted feet onto it for `config.COM_SLIDE_S` -- `phase_name` reads
+    "recentre" -- before the trot starts.  T pressed before the HOLD has
+    `config.COM_MIN_S` of samples waits for them.  Each HOLD measures afresh
+    ("each hold will bring the new com shift"); each T applies its own HOLD's.
 
 THE TROT IS A SUB-STATE OF HOLD, NOT AN EIGHTH PHASE
     DOG5's TROT stage, ported: T from HOLD starts it, T during it LATCHES an
@@ -164,6 +178,7 @@ from .. import hardware_map as HM    # noqa: E402
 from .. import kinematics as HK      # noqa: E402
 from .. import safety as SAFE        # noqa: E402
 from ..motor import MAX_SPEED_POS    # noqa: E402
+from . import com_estimate as COM    # noqa: E402
 from . import config as BCFG         # noqa: E402
 from . import law as BLAW            # noqa: E402
 from . import posture as POSE        # noqa: E402
@@ -201,6 +216,8 @@ BLURB = {
               "window; ENTER is refused until then",
     "step":   "STEPPING THE FEET -- one gait cycle, each diagonal lands on the "
               "new site; HOLD (or PARK) follows at four feet down",
+    "recentre": "RE-CENTRING ON THE HOLD'S CoM -- four feet down, the trunk "
+                "slides onto it; the trot starts by itself",
     "fall":   "THE FALL HOLD -- past the tilt limit: no balance, no swing, every "
               "joint held at the stand in joint space.  ENTER parks; X drops "
               "it limp",
@@ -249,7 +266,7 @@ def phase_blurb(sequence: "StandSequence") -> str:
     The lift's blurb depends on `--law`, and the phase banner is the only
     place that difference is ever stated, so it is stated there.
     """
-    if sequence.phase_name in ("rise", "hold", "trot", "step"):
+    if sequence.phase_name in ("rise", "hold", "trot", "step", "recentre"):
         return "%s -- %s" % (BLURB[sequence.phase_name],
                              LIFT_BLURB[sequence.law])
     return BLURB[sequence.phase_name]
@@ -415,7 +432,7 @@ class StandSequence:
                  crouch: POSE.CrouchPose = POSE.NOMINAL, gait=None,
                  step_to=None, step_gait=None, trot_swings: int = 0,
                  position_trips: bool = True, wave: str | None = None,
-                 wave_com_xy=None):
+                 wave_com_xy=None, com_auto: bool = False):
         if law not in LAWS:
             raise ValueError("law must be one of %s, got %r" % (LAWS, law))
         # THE WAVE IS ONLY VALIDATED FROM THE NOMINAL STAND.  `sim.wave`'s
@@ -525,11 +542,45 @@ class StandSequence:
         #: `wave_com_xy` is the CoM it shifts over and splits the load about,
         #: trunk frame -- `sim.wave.COM_XY_LIFT` plus `--com-offset`.
         self.wave = (None if wave is None else
-                     WV.ThreeLegStance(wave, kin=HK, com_xy=wave_com_xy))
+                     WV.ThreeLegStance(wave, kin=HK, com_xy=wave_com_xy,
+                                       weight=BCFG.WEIGHT))
         self.phases = phases_for(wave)
         #: True when the last refusal from `advance` will not clear by
         #: waiting -- `--auto` stops on it instead of asking forever.
         self.refusal_final = False
+        #: THE CoM, MEASURED IN EVERY HOLD AND APPLIED AT T (module
+        #: docstring), or None when off.  It needs a trot to apply it at and
+        #: the TRACKED joint layer to carry the trunk over the feet.
+        if com_auto and gait is None:
+            raise ValueError("com_auto applies the HOLD's CoM at T; this "
+                             "sequence has no gait")
+        if com_auto and law != "srb":
+            raise ValueError("com_auto moves the SRB pin; the %s law has none"
+                             % law)
+        if com_auto and not self.balance.rise_track:
+            raise ValueError("com_auto slides the trunk over the planted feet "
+                             "with the tracked joint layer; this law has no "
+                             "rise_track")
+        if com_auto and not self.balance.kp_joint > 0.0:
+            # STICTION.  The statics read the load off the drivers' torque;
+            # in a damping-only HOLD the joints freeze where the rise left
+            # them and friction carries part of it.  MuJoCo, 0.1 N*m joint
+            # Coulomb: a sprung HOLD read the CoM within 0.4 mm, a
+            # damping-only one 3-4 mm off, and the walk fell on it.
+            raise ValueError("com_auto reads the CoM off a HOLD held by the "
+                             "joint spring; this law's kp_joint is %.1f"
+                             % self.balance.kp_joint)
+        self.com = COM.ComMeasure() if com_auto else None
+        #: T pressed, the HOLD's samples not yet enough: the trot waits.
+        self.com_pending = False
+        #: The slide onto the measured CoM is running (`phase_name`
+        #: "recentre"); when it began.
+        self.recentring = False
+        self.t_recentre = 0.0
+        #: Every T's reading, for the exit report: dicts of the HOLD's
+        #: summary, the pin it was read against, the correction and what
+        #: was done with it.
+        self.com_log: list[dict] = []
 
     @property
     def phase_name(self) -> str:
@@ -537,6 +588,8 @@ class StandSequence:
             return "fall"
         if self.stepping:
             return "step"
+        if self.recentring:
+            return "recentre"
         return "trot" if self.trotting else self.phases[self.phase]
 
     @property
@@ -617,10 +670,82 @@ class StandSequence:
             # leg the stance law in mid-air.  `update` takes it.
             self.trot_exit = True
             return "trot exit latched: HOLD at the next four-foot window"
+        if self.recentring:
+            return ("T ignored: re-centring on this HOLD's CoM -- the trot "
+                    "starts by itself in %.1f s"
+                    % max(0.0, self.t_recentre + BCFG.COM_SLIDE_S - now))
         if self.phase_name != "hold":
             return "T ignored: the trot starts from HOLD, not %s" % self.phase_name
         if self.law != "srb":
             return "T ignored: only the SRB law can trot"
+        if self.com is not None:
+            # THE HOLD'S CoM FIRST (module docstring): applied now if the
+            # HOLD has enough of it, else the trot waits for it -- `update`
+            # applies it on the sweep it is ready.
+            if self.com_pending:
+                return ("T ignored: the trot is already waiting for this "
+                        "HOLD's CoM, %.1f s more.  ENTER parks instead."
+                        % self.com.seconds_to_ready(now))
+            self.com_pending = True
+            if self.com.ready:
+                return self._apply_com(now)
+            return ("TROT ARMED: this HOLD's CoM needs %.1f s more of samples; "
+                    "then the stance slides onto it (%.1f s) and the trot "
+                    "starts by itself.  ENTER parks instead."
+                    % (self.com.seconds_to_ready(now), BCFG.COM_SLIDE_S))
+        return self._start_trot(now)
+
+    def _apply_com(self, now: float) -> str:
+        """T's CoM: the HOLD's reading against the pin, and the slide onto it
+        begun -- or refused, and the trot started on the pin there is.
+        Returns what to say."""
+        self.com_pending = False
+        s = self.com.summary()
+        pin = np.array(self.balance.srb.com_body[:2], dtype=float)
+        d = s["c"] - pin
+        dn = float(np.hypot(d[0], d[1]))
+        row = dict(t=float(now), pin=pin, d=d, **s)
+        head = ("CoM over %.1f s of this HOLD: trunk x/y %+.1f/%+.1f mm "
+                "(p10..p90 %+.1f..%+.1f / %+.1f..%+.1f), Fz/W %.2f; the pin "
+                "%+.1f/%+.1f; measured - pinned %+.1f/%+.1f mm"
+                % (s["seconds"], *(1e3 * s["c"]), 1e3 * s["p10"][0],
+                   1e3 * s["p90"][0], 1e3 * s["p10"][1], 1e3 * s["p90"][1],
+                   s["kt"], *(1e3 * pin), *(1e3 * d)))
+        lo, hi = BCFG.COM_KT_RANGE
+        spread = float(np.hypot(*(s["p90"] - s["p10"])))
+        why = None
+        if not lo <= s["kt"] <= hi:
+            why = ("the drivers' torque accounts for %.2f of the weight, "
+                   "outside %.1f..%.1f (config.COM_KT_RANGE): the torque "
+                   "readback is not believed" % (s["kt"], lo, hi))
+        elif spread > BCFG.COM_SPREAD_MAX:
+            why = ("its p10..p90 spans %.1f mm, past %.0f (config."
+                   "COM_SPREAD_MAX): the robot was not still.  Hold still and "
+                   "T again after it has re-measured"
+                   % (1e3 * spread, 1e3 * BCFG.COM_SPREAD_MAX))
+        elif dn > BCFG.COM_AUTO_MAX:
+            why = ("%.1f mm is past the %.0f mm bound (config.COM_AUTO_MAX): "
+                   "check the torque readback, or fly --com-offset by hand"
+                   % (1e3 * dn, 1e3 * BCFG.COM_AUTO_MAX))
+        elif dn < BCFG.COM_SLIDE_MIN:
+            why = ("under %.1f mm: nothing to move"
+                   % (1e3 * BCFG.COM_SLIDE_MIN))
+        row.update(applied=why is None, why=why)
+        self.com_log.append(row)
+        if why is not None:
+            return "%s\n   NOT APPLIED: %s.  %s" % (head, why,
+                                                    self._start_trot(now))
+        self.balance.begin_recentre(d)
+        self.recentring = True
+        self.t_recentre = float(now)
+        self.t_phase = float(now)
+        return ("%s\n   RE-CENTRING: the pin and every stance site move "
+                "%+.1f/%+.1f mm; the trunk slides over the planted feet for "
+                "%.1f s, then the trot starts by itself.  X is an E-STOP."
+                % (head, *(1e3 * d), BCFG.COM_SLIDE_S))
+
+    def _start_trot(self, now: float) -> str:
+        """The trot's clock starts here.  Returns what to say."""
         # A FRESH x/y SETPOINT PER TROT (`law.BalanceLaw.est_xy`): latched on
         # this trot's first usable estimate, never carried over from the
         # hold's or the last trot's.
@@ -698,6 +823,54 @@ class StandSequence:
         trot's x/y only)."""
         self.balance.feed_estimate(estimate)
 
+    def feed_torque(self, now: float, body, tau_meas) -> None:
+        """The runner's door for the drivers' MEASURED torque, with the sweep's
+        `BodyState` it goes with: one CoM sample in HOLD (and while T waits
+        for samples), nothing anywhere else -- the statics assume four feet
+        at rest.  `hw.stand.run` calls it from a slot of its own."""
+        if self.com is None or body is None or self.phase_name != "hold":
+            return
+        # The legs' weight torque the law took in slot 0 for this very sweep
+        # -- when it refreshed all four (`gravity_legs_per_sweep`).
+        law = self.balance
+        gravity = (law.gravity if law.gravity_legs_per_sweep >= C.N_LEGS
+                   else None)
+        c, kt = COM.com_sample(body, tau_meas, float(law.srb.com_body[2]),
+                               gravity=gravity)
+        self.com.add(now, c, kt)
+
+    @property
+    def trot_pending(self) -> bool:
+        """T has been pressed and the trot has not started yet: it waits for
+        the HOLD's CoM, or the stance is sliding onto it.  `--auto` reads it
+        so as not to press T again."""
+        return self.com_pending or self.recentring
+
+    def com_report(self) -> str:
+        """The exit report's CoM lines: every T's reading and what was done
+        with it, and where the pin ended.  Empty when `com_auto` is off."""
+        if self.com is None:
+            return ""
+        lines = []
+        for r in self.com_log:
+            lines.append(
+                "  CoM at T        %+.1f/%+.1f mm over %.1f s (p10..p90 "
+                "%+.1f..%+.1f / %+.1f..%+.1f), Fz/W %.2f, pin %+.1f/%+.1f: %s"
+                % (*(1e3 * r["c"]), r["seconds"], 1e3 * r["p10"][0],
+                   1e3 * r["p90"][0], 1e3 * r["p10"][1], 1e3 * r["p90"][1],
+                   r["kt"], *(1e3 * r["pin"]),
+                   "re-centred %+.1f/%+.1f mm" % tuple(1e3 * r["d"])
+                   if r["applied"] else "not applied, " + r["why"]))
+        if not lines:
+            lines.append("  CoM             measured in HOLD, never applied "
+                         "(no T)")
+        shift = self.balance.com_shift
+        lines.append("  CoM pin at exit %+.1f/%+.1f mm trunk x/y, %+.1f/%+.1f "
+                     "from the run's start"
+                     % (*(1e3 * np.asarray(self.balance.srb.com_body[:2])),
+                        *(1e3 * shift)))
+        return "\n".join(lines)
+
     @property
     def finished(self) -> bool:
         return self.phase_name == "done"
@@ -734,6 +907,13 @@ class StandSequence:
         if self.stepping:
             return "stepping the feet -- HOLD%s follows at four feet down" % (
                 " then PARK" if self.park_after_step else "")
+        if self.recentring:
+            return ("re-centring on this HOLD's CoM -- the trot starts by "
+                    "itself in %.1f s; T then latches its exit and ENTER "
+                    "parks from HOLD"
+                    % max(0.0, self.t_recentre + BCFG.COM_SLIDE_S - now))
+        # ENTER in place of a trot still waiting for its CoM: no trot.
+        self.com_pending = False
         # THE FEET GO HOME BEFORE THE PARK.  The park ramps the joints to the
         # crouch; from any other stance that slides the feet on the floor.
         if (self.phase_name == "hold" and self.law == "srb" and not from_fall
@@ -879,6 +1059,8 @@ class StandSequence:
             self.t_phase = now
             self.q_ref0 = C.unflat(q).copy()
             self.hold.start(now)
+            if self.com is not None:
+                self.com.start(now)          # every HOLD measures its own CoM
             # THE JOINT TARGET IS FIXED HERE, ONCE: the angles on the sweep
             # the robot reaches HOLD.  Kept through the hold and every trot
             # -- not re-taken at T, which would carry any drift forward.
@@ -902,6 +1084,8 @@ class StandSequence:
             self.balance.release_xy()
             self.t_phase = now
             self.hold.start(now)
+            if self.com is not None:
+                self.com.start(now)
             name = self.phase_name
             if self.trot_swings:
                 self.notice = ("back in HOLD -- all four feet down.  T swings "
@@ -923,6 +1107,8 @@ class StandSequence:
             self.balance.hold_joints(q)
             self.t_phase = now
             self.hold.start(now)
+            if self.com is not None:
+                self.com.start(now)
             name = self.phase_name
             if self.park_after_step:
                 self.park_after_step = False
@@ -935,6 +1121,31 @@ class StandSequence:
                                % ("W steps them back; T trots here; ENTER "
                                   "steps back and parks." if not self.feet_home
                                   else "ENTER parks."))
+
+        # T WAS PRESSED BEFORE THE HOLD HAD ITS CoM: apply it the sweep it has.
+        if name == "hold" and self.com_pending and self.com.ready:
+            self.notice = self._apply_com(now)
+            name = self.phase_name
+
+        if name == "recentre":
+            # THE SLIDE ONTO THE MEASURED CoM (`law.BalanceLaw.begin_recentre`):
+            # the law as in HOLD with its x/y loop off -- the trunk is meant
+            # to move -- and the sites and pin stepped AFTER it, so the next
+            # sweep's `state.read` and law read the same pin.
+            result = self._lift_srb(now, body, None, xy_hold=False)
+            if self.balance.fallen and not self.fallen:
+                self._enter_fall(now, name)
+                return result
+            s = (now - self.t_recentre) / BCFG.COM_SLIDE_S
+            if s >= 1.0:
+                self.balance.end_recentre(q)
+                self.recentring = False
+                self.notice = ("re-centred: the pin is now %s.  %s"
+                               % (self.balance.srb.describe(),
+                                  self._start_trot(now)))
+            else:
+                self.balance.recentre_to(ST.smoothstep(max(0.0, s)))
+            return result
 
         if self.wave is not None and name in WV.WAVE_PHASES:
             return self._wave(now, elapsed, body)
@@ -953,6 +1164,12 @@ class StandSequence:
             elif name == "trot":
                 self.trot.add(now, self.out.state, self.balance, self.out)
                 self._count_swings()
+                # The walk's governor paused or resumed the keys this sweep
+                # (walk.py): its words go out on this channel like any other.
+                walk = self.balance.walk
+                said = None if walk is None else walk.take_notice()
+                if said:
+                    self.notice = said
             if self.balance.fallen and not self.fallen:
                 self._enter_fall(now, name)
             return result
@@ -992,6 +1209,9 @@ class StandSequence:
         if self.stepping:
             self.balance.end_step()
         self.stepping = self.park_after_step = False
+        if self.recentring:
+            self.balance.cancel_recentre()
+        self.recentring = self.com_pending = False
         self.balance.release_xy()
         self.t_phase = float(now)
         law = self.balance
@@ -1046,7 +1266,8 @@ class StandSequence:
         leg = self._sweep % C.N_LEGS
         self.gravity[leg] = SK.leg_gravity_torque(leg, q4[leg])
         request = ST.compliance_torque(q4, C.unflat(qd), self.h_cmd,
-                                       kin=HK, gravity=self.gravity)
+                                       kin=HK, gravity=self.gravity,
+                                       weight=BCFG.WEIGHT)
         self.tau_request = C.flat(request)
         self.tau = self.gate.apply(self.tau_request, q, now)
         self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))

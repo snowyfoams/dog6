@@ -268,7 +268,7 @@ def height_from_fk(q) -> float:
 
 
 def compliance_torque(q, qd, height, *, foot_xy=FOOT_XY, kin=K,
-                      gravity=None) -> np.ndarray:
+                      gravity=None, weight: float = P.WEIGHT) -> np.ndarray:
     """(4, 3) joint torques for the Cartesian compliance law at `height`.
 
     THE ONE COPY OF THE LAW.  `StandController` runs it in MuJoCo and
@@ -279,7 +279,9 @@ def compliance_torque(q, qd, height, *, foot_xy=FOOT_XY, kin=K,
     `sim.kinematics` here, `hw.kinematics` on the robot, which `sim.selftest`
     gates equal to 1e-12 and which is twenty times faster.  `gravity` is the
     (4, 3) leg-weight torque if the caller already has it; left None it is
-    computed here with `sim.kinematics.leg_gravity_torque`.
+    computed here with `sim.kinematics.leg_gravity_torque`.  `weight` is what
+    the four feedforwards carry: the design's here, the WEIGHED robot's on
+    the robot (`hw.balance.config.WEIGHT`, 2026-10-06).
     """
     q = C.unflat(q)
     qd = C.unflat(qd)
@@ -291,7 +293,7 @@ def compliance_torque(q, qd, height, *, foot_xy=FOOT_XY, kin=K,
         p_des = np.array([foot_xy[i, 0], foot_xy[i, 1], z_des])
         # f is what the LEG APPLIES TO THE WORLD.  f_ff pushes DOWN.
         force = (KP_CART * (p_des - p) - KD_CART * (jac @ qd[i])
-                 + np.array([0.0, 0.0, -P.WEIGHT / C.N_LEGS]))
+                 + np.array([0.0, 0.0, -float(weight) / C.N_LEGS]))
         leg_gravity = (K.leg_gravity_torque(i, q[i]) if gravity is None
                        else gravity[i])
         tau[i] = jac.T @ force + leg_gravity

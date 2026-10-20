@@ -1256,7 +1256,9 @@ def main() -> int:
     from . import swing as SWING
 
     # -- the clock ------------------------------------------------------
-    gait = GAIT.TrotGait()
+    # DOG5's re-level is off by default since 2026-10-20 (SETTLE_S 0); it is
+    # still `--settle`, so the clock under test carries one.
+    gait = GAIT.TrotGait(settle_s=0.2)
     gait.reset(0.0)
     fl, fr, rl, rr = (C.LEGS.index(n) for n in ("FL", "FR", "RL", "RR"))
     t_end = gait.cycle_start(3 * gait.settle_every)
@@ -2403,8 +2405,8 @@ def main() -> int:
     check("reference: reset ON the robot -- the first sweep has no error",
           np.array_equal(s0.p, p_a) and s0.yaw == yaw_a and not s0.v.any()
           and not s0.a.any())
-    # Inside the keys' box, whatever it is (60 % of doc/walk's since
-    # 2026-10-05): this is the generator's arithmetic, not the box.
+    # Inside the keys' box, whatever it is (x/y doubled 2026-10-20, yaw 60 %
+    # of doc/walk's): this is the generator's arithmetic, not the box.
     fwd = WTRAJ.Command(vx=cfg.WALK_VX_MAX, vy=0.0, yaw_rate=0.0)
     run = [wref.update(0.004 * k, fwd) for k in range(1, 151)]
     k_half = int(round(0.5 * fwd.vx / cfg.WALK_ACC_MAX / 0.004))
@@ -2458,7 +2460,7 @@ def main() -> int:
     a_q = qpa.allocate(at_fold.r_w, trim)
     a_l = ALLOC.allocate(at_fold.r_w, trim, mu=cfg.MU)
     close("QP: with every face slack it IS the least squares, to alpha's "
-          "regularisation (0.02 N of 57.7)", a_q.f_w, a_l.f_w, 2e-2, " N")
+          "regularisation (0.02 N of the weight)", a_q.f_w, a_l.f_w, 2e-2, " N")
     check("...found on the fast path, one 12x12 solve, no iteration",
           qpa.last_iter == 0 and not a_q.clipped.any())
     a_d = qpa.allocate(at_fold.r_w, trim,
@@ -2926,13 +2928,25 @@ def main() -> int:
     a_w.ff_armature, a_w.swing_ff = None, False
     opts["hook"].configure(a_w)
     built = opts["hook"].law_kwargs(a_w)["walk"]
-    check("...and the plan its flags build is the walk doc/walk flew: the "
-          "task-space swing at WN_SWING_OSC",
-          built.swing_law == cfg.WALK_SWING_LAW == "osc"
-          and np.array_equal(built.wn_swing, cfg.WN_SWING_OSC)
-          and built.zeta_swing == cfg.ZETA_SWING_OSC
+    check("...and the plan its flags build swings on the impedance (the "
+          "default since 2026-10-20) at KP/KD_SWING_WALK",
+          built.swing_law == cfg.WALK_SWING_LAW == "impedance"
+          and np.array_equal(built.kp_swing,
+                             np.tile(cfg.KP_SWING_WALK, (C.N_LEGS, 1)))
+          and np.array_equal(built.kd_swing,
+                             np.tile(cfg.KD_SWING_WALK, (C.N_LEGS, 1)))
           and built.reference.vx_max == cfg.WALK_VX_MAX,
-          "wn %s rad/s" % np.array2string(built.wn_swing, precision=0))
+          "Kp %s" % np.array2string(cfg.KP_SWING_WALK, precision=0))
+    a_osc = ap_w.parse_args(["--swing-law", "osc"])
+    a_osc.ff_armature, a_osc.swing_ff = None, False
+    opts["hook"].configure(a_osc)
+    b_osc = opts["hook"].law_kwargs(a_osc)["walk"]
+    check("...--swing-law osc is the task-space swing doc/walk flew, at "
+          "WN_SWING_OSC",
+          b_osc.swing_law == "osc"
+          and np.array_equal(b_osc.wn_swing, cfg.WN_SWING_OSC)
+          and b_osc.zeta_swing == cfg.ZETA_SWING_OSC,
+          "wn %s rad/s" % np.array2string(b_osc.wn_swing, precision=0))
     a_r = ap_w.parse_args(["--place-at-rest"])
     a_r.ff_armature, a_r.swing_ff = None, False
     opts["hook"].configure(a_r)
@@ -2953,8 +2967,7 @@ def main() -> int:
     walk_kd = np.tile(cfg.KD_SWING_WALK, (C.N_LEGS, 1))
     walk_kp[rl] = [150.0, 150.0, 600.0]
     walk_kd[rl] = [6.0, 6.0, 60.0]
-    a_l = ap_w.parse_args(["--swing-law", "impedance",
-                           "--kp-swing-walk-rl", "150", "150", "600",
+    a_l = ap_w.parse_args(["--kp-swing-walk-rl", "150", "150", "600",
                            "--kd-swing-walk-rl", "6", "6", "60"])
     a_l.ff_armature, a_l.swing_ff = None, False
     opts["hook"].configure(a_l)
@@ -2966,7 +2979,8 @@ def main() -> int:
           and np.array_equal(plan_l.kd_swing, walk_kd)
           and opts["hook"].own_swing == ["RL"],
           "own %s" % opts["hook"].own_swing)
-    a_o = ap_w.parse_args(["--kp-swing-walk-rl", "150", "150", "600"])
+    a_o = ap_w.parse_args(["--swing-law", "osc",
+                           "--kp-swing-walk-rl", "150", "150", "600"])
     a_o.ff_armature, a_o.swing_ff = None, False
     try:
         opts["hook"].configure(a_o)
@@ -2977,12 +2991,12 @@ def main() -> int:
     err_w = io.StringIO()
     try:
         with contextlib.redirect_stderr(err_w):
-            FW.main(["--fake", "--kp-swing-walk-rl", "150", "150", "600"])
+            FW.main(["--fake", "--swing-law", "osc",
+                     "--kp-swing-walk-rl", "150", "150", "600"])
         exit_w = None
     except SystemExit as refusal_exit:
         exit_w = refusal_exit.code
-    check("...hw.fold_walk at its default osc swing refuses them before the "
-          "bus", exit_w == 2 and "the impedance's gains" in err_w.getvalue(),
+    check("...hw.fold_walk on --swing-law osc refuses them before the bus", exit_w == 2 and "the impedance's gains" in err_w.getvalue(),
           "exit %r" % exit_w)
     sw_ref = argparse.Namespace(p=rest[rl] + [0.0, 0.0, 0.010],
                                 v=np.array([0.0, 0.0, 0.3]), a=np.zeros(3))
@@ -3060,6 +3074,109 @@ def main() -> int:
     close("...and its footholds are placed about FOLD2's OWN sites, trunk x "
           "+-219.5 mm", np.abs(lw2.walk.sites_b),
           np.tile([0.2195, 0.065], (4, 1)), 5e-4, " m")
+
+    # -- governor.py: the operator's SPACE, pressed by the law ---------------
+    from . import governor as GOV
+    from .trajectory import Command as WCmd
+    go = GOV.WalkGovernor()
+    cmd = WCmd(vx=0.0, vy=0.03, yaw_rate=0.0)
+    # the trot's own rocking: +-4 deg at the 0.6 s gait's 1.67 Hz, in place
+    for k in range(500):
+        tk = 0.004 * k
+        out = go.update(tk, np.radians(4.0) * np.sin(2 * np.pi * 1.667 * tk),
+                        0.0, cmd)
+    check("governor: the trot's +-4 deg rocking at 1.67 Hz is not a lean -- "
+          "never pauses, the command passes", not go.paused and go.pauses == 0
+          and out is cmd and go.lean_peak < cfg.WALK_PAUSE_LEAN_DEG,
+          "lean peak %.1f deg" % go.lean_peak)
+    go = GOV.WalkGovernor()
+    t_p = None
+    for k in range(200):
+        tk = 0.004 * k
+        out = go.update(tk, np.radians(8.0), 0.0, cmd)
+        if go.paused and t_p is None:
+            t_p = tk
+    check("...a sustained 8 deg lean PAUSES within 0.15 s: the command "
+          "returned is zero, the keys untouched",
+          t_p is not None and t_p < 0.15 and out.vy == 0.0 and out.vx == 0.0
+          and go.pauses == 1 and not go.clear_pending, "paused at %.3f s" % t_p)
+    said = go.take_notice() or ""
+    check("...and says so once", "PAUSED" in said and go.take_notice() is None,
+          said[:50])
+    t_r = None
+    for k in range(200, 700):
+        tk = 0.004 * k
+        out = go.update(tk, 0.0, 0.0, cmd)
+        if not go.paused and t_r is None:
+            t_r = tk
+    check("...level again: RESUMES after calm_s, the command back",
+          t_r is not None and abs((t_r - 0.8) - cfg.WALK_CALM_S) < 0.15
+          and out is cmd and "RESUMED" in (go.take_notice() or ""),
+          "resumed at %.2f s" % t_r)
+    for k in range(700, 760):
+        go.update(0.004 * k, np.radians(8.0), 0.0, cmd)
+    check("...a re-pause within %.0f s of the resume CLEARS the keys "
+          "(clear_pending, read once)" % cfg.WALK_REPAUSE_S,
+          go.paused and go.pauses == 2 and go.clears == 1 and go.take_clear()
+          and not go.take_clear() and "CLEARED" in (go.take_notice() or ""))
+    # paused from 0.0 to the resume (~1.9 s: the 0.8 s of lean, the filter's
+    # 0.1 s decay under 3 deg, then calm_s), plus the time since the re-pause
+    # (which the filter's 0.1 s rise to 5 deg delayed past 2.8 s)
+    expect = t_r + (0.004 * 759 - go.t_pause)
+    check("...paused seconds are counted", abs(go.paused_s - expect) < 0.03,
+          "%.2f s (expected %.2f)" % (go.paused_s, expect))
+    go.reset()
+    check("...reset for a new trot keeps the counts, drops the state",
+          not go.paused and go.pauses == 2 and go.lean == 0.0)
+    go2 = GOV.WalkGovernor()
+    for k in range(100):
+        out = go2.update(0.004 * k, np.radians(8.0), 0.0, cmd, walking=False)
+    check("...with the keys not reaching the reference (walking=False) it "
+          "follows the lean and decides nothing", not go2.paused and out is cmd
+          and go2.lean > 5.0)
+    for kw in (dict(pause_deg=0.0), dict(pause_deg=4.0, calm_deg=4.0)):
+        try:
+            GOV.WalkGovernor(**kw)
+            raised = False
+        except ValueError:
+            raised = True
+        check("...refuses %s" % kw, raised)
+    # through WalkPlan and the law: the reference's command is zero while paused
+    tipped = state_at(cfg.H_LIFT, R=C.rot_x(np.deg2rad(8.0)),
+                      foot_xy=fold.foot_xy, q_seed=fold.q, srb=fold.srb)
+    for gov, label in (("default", "a lean of 8 deg pauses the walk: the "
+                                   "reference's command goes to zero and the "
+                                   "plan says why"),
+                       (None, "...with the governor OFF (--pause-lean 0) the "
+                              "same lean walks on")):
+        gl, gp = _walk_law(governor=gov)
+        gp.set_command(cmd)
+        gg = GAIT.TrotGait()
+        gg.reset(1.004)
+        said = None
+        for k in range(100):
+            tk = 1.004 + 0.004 * k
+            gl.feed_estimate(_est(tk - 0.004))
+            o = gl.update(tk, tipped, gait=gg, xy_hold=True)
+            said = gp.take_notice() or said
+        if gov is None:
+            check(label, gp.governor is None and o.ref.command.vy > 0.02
+                  and said is None, "ref vy %.3f" % o.ref.command.vy)
+        else:
+            check(label, gp.governor.paused and o.ref.command.vy == 0.0
+                  and "PAUSED" in (said or ""),
+                  "ref vy %.3f, lean %.1f" % (o.ref.command.vy, gp.governor.lean))
+    # the hook that owns the keys clears them when the governor asks
+    hook = FW.WalkHook()
+    hook.plan = WWALK.WalkPlan()
+    hook.keys.press("a")
+    hook.plan.governor.clear_pending = True
+    class _Stand:
+        trotting, trot_exit = True, False
+    hook.sweep(2.0, _Stand())
+    check("...and hw.fold_walk's hook clears the keys on the governor's word "
+          "(SPACE)", hook.keys.command.vy == 0.0
+          and hook.plan.command.vy == 0.0 and not hook.plan.governor.clear_pending)
 
     # =====================================================================
     print("\n15. the fall hold: past 45 deg the joints hold the stand, "
@@ -3194,6 +3311,254 @@ def main() -> int:
     check("hw.stand REFUSES --fall-hold on the stand's 5 N*m/s slew, before "
           "the bus", refused_code == 2 and "--fall-hold on a 5 N*m/s slew"
           in err.getvalue(), "exit %r" % refused_code)
+
+    # =====================================================================
+    print("\n16. the CoM: measured in every HOLD, applied at T (--com-auto)")
+    # =====================================================================
+    from . import com_estimate as COMEST
+    from .. import com_check as CCHK
+
+    def _hold_tau(q, c_b, R, squeeze=0.0):
+        """(12,) the torque the drivers would MEASURE holding, at `q` under
+        `R`, a robot whose CoM is `c_b` (trunk frame): the vertical loads of
+        a true static equilibrium -- least norm over the four feet, with an
+        internal fore-aft squeeze and its moment in it -- and each leg's own
+        weight, through the leg's Jacobian."""
+        q4 = C.unflat(q)
+        x_b = np.array([HK.foot_position(i, q4[i]) for i in range(C.N_LEGS)])
+        r_w = x_b @ R.T
+        c_w = R @ np.asarray(c_b, dtype=float)
+        fx = squeeze * np.array([-1.0, -1.0, 1.0, 1.0])
+        A = np.vstack([np.ones(C.N_LEGS), r_w[:, 0], r_w[:, 1]])
+        b = np.array([cfg.WEIGHT, cfg.WEIGHT * c_w[0] + np.dot(r_w[:, 2], fx),
+                      cfg.WEIGHT * c_w[1]])
+        f_w = np.column_stack([fx, np.zeros(C.N_LEGS),
+                               A.T @ np.linalg.solve(A @ A.T, b)])
+        f_b = f_w @ R
+        g = TRQ.all_leg_gravity_torque(q, R)
+        return np.concatenate([-HK.foot_jacobian(i, q4[i]).T @ f_b[i] + g[i]
+                               for i in range(C.N_LEGS)])
+
+    def _yawed(q, roll, pitch, yaw=0.3):
+        R = C.rot_z(yaw) @ COMEST.level_rotation(roll, pitch)
+        return STATE.read(q, np.zeros(C.N_JOINTS), IMU.TrunkOrientation(
+            R=R, omega_b=np.zeros(3), roll=roll, pitch=pitch, yaw=yaw,
+            age_s=0.0), srb=stand_srb)
+
+    stand_srb = fold.srb_at(FT.HEIGHT, FT.STAND_XY)
+    q_st = C.flat(LAW.ik_reference(FT.HEIGHT, fold.q, FT.STAND_XY))
+    rng = np.random.default_rng(16)
+    worst_l = worst_b = worst_kt = 0.0
+    for _ in range(100):
+        qq = q_st + rng.normal(size=C.N_JOINTS) * 0.02
+        c_true = np.array([stand_srb.com_body[0] + rng.normal() * 0.006,
+                           rng.normal() * 0.006, stand_srb.com_body[2]])
+        rr, pp = rng.normal(size=2) * np.radians(2.0)
+        R_l = COMEST.level_rotation(rr, pp)
+        tau = _hold_tau(qq, c_true, R_l, squeeze=rng.normal() * 3.0)
+        c_l, kt = COMEST.com_from_hold(qq, tau, rr, pp)
+        worst_l = max(worst_l, float(np.abs(c_l - (R_l @ c_true)[:2]).max()))
+        c_b, kt_b = COMEST.com_sample(_yawed(qq, rr, pp), tau, c_true[2])
+        worst_b = max(worst_b, float(np.abs(c_b - c_true[:2]).max()))
+        worst_kt = max(worst_kt, abs(kt - 1.0), abs(kt_b - 1.0))
+    check("the statics recover a KNOWN CoM: 100 static stances, tilted, "
+          "squeezed (level frame)", worst_l < 1e-9, "worst %.1e m" % worst_l)
+    check("...the online sample from a yawed BodyState, in the trunk frame",
+          worst_b < 1e-9, "worst %.1e m" % worst_b)
+    check("...and Fz/W is 1 when the torque constant is right",
+          worst_kt < 1e-9, "worst %.1e" % worst_kt)
+    check("hw.com_check reads the log with the SAME function the run uses",
+          CCHK.com_from_hold is COMEST.com_from_hold)
+
+    cm = COMEST.ComMeasure()
+    cm.start(10.0)
+    one = np.array([0.001, 0.002])
+    kept_early = cm.add(10.0 + 0.5 * cfg.COM_SETTLE_S, one, 1.0)
+    for k in range(cm.min_n - 1):
+        cm.add(10.0 + cfg.COM_SETTLE_S + 0.004 * k, one, 1.0)
+    not_yet = cm.ready
+    cm.add(10.0 + cfg.COM_SETTLE_S + 0.004 * cm.min_n,
+           np.array([0.5, -0.5]), 1.0)               # one wild sweep
+    check("ComMeasure: the settle is skipped, ready after COM_MIN_S of "
+          "samples", not kept_early and not not_yet and cm.ready,
+          "%d samples" % cm.kept)
+    check("...its median is not moved by one wild sweep",
+          np.allclose(cm.summary()["c"], one, atol=1e-12))
+    cm.start(20.0)
+    check("...and a new HOLD forgets the last one's", cm.kept == 0
+          and not cm.ready)
+
+    # -- the sequence -------------------------------------------------------
+    st = state_at(FT.HEIGHT, foot_xy=FT.STAND_XY, q_seed=fold.q,
+                  srb=stand_srb)
+    d_true = np.array([0.003, 0.005])
+    c_true = np.array(stand_srb.com_body, dtype=float)
+    c_true[:2] += d_true
+    tau_true = _hold_tau(st.q, c_true, np.eye(3))
+
+    def _com_seq(com_auto=True, **kw):
+        law = LAW.BalanceLaw(**dict(dict(
+            foot_xy=fold.foot_xy, stand_xy=FT.STAND_XY, slide_from_h=0.110,
+            rise_track=True, kp_joint=cfg.KP_JOINT_HOLD,
+            kd_joint=cfg.KD_JOINT_HOLD, h_lift=FT.HEIGHT, srb=stand_srb,
+            dynamic_setpoint=False, track_stop_deg=0.0), **kw))
+        law.arm(0.0, st)
+        seq = SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                                balance=law, gait=GAIT.TrotGait(),
+                                com_auto=com_auto)
+        seq.phase = SEQ.PHASES.index("hold")
+        seq.body = st
+        seq.gate.start(0.0, q=st.q)
+        law.hold_joints(law.hold_reference(st.q))
+        if seq.com is not None:
+            seq.com.start(0.0)                   # the rise's arrival does it
+        return seq
+
+    def _hold_for(seq, t0, t1, tau):
+        for t in np.arange(t0, t1, 0.004):
+            seq.update(t, st)
+            seq.feed_torque(t, st, tau)
+
+    cs = _com_seq()
+    stand0 = cs.balance.stand_xy.copy()
+    pin0 = np.array(cs.balance.srb.com_body, dtype=float)
+    _hold_for(cs, 0.0, 0.6, tau_true)
+    early = cs.toggle_trot(0.6)
+    again = cs.toggle_trot(0.61)
+    check("T before the HOLD has its CoM: the trot waits for it, still HOLD",
+          early.startswith("TROT ARMED") and cs.com_pending
+          and cs.phase_name == "hold" and not cs.trotting, early[:40])
+    check("...T again is not a second press (and --auto reads trot_pending)",
+          again.startswith("T ignored") and cs.trot_pending, again[:40])
+    t = 0.6
+    while cs.phase_name == "hold" and t < 3.0:
+        cs.update(t, st)
+        cs.feed_torque(t, st, tau_true)
+        t += 0.004
+    said = cs.take_notice() or ""
+    check("...the sweep it has COM_MIN_S of samples: RE-CENTRING", cs.phase_name
+          == "recentre" and "RE-CENTRING" in said and not cs.com_pending,
+          "at %.2f s" % t)
+    row = cs.com_log[-1]
+    close("...and it read the CoM the torques carry (measured - pinned)",
+          row["d"], d_true, 1e-9, " m")
+    check("...HOLD's pose is let go (the tracked layer slides) and the x/y "
+          "loop with it", cs.balance.q_hold is None and cs.balance.xy_des is None
+          and cs.balance.recentring)
+    enter = cs.advance(t, st.q)
+    check("...ENTER is refused while it slides", enter is not None
+          and "re-centring" in enter, (enter or "")[:40])
+    t_mid = cs.t_recentre + 0.5 * cfg.COM_SLIDE_S
+    while t < t_mid:
+        cs.update(t, st)
+        t += 0.004
+    shift = np.array(cs.balance.srb.com_body[:2]) - pin0[:2]
+    frac = ST.smoothstep((t - 0.004 - cs.t_recentre) / cfg.COM_SLIDE_S)
+    close("...halfway, the pin and the sites are on the smoothstep TOGETHER",
+          np.concatenate([shift, (cs.balance.stand_xy - stand0)[0]]),
+          np.concatenate([frac * d_true, frac * d_true]), 1e-12, " m")
+    while cs.phase_name == "recentre" and t < 5.0:
+        cs.update(t, st)
+        t += 0.004
+    said = cs.take_notice() or ""
+    close("arrived: the pin is the measured CoM", cs.balance.srb.com_body,
+          c_true, 1e-9, " m")
+    close("...every stance site moved by the same", cs.balance.stand_xy,
+          stand0 + d_true[None, :], 1e-9, " m")
+    close("...HOLD's pose re-latched: the IK on the moved sites",
+          cs.balance.q_hold, C.flat(LAW.ik_reference(
+              FT.HEIGHT, C.unflat(st.q), stand0 + d_true[None, :])), 1e-12,
+          " rad")
+    check("...and the TROT started by itself", cs.phase_name == "trot"
+          and cs.trotting and cs.trot_runs == 1 and "re-centred" in said,
+          said[:50])
+    check("...the feet are still 'home' for the park (home moved with them)",
+          cs.feet_home)
+    n_trot = cs.com.kept
+    cs.feed_torque(t, st, tau_true)
+    check("no sample is taken in the trot", cs.com.kept == n_trot)
+    cs.toggle_trot(t)
+    while cs.phase_name == "trot" and t < 8.0:
+        cs.update(t, st)
+        t += 0.004
+    check("back in HOLD: it measures afresh -- each HOLD its own",
+          cs.phase_name == "hold" and cs.com.kept == 0, "%d kept" % cs.com.kept)
+
+    def _refused(tau, label):
+        rs = _com_seq()
+        _hold_for(rs, 0.0, 1.8, tau)
+        pin = np.array(rs.balance.srb.com_body)
+        said = rs.toggle_trot(1.8)
+        check(label, rs.trotting and not rs.recentring
+              and np.array_equal(np.array(rs.balance.srb.com_body), pin)
+              and not rs.com_log[-1]["applied"] and "NOT APPLIED" in said,
+              (rs.com_log[-1]["why"] or "")[:50])
+
+    _refused(tau_true * 3.0, "a torque readback 3x the weight: NOT applied, "
+             "the trot starts on the pin there is")
+    far = np.array(stand_srb.com_body, dtype=float)
+    far[0] += 1.5 * cfg.COM_AUTO_MAX
+    _refused(_hold_tau(st.q, far, np.eye(3)),
+             "a CoM past COM_AUTO_MAX: NOT applied")
+    ws = _com_seq()
+    jit = np.random.default_rng(3)
+    for k, tt in enumerate(np.arange(0.0, 1.8, 0.004)):
+        ws.update(tt, st)
+        wobble = np.array(c_true)
+        wobble[0] += 0.03 * np.sin(17.0 * k) + 0.002 * jit.normal()
+        ws.feed_torque(tt, st, _hold_tau(st.q, wobble, np.eye(3)))
+    said = ws.toggle_trot(1.8)
+    check("a HOLD that was not still (p10..p90 past COM_SPREAD_MAX): NOT "
+          "applied", not ws.com_log[-1]["applied"]
+          and "not still" in (ws.com_log[-1]["why"] or ""), said[:40])
+
+    fs16 = _com_seq()
+    _hold_for(fs16, 0.0, 1.8, tau_true)
+    fs16.toggle_trot(1.8)
+    tipped = state_at(FT.HEIGHT, R=C.rot_x(np.deg2rad(cfg.FALL_HOLD_DEG + 5)),
+                      foot_xy=FT.STAND_XY, q_seed=fold.q, srb=stand_srb)
+    fs16.balance.fall_hold_deg = cfg.FALL_HOLD_DEG
+    fs16.update(1.9, tipped)
+    check("a fall mid-slide: the fall hold, the slide dropped",
+          fs16.phase_name == "fall" and not fs16.recentring
+          and not fs16.balance.recentring)
+
+    class _Walk:                                 # walk.WalkPlan's two members
+        engaged = True
+
+        def disengage(self):
+            self.engaged = False
+    wl = _com_seq()
+    _hold_for(wl, 0.0, 1.8, tau_true)
+    wl.balance.walk = _Walk()            # engaged by an earlier trot, say
+    wl.toggle_trot(1.8)
+    check("an engaged walk is dropped at the slide; the trot re-engages it "
+          "on the new stance", not wl.balance.walk.engaged)
+    check("walk.WalkPlan has the member the slide calls",
+          callable(getattr(WWALK.WalkPlan, "disengage", None)))
+
+    for kw, label in ((dict(rise_track=False, stand_xy=None),
+                       "com_auto REFUSED without the tracked layer"),
+                      (dict(kp_joint=0.0, kp_rise=cfg.KP_JOINT_HOLD),
+                       "...and on a damping-only HOLD (stiction misreads it)")):
+        try:
+            _com_seq(**kw)
+            raised = False
+        except ValueError:
+            raised = True
+        check(label, raised)
+    try:
+        SEQ.StandSequence(SAFE.SafetyGate(3.0), crouch=fold,
+                          balance=LAW.BalanceLaw(rise_track=True), gait=None,
+                          com_auto=True)
+        raised = False
+    except ValueError:
+        raised = True
+    check("...and without a trot to apply it at", raised)
+    off = _com_seq(com_auto=False)
+    said = off.toggle_trot(0.1)
+    check("--no-com-auto: T starts the trot at once, as before",
+          off.trotting and off.com is None and said.startswith("TROT"))
 
     # =====================================================================
     print("\n" + "=" * 78)

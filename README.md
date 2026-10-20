@@ -98,7 +98,7 @@ match the Python.
 
 | | DOG6 | DOG5 |
 |---|---|---|
-| mass | 5.883 kg | 5.815 kg |
+| mass | **5.210 kg weighed** (2026-10-06; CAD 5.883 kg) | 5.815 kg |
 | trunk | 2.349 kg (40 %) | 2.619 kg (45 %) |
 | hip / thigh / shin | 0.400 / 0.412 / 0.072 kg | 0.392 / 0.369 / 0.038 |
 | hip spacing | 0.313 × 0.120 m | 0.441 × 0.120 m |

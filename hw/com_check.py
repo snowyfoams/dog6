@@ -1,9 +1,16 @@
-"""Where the built robot's CoM really is, read off a HOLD log.
+"""Where the built robot's CoM really is, read off a log -- EVERY HOLD in it.
 
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V -m hw.com_check fold_trot.npz                  a `hw.fold_trot --log` run
     $V -m hw.com_check fold2_trot.npz --entry fold2_trot
     $V -m hw.com_check trot.npz --entry trot --height 145
+
+SINCE 2026-10-06 THE RUN DOES THIS ITSELF (`--com-auto`, the default on every
+trot that tracks its rise): each HOLD measures the CoM and T applies it
+(`hw.balance.com_estimate`, where `com_from_hold` now lives).  This script
+reads the same thing back off the npz, one row per HOLD -- the operator found
+each HOLD gives its own -- beside the pin the law flew (`com_pin`) and each
+T's re-centring.
 
 WHY.  The balance law pins the whole-robot CoM at the CAD's number
 (`config.SrbModel`, `posture.CrouchPose.srb_at`) and never measures it.  A
@@ -52,15 +59,15 @@ import argparse                      # noqa: E402
 
 import numpy as np                   # noqa: E402
 
-from sim import coordinates as C     # noqa: E402
-from sim import params as P          # noqa: E402
-
-from . import kinematics as HK       # noqa: E402
+from .balance import com_estimate as COM  # noqa: E402
 from .balance import config as BCFG  # noqa: E402
 from .balance import posture as POSE  # noqa: E402
-from .balance import torque as TRQ   # noqa: E402
 
-__all__ = ["com_from_hold", "pinned_srb", "main"]
+#: One sweep's statics: `hw.balance.com_estimate`'s, which the run uses too.
+com_from_hold = COM.com_from_hold
+
+__all__ = ["com_from_hold", "pinned_srb", "segments", "hold_reading",
+           "analyse", "main"]
 
 #: entry point -> (crouch, default hold height m, stand feet or None)
 ENTRIES = {
@@ -87,78 +94,111 @@ def pinned_srb(entry: str, height: float | None = None) -> BCFG.SrbModel:
     return crouch.srb_at(h if height is None else float(height), stand_xy)
 
 
-def com_from_hold(q, tau_meas, roll, pitch) -> tuple[np.ndarray, float]:
-    """``(c_xy, kt)`` for ONE sweep: the CoM in the LEVEL trunk frame (the
-    trunk's roll and pitch taken out, yaw left in), m, and the measured
-    vertical force over the weight.  `q`, `tau_meas` (12,); angles rad."""
-    R = C.rot_y(float(pitch)) @ C.rot_x(float(roll))
-    q4 = C.unflat(np.asarray(q, dtype=float))
-    tau4 = C.unflat(np.asarray(tau_meas, dtype=float))
-    grav = TRQ.all_leg_gravity_torque(np.asarray(q, dtype=float), R)
-    M = np.zeros(3)
-    F = np.zeros(3)
-    for i in range(C.N_LEGS):
-        jac = HK.foot_jacobian(i, q4[i])
-        f_b = -np.linalg.solve(jac.T, tau4[i] - grav[i])
-        f_w = R @ f_b
-        r_w = R @ HK.foot_position(i, q4[i])
-        M += np.cross(r_w, f_w)
-        F += f_w
-    fz = float(F[2])
-    if abs(fz) < 1e-6:
-        return np.full(2, np.nan), 0.0
-    # sum r x f = c x (F_z z_hat) = F_z (c_y, -c_x, 0)
-    return np.array([-M[1] / fz, M[0] / fz]), fz / BCFG.WEIGHT
+def segments(phase_col, name: str) -> list[tuple[int, int]]:
+    """``[(i0, i1), ...]``: each contiguous run of `name` in the log's phase
+    column, as sweep index ranges (i1 exclusive)."""
+    on = (np.asarray(phase_col) == name).astype(int)
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], on, [0]])))
+    return [(int(a), int(b)) for a, b in zip(edges[0::2], edges[1::2])]
+
+
+def hold_reading(L, i0: int, i1: int, z_b: float,
+                 settle_s: float = BCFG.COM_SETTLE_S) -> dict:
+    """One HOLD's CoM, read off the log as the run read it (`com_estimate`):
+    trunk-frame x/y per sweep after the settle, its median and p10/p90 (m),
+    the median Fz/W, the mean roll/pitch (rad), and the sweep count."""
+    idx = np.arange(i0, i1)
+    idx = idx[(L["t"][idx] >= settle_s)
+              & np.isfinite(L["tau_meas"][idx]).all(axis=1)]
+    c, kt = [], []
+    for k in idx:
+        cl, kk = com_from_hold(L["q"][k], L["tau_meas"][k], L["roll"][k],
+                               L["pitch"][k])
+        if np.all(np.isfinite(cl)):
+            c.append(COM.level_to_trunk_xy(cl, L["roll"][k], L["pitch"][k],
+                                           z_b))
+            kt.append(kk)
+    if not c:
+        return dict(n=0, idx=idx)
+    c, kt = np.array(c), np.array(kt)
+    return dict(n=len(c), idx=idx, c=np.median(c, axis=0),
+                p10=np.percentile(c, 10, axis=0),
+                p90=np.percentile(c, 90, axis=0), kt=float(np.median(kt)),
+                roll=float(np.mean(L["roll"][idx])),
+                pitch=float(np.mean(L["pitch"][idx])))
 
 
 def analyse(L, entry: str, height: float | None = None,
             phase: str = "hold") -> str:
+    """Every HOLD in the log, one row each, against the pin the law FLEW
+    there (`com_pin`, a `--com-auto` / `--com-offset` run's own) or, in a log
+    from before 2026-10-06, the entry point's; then each T's re-centring."""
     srb = pinned_srb(entry, height)
+    cad = np.asarray(srb.com_body, dtype=float)[:2]
+    z_b = float(srb.com_body[2])
     ph = L["phase"]
-    sel = np.flatnonzero(ph == phase)
-    if not sel.size:
+    segs = segments(ph, phase)
+    if not segs:
         return "no %r sweeps in this log (phases: %s)" % (
             phase, ", ".join(sorted(set(ph.tolist()))))
-    finite = sel[np.isfinite(L["tau_meas"][sel]).all(axis=1)]
-    c = np.array([com_from_hold(L["q"][k], L["tau_meas"][k],
-                                L["roll"][k], L["pitch"][k])[0]
-                  for k in finite])
-    kt = np.array([com_from_hold(L["q"][k], L["tau_meas"][k],
-                                 L["roll"][k], L["pitch"][k])[1]
-                   for k in finite])
-    ok = np.isfinite(c).all(axis=1)
-    c, kt = c[ok], kt[ok]
-    med = np.median(c, axis=0)
-    p10, p90 = np.percentile(c, 10, axis=0), np.percentile(c, 90, axis=0)
-    pin = np.asarray(srb.com_body, dtype=float)[:2]
-    d = med - pin
-    out = [
-        "%d %s sweeps (%.1f s), %s" % (len(c), phase, len(c) / 250.0,
-                                       srb.describe()),
-        "  measured CoM, trunk x / y:  %+.1f / %+.1f mm  (p10..p90 %+.1f..%+.1f "
-        "/ %+.1f..%+.1f)" % (1e3 * med[0], 1e3 * med[1], 1e3 * p10[0],
-                             1e3 * p90[0], 1e3 * p10[1], 1e3 * p90[1]),
-        "  pinned CoM, trunk x / y:    %+.1f / %+.1f mm" % (1e3 * pin[0],
-                                                             1e3 * pin[1]),
-        "  measured vertical force / weight: median %.2f (p10 %.2f, p90 %.2f) "
-        "-- the drivers' torque constant, roughly; far from 1 means the "
-        "torque readback or the gravity model is off, and the CoM above is a "
-        "ratio that does not depend on it" % (np.median(kt),
-                                               np.percentile(kt, 10),
-                                               np.percentile(kt, 90)),
-        "  roll / pitch over the phase: %+.2f / %+.2f deg mean -- an "
-        "integrator-less attitude loop parks a few degrees off for a CoM "
-        "off the pin" % (np.degrees(L["roll"][finite].mean()),
-                         np.degrees(L["pitch"][finite].mean())),
-        "",
-        "  -> --com-offset %+.1f %+.1f   (measured minus pinned, mm)"
-        % (1e3 * d[0], 1e3 * d[1]),
-    ]
-    if np.hypot(*d) < 1.0e-3:
-        out.append("     under a millimetre: the pin is right; leave it")
-    elif np.hypot(*(p90 - p10)) > 2.0 * np.hypot(*d):
-        out.append("     the spread is larger than the offset: hold longer, "
-                   "or check the torque readback before trusting this")
+    pins = L["com_pin"] if "com_pin" in L.files else None
+    online = L["com_meas"] if "com_meas" in L.files else None
+    out = ["%s -- the entry point's pin at that height" % srb.describe(),
+           "each %s from %.1f s in (the settle the run skips too), trunk "
+           "frame, mm:" % (phase.upper(), BCFG.COM_SETTLE_S),
+           "   #  starts   s     CoM x / y     p10..p90 x / y            Fz/W  "
+           "roll/pitch deg   pin flown x / y   measured - flown"]
+    last = None
+    for j, (i0, i1) in enumerate(segs, 1):
+        r = hold_reading(L, i0, i1, z_b)
+        if r["n"] == 0:
+            out.append("  %2d  sweep %d: under %.1f s, nothing after the "
+                       "settle" % (j, i0, BCFG.COM_SETTLE_S))
+            continue
+        pin = cad
+        if pins is not None and np.isfinite(pins[r["idx"]]).all():
+            pin = np.median(pins[r["idx"]], axis=0)
+        d = r["c"] - pin
+        out.append("  %2d  %6d %4.1f  %+6.1f %+6.1f  %+6.1f..%+6.1f / "
+                   "%+5.1f..%+5.1f  %4.2f  %+5.2f/%+5.2f    %+6.1f %+6.1f    "
+                   "%+5.1f %+5.1f"
+                   % (j, i0, r["n"] / 250.0, *(1e3 * r["c"]),
+                      1e3 * r["p10"][0], 1e3 * r["p90"][0], 1e3 * r["p10"][1],
+                      1e3 * r["p90"][1], r["kt"], np.degrees(r["roll"]),
+                      np.degrees(r["pitch"]), *(1e3 * pin), *(1e3 * d)))
+        if online is not None:
+            got = online[r["idx"]]
+            got = got[np.isfinite(got).all(axis=1)]
+            if got.size:
+                out.append("        the run's own reading (com_meas): %+.1f "
+                           "%+.1f" % tuple(1e3 * np.median(got, axis=0)))
+        last = r
+    if pins is not None:
+        rc = segments(ph, "recentre")
+        if rc:
+            out.append("")
+            out.append("re-centred at T (the pin flown, before -> after the "
+                       "slide), mm:")
+            for i0, i1 in rc:
+                before = pins[max(0, i0 - 1)]
+                after = pins[min(len(pins) - 1, i1)]
+                out.append("  sweep %6d, %.1f s: %+.1f/%+.1f -> %+.1f/%+.1f  "
+                           "(%+.1f/%+.1f)"
+                           % (i0, (i1 - i0) / 250.0, *(1e3 * before),
+                              *(1e3 * after), *(1e3 * (after - before))))
+    out.append("")
+    out.append("  measured vertical force / weight is the drivers' torque "
+               "constant, roughly: far from 1 means the torque readback or "
+               "the gravity model is off.  The CoM is a ratio and does not "
+               "depend on it.")
+    if last is not None:
+        d = last["c"] - cad
+        out.append("  -> the LAST hold, against the CAD's pin: --com-offset "
+                   "%+.1f %+.1f  (by hand, with --no-com-auto)"
+                   % tuple(1e3 * d))
+        if np.hypot(*(last["p90"] - last["p10"])) > 2.0 * np.hypot(*d):
+            out.append("     its spread is larger than the offset: hold "
+                       "longer, or check the torque readback")
     return "\n".join(out)
 
 

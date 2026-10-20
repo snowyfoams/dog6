@@ -64,7 +64,7 @@ THE THREE TRIPS IT CAN RAISE, AND THE TWO IT DELIBERATELY DOES NOT
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 
 import numpy as np
 
@@ -351,6 +351,11 @@ class BalanceLaw:
     #: keeps the scalar gains on all three joints.  `config.KP_JOINT_HOLD_ABD`.
     kp_joint_abd: float | None = None
     kd_joint_abd: float | None = None
+    #: The TRACKED RISE's spring (`rise_track`, also the W step's), split off
+    #: 2026-10-06 so a stance can go damping-only (`kp_joint` 0, the walks'
+    #: `config.WALK_KP_JOINT`) without the rise losing what holds trunk x over
+    #: the feet.  None is `kp_joint`, the rise as it was.
+    kp_rise: float | None = None
     #: THE SWING ARC LEVELED IN ROLL, 2026-10-02, on request ("把roll融入到
     #: foot trajectory").  Off, the arc and its resting site live in the
     #: trunk frame and tilt with the trunk: rolled 1 deg, the fold stand's
@@ -369,6 +374,12 @@ class BalanceLaw:
     #: each stance started at, calm roll rms 0.6 -> 1.5-1.6 deg, and 1 s
     #: after an 8 N side push 2-3 deg against 0.2-0.3.  Removed the same day
     #: on the operator's call.  The arc alone: roll as without it (0.63-0.69).
+    #:
+    #: `hw.stand` turns it ON by default for the Cartesian swing since
+    #: 2026-10-07 (on request; `--no-swing-roll`); the field's own default
+    #: stays False so a joint/knee-swing law built without it does not
+    #: refuse.  A WALKING law never reads it: from the first trot sweep the
+    #: swing is `walk.swing_ref`'s (footstep.py, heading only).
     swing_roll: bool = False
     #: THE RISE TRACKED, 2026-10-01.  While no pose is latched (the rise, and
     #: a foot step) the joint layer's target is `q_ref` -- the IK at the
@@ -596,6 +607,14 @@ class BalanceLaw:
         self.xy_refusal: str | None = None
         self.xy_err_peak = 0.0
         self.xy_acc_peak = 0.0
+        #: THE CoM RE-CENTRING (`begin_recentre`): the slide in progress --
+        #: its correction and the sites and pin it started from -- or None.
+        self._rc: dict | None = None
+        #: (2,) m, trunk frame: how far this run's re-centrings have moved the
+        #: pin and the sites from the ones it started with, in total.
+        self.com_shift = np.zeros(2)
+        #: The pin the run started with, kept for the name of every one after.
+        self._srb0 = self.srb
 
     # -- the setpoint, latched at ZERO TORQUE ----------------------------
     def latch_setpoint(self, state) -> tuple | None:
@@ -733,6 +752,11 @@ class BalanceLaw:
     def armed(self) -> bool:
         return self.ramp is not None
 
+    @property
+    def rise_kp(self) -> float:
+        """The tracked rise's spring: `kp_rise`, or `kp_joint` when None."""
+        return float(self.kp_joint if self.kp_rise is None else self.kp_rise)
+
     def remaining(self, now: float) -> float:
         """Seconds of ramp left; 0 once it has arrived."""
         if self.ramp is None:
@@ -828,6 +852,85 @@ class BalanceLaw:
         if self.stand_xy is not None:
             self.foot_xy[:] = self.stand_xy
         return C.flat(ik_reference(self.h_lift, C.unflat(q), self.foot_xy))
+
+    # -- the CoM re-centred at T (sequence, com_estimate.py) ---------------
+    def begin_recentre(self, d_xy) -> None:
+        """Start moving the stance ONTO THE MEASURED CoM: the SRB pin and
+        every stance site by `d_xy` (2,) m, trunk frame -- the measured CoM
+        minus the pinned one, `--com-offset`'s shift done at T instead of at
+        start-up.  `recentre_to` moves them, `end_recentre` latches the new
+        stance.
+
+        THE SLANTED RISE'S MECHANISM, FOUR FEET DOWN.  HOLD's joint pose is
+        let go, so the TRACKED layer (`rise_track`, its spring `rise_kp`)
+        holds the legs on the IK of the moving sites and carries the trunk
+        over the planted feet by -d -- what moved it 85 mm through the fold's
+        rise.  The x/y loop is let go too (the trunk is MEANT to move), and
+        an engaged walk is dropped: the next trot engages it on the new
+        stance (`walk.WalkPlan.engage` takes its sites from `q_hold`).
+
+        WHY THE SITES MOVE WITH THE PIN.  In MuJoCo (doc/walk section 11.4)
+        the pin alone bought almost nothing: the trunk rocks about whichever
+        trot diagonal the real CoM is further from, and only stance sites
+        that put both diagonals through it cured that."""
+        if not self.rise_track:
+            raise ValueError("re-centring needs rise_track: only the tracked "
+                             "joint layer carries the trunk over the feet")
+        if self.foot_xy is None:
+            self.foot_xy = np.array(ST.FOOT_XY, dtype=float)
+        self._rc = dict(
+            d=np.array(d_xy, dtype=float).reshape(2),
+            foot=self.foot_xy.copy(),
+            stand=None if self.stand_xy is None else self.stand_xy.copy(),
+            crouch=None if self._crouch_xy is None else self._crouch_xy.copy(),
+            srb=self.srb, shift=self.com_shift.copy())
+        self.release_joints()
+        self.release_xy()
+        if self.walk is not None:
+            self.walk.disengage()
+
+    @property
+    def recentring(self) -> bool:
+        return self._rc is not None
+
+    def recentre_to(self, s: float) -> None:
+        """Sites and pin at fraction `s` (0..1) of the correction.  The pin is
+        a NEW `SrbModel` -- one object, which `state.read` and the law must
+        share: set it after the sweep's law, and the next sweep's
+        measurement and law both read it (`hw.stand.run` takes
+        `balance.srb` every sweep)."""
+        rc = self._rc
+        if rc is None:
+            raise RuntimeError("begin_recentre() has not been called")
+        d = float(s) * rc["d"]
+        self.foot_xy[:] = rc["foot"] + d[None, :]
+        if rc["stand"] is not None:
+            self.stand_xy[:] = rc["stand"] + d[None, :]
+        if rc["crouch"] is not None:
+            # The park's home moves too: re-centred feet are still "home".
+            self._crouch_xy[:] = rc["crouch"] + d[None, :]
+        self.com_shift = rc["shift"] + d
+        com = np.array(rc["srb"].com_body, dtype=float)
+        com[:2] += d
+        com.flags.writeable = False
+        self.srb = dc_replace(
+            rc["srb"], com_body=com,
+            name="%s, CoM re-centred %+.1f/%+.1f mm"
+            % (self._srb0.name, *(1e3 * self.com_shift)))
+
+    def end_recentre(self, q) -> None:
+        """The slide has arrived: the sites and the pin at the full
+        correction, and the joint layer latched on the new stance -- the IK
+        at the stand on the moved sites, as the first HOLD latched it
+        (`hold_reference`).  `q` seeds the IK branch."""
+        self.recentre_to(1.0)
+        self._rc = None
+        self.hold_joints(self.hold_reference(q))
+
+    def cancel_recentre(self) -> None:
+        """Drop a slide where it is -- the fall hold has taken over, and from
+        it ENTER parks.  The sites and the pin stay where the slide left them."""
+        self._rc = None
 
     # -- the trot's joint-space layer ------------------------------------
     def hold_joints(self, q) -> None:
@@ -1302,12 +1405,12 @@ class BalanceLaw:
             if clock_now is not None:
                 hold[~clock_now.contact] = 0.0
             tau += C.flat(hold)
-        elif self.rise_track and (self.kp_joint > 0.0 or self.kd_joint > 0.0):
+        elif self.rise_track and (self.rise_kp > 0.0 or self.kd_joint > 0.0):
             # NO POSE LATCHED YET -- the rise, or a foot step: the target is
             # the IK reference, the posture's own path at the commanded
             # height (`rise_track` says why).  A stepping leg gets none of
-            # it, as above.
-            hold = C.unflat(self.kp_joint * (C.flat(q_ref) - state.q)
+            # it, as above.  Its spring is `kp_rise`, not the stance's.
+            hold = C.unflat(self.rise_kp * (C.flat(q_ref) - state.q)
                             - self.kd_joint * np.asarray(state.qd))
             if clock_now is not None:
                 hold[~clock_now.contact] = 0.0

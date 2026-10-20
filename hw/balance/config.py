@@ -185,8 +185,19 @@ class SrbModel:
 #: all name them.
 SRB = SrbModel(name="nominal", com_body=COM_BODY, inertia_body=INERTIA_BODY)
 
-MASS = float(P.MASS)                                    # 5.8828 kg   [CAD]
-WEIGHT = float(P.WEIGHT)                                # 57.71 N     [CAD]
+#: THE BUILT ROBOT WEIGHS 5.210 kg -- the operator weighed it, 2026-10-06
+#: ("i weight again, it just 5210g") -- 0.673 kg (11 %) under the CAD's
+#: 5.8828.  This is the SRB law's m: the gravity it carries (m g) and the force
+#: each m/s^2 of its PD asks for (`controller.balance_wrench`), the allocator's
+#: box (FZ_MAX), the residual trip and `com_estimate`'s Fz/W.  Where the
+#: 0.673 kg is missing from was not measured, so c^b and I^b keep the CAD's
+#: shape (`SrbModel.from_pose`); c^b's x/y is measured in every HOLD
+#: (`com_estimate.py`, --com-auto).  `sim` keeps the design's (`P.MASS`), and
+#: the two `sim` laws `hw.stand` runs -- the per-leg baseline and the wave --
+#: are handed this one on the robot.
+MASS_CAD = float(P.MASS)                                # 5.8828 kg   [CAD]
+MASS = 5.210                                            # kg          [MEASURED 2026-10-06]
+WEIGHT = MASS * float(P.GRAVITY)                        # 51.11 N
 
 #: World-frame gravity, z UP.  `b_d` adds +9.81 z_hat, not -9.81: the feet
 #: must supply m*a MINUS m*g_vector, and g_vector is this.
@@ -379,7 +390,7 @@ MU = 0.5
 #: constraint the per-leg law does not have: nothing in a Cartesian spring
 #: stops it commanding a foot to pull upward on the floor.  [INHERITED cmpc]
 FZ_MIN = 1.0                        # N
-FZ_MAX = 2.0 * WEIGHT               # 115.4 N
+FZ_MAX = 2.0 * WEIGHT               # 102.2 N
 
 #: The least-squares weight, per foot, as (tangential, tangential, normal).
 #: The objective is min f^T W f, so a LARGER weight means a SMALLER component:
@@ -458,8 +469,8 @@ IMU_MAX_AGE_S = 0.05
 #: moment threshold is taken against the SHORT lever (+-65 mm, roll), which is
 #: the axis that saturates first.  SUSTAINED, not instantaneous: a sweep or
 #: two on the cone boundary during a transient is normal.  [UNTUNED]
-RESIDUAL_FORCE_N = 0.25 * WEIGHT                 # 14.4 N
-RESIDUAL_MOMENT_NM = 0.25 * WEIGHT * 0.065       # 0.94 N*m
+RESIDUAL_FORCE_N = 0.25 * WEIGHT                 # 12.8 N
+RESIDUAL_MOMENT_NM = 0.25 * WEIGHT * 0.065       # 0.83 N*m
 RESIDUAL_STREAK = 25                             # sweeps -> 0.10 s at 250 Hz
 
 
@@ -490,7 +501,11 @@ CONTACT_RAMP = 0.15
 #: for SETTLE_S with all four feet at full weight.  DOG5 never solved its
 #: trot roll; this is how its demo held.  Its alternating lead diagonal is
 #: NOT kept: removed on request 2026-09-21, one fixed trot.
-SETTLE_S = 0.2                      # s       [DOG5 FLOWN]
+#: OFF ON DOG6 SINCE 2026-10-20: the operator's test on the robot that day
+#: says DOG6 does not need it, so every trot's default is no settle (the
+#: walk's was already WALK_SETTLE_S = 0).  `--settle 0.2` puts DOG5's
+#: re-level back, every SETTLE_EVERY cycles.
+SETTLE_S = 0.0                      # s       (DOG5 flew 0.2)
 SETTLE_EVERY = 2                    # cycles  [DOG5 FLOWN]
 
 #: THE JOINT-SPACE LAYER, 2026-09-21: DOG5 trot_hw's `JointImpedance`,
@@ -583,6 +598,40 @@ KD_SWING_KNEE = np.array([0.8, 0.8, 0.8])
 #: 2026-10-02, the operator's best fold trot (`KP_SWING` above).
 TAU_SLEW_TROT_NM_S = 120.0
 
+#: THE CoM, MEASURED IN EVERY HOLD AND APPLIED AT T, 2026-10-06, on request
+#: ("each hold will bring the new com shift, so why not directly read the com
+#: shift when hold and use it when I press T").  `com_estimate.py` reads the
+#: CoM off the drivers' measured torques every HOLD sweep -- `hw.com_check`'s
+#: statics, now online -- and T slides the trunk over the four planted feet
+#: onto it before the trot clock starts: the SRB pin and the stance sites
+#: move together by (measured - pinned), which is `--com-offset`'s
+#: re-centring done at T instead of at start-up.  `hw.stand --no-com-auto`
+#: turns it off.  [DERIVED -- NOT FLOWN]
+#:
+#: s, skipped at the start of each HOLD: the rise's arrival, a trot's exit or
+#: a step's landing are still settling then, and the statics assume rest.
+COM_SETTLE_S = 0.5
+#: s of samples a HOLD needs before T may use them; T pressed sooner waits.
+COM_MIN_S = 1.0
+#: s, the newest samples kept (a ring): what the CoM reads like NOW.
+COM_WINDOW_S = 10.0
+#: s, the slide from the old stance to the re-centred one, four feet down.
+COM_SLIDE_S = 0.5
+#: m, a correction past this is NOT applied: the trot starts on the pin it
+#: has and the notice says why.  The CAD's error was simulated at 3 / 5 mm.
+COM_AUTO_MAX = 0.015
+#: The measured vertical force over the weight, outside which the torque
+#: readback is not believed and the correction is not applied.
+COM_KT_RANGE = (0.5, 1.5)
+#: m, a correction smaller than this is not applied: nothing to move.
+COM_SLIDE_MIN = 0.5e-3
+#: m, |p90 - p10| of the HOLD's samples past which the robot was not still
+#: and the reading is not applied.  The robot's own logs: the first HOLD of
+#: trot_kd.npz (2026-09-25, 1.1 s) spans 5.1 / 2.2 mm in x / y and the fold's
+#: in fold_walk_bisect.npz (2026-10-05) 4.8 / 1.8; the 10 s HOLD after that
+#: trot spans 36 / 12 and reads a median 2.8 mm from the first.
+COM_SPREAD_MAX = 0.015
+
 
 # ===========================================================================
 # walking  (trajectory.py, keys.py, qp.py, footstep.py, swing_control.py,
@@ -600,8 +649,10 @@ TAU_SLEW_TROT_NM_S = 120.0
 #: (`sim.cmpc.config.V_STEP`, `YAW_RATE_STEP`): the hardware law has no
 #: horizon to plan a velocity change into, so it gets smaller ones.
 #: 60 % OF THAT SINCE 2026-10-05, on request ("the velocity is high"): the
-#: press was 0.05 m/s and 10 deg/s, as doc/walk flew it.
-WALK_V_STEP = 0.03
+#: press was 0.05 m/s and 10 deg/s, as doc/walk flew it.  W/S/A/D DOUBLED
+#: 2026-10-20, on request ("improve the wasd for xy velocity, 2 times"):
+#: 0.03 -> 0.06 m/s a press; Q/E's yaw press is unchanged.
+WALK_V_STEP = 0.06
 WALK_YAW_STEP = float(np.radians(6.0))
 
 #: What the keys may accumulate to: inside what MuJoCo walked, not what the
@@ -614,8 +665,12 @@ WALK_YAW_STEP = float(np.radians(6.0))
 #: 2026-10-05, on request ("the velocity is high"): the box was 0.10 / 0.05
 #: m/s and 20 deg/s, as doc/walk flew it -- `--v-max 0.10 0.05
 #: --yaw-rate-max 20 --v-step 0.05 --yaw-step 10` is the walk as simulated.
-WALK_VX_MAX = 0.06                  # m/s
-WALK_VY_MAX = 0.03                  # m/s
+#: THE X/Y BOX DOUBLED 2026-10-20 with the press, on request: 0.06 / 0.03 ->
+#: 0.12 / 0.06 m/s (yaw stays 12 deg/s).  0.12 m/s forward is past the 0.10
+#: of the sweep above and short of the 0.15 that tipped; `--v-max 0.06 0.03
+#: --v-step 0.03` is the box before.
+WALK_VX_MAX = 0.12                  # m/s
+WALK_VY_MAX = 0.06                  # m/s
 WALK_YAW_RATE_MAX = float(np.radians(12.0))   # rad/s
 
 #: The command is SLEWED toward what the keys ask, never stepped: a step in
@@ -663,6 +718,32 @@ WALK_PLACE_AT_REST = False
 #: every trot.
 WALK_V_FILTER_HZ = 1.0                # Hz
 
+#: THE GOVERNOR, 2026-10-06, on request (governor.py has the whole account):
+#: the operator's SPACE, pressed by the law when the trunk LEANS.  Roll and
+#: pitch from the setpoint, low-passed at WALK_LEAN_HZ, the larger of the two
+#: past WALK_PAUSE_LEAN_DEG pauses the keys (the trot in place); under
+#: WALK_CALM_LEAN_DEG for WALK_CALM_S resumes them; a re-pause within
+#: WALK_REPAUSE_S of a resume clears them as SPACE would.  Sized on the
+#: 2026-10-06 fold2_walk_2.npz log: in place the lean stayed under 5 deg for
+#: 526 s, the operator's own stops read 4-12 deg of tilt, and 5 / 3 / 1.0
+#: pauses 5 times in 104 s of walking, 0.2-0.4 s before the operator did at
+#: the fall.  `--pause-lean 0` is off.  [SIZED ON THE ROBOT'S LOG -- NOT FLOWN]
+WALK_PAUSE_LEAN_DEG = 5.0             # deg
+WALK_CALM_LEAN_DEG = 3.0              # deg
+WALK_CALM_S = 1.0                     # s
+WALK_LEAN_HZ = 1.5                    # Hz
+WALK_REPAUSE_S = 5.0                  # s
+
+#: THE WALK'S PLANTED LEGS ARE DAMPED, NOT SPRUNG, 2026-10-06 (on request):
+#: `hw.fold_walk` / `hw.fold2_walk` default the joint layer's Kp to this on
+#: every joint, abduction too, so a planted leg gets Kd (qd_t - qd) alone --
+#: MIT's stance leg, and sim.cmpc's since claude/cmpc-joint-damping.  Kd stays
+#: KD_JOINT_HOLD; while walking qd_t is the anchor's rate, so the damper drags
+#: only the error.  The TRACKED RISE keeps its spring (`law.kp_rise` =
+#: KP_JOINT_HOLD): it is what holds trunk x over the feet on the way up.
+#: `--kp-joint 5 --kp-joint-abd 5` puts the stance spring back.  Not flown.
+WALK_KP_JOINT = 0.0                   # N*m/rad
+
 #: The swing foot's Cartesian impedance while WALKING, trunk frame.  The trot
 #: in place's 10 N/m in x/y (`KP_SWING`) is too soft to carry a foot across
 #: a stride: at 0.1 m/s it must move 48 mm in 120 ms, ~6 N peak on the 0.32 kg
@@ -694,7 +775,11 @@ ZETA_SWING_OSC = 0.7
 #: at 120 (TAU_SLEW_TROT_NM_S).  0.70 gives the swing 180 ms; the contact
 #: ramp has to fit the four-foot window, (duty - 0.5) / (2 duty) of stance,
 #: and takes 90 % of it.
-WALK_SWING_LAW = "osc"
+#: THE SWING LAW IS THE IMPEDANCE SINCE 2026-10-20: the operator's test on
+#: the robot that day says it must be (--kp/--kd-swing-walk, KP/KD_SWING_WALK;
+#: M0 only under --swing-ff).  `--swing-law osc` is the task-space law, the
+#: default before and the one MuJoCo tuned at WN_SWING_OSC.
+WALK_SWING_LAW = "impedance"
 WALK_DUTY = 0.70
 WALK_CONTACT_RAMP = 0.9 * (WALK_DUTY - 0.5) / (2.0 * WALK_DUTY)
 #: NO SETTLE WHILE WALKING.  DOG5's re-level freezes the gait clock 0.2 s

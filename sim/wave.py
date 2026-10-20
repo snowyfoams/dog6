@@ -286,7 +286,7 @@ class ThreeLegStance:
                  raised=None, amplitude: float = WAVE_AMPLITUDE,
                  hz: float = WAVE_HZ, cycles: int = WAVE_CYCLES,
                  kp=ST.KP_CART, kd=ST.KD_CART, kp_three=KP_THREE,
-                 kd_three=KD_THREE, com_xy=None):
+                 kd_three=KD_THREE, com_xy=None, weight: float = P.WEIGHT):
         self.leg = K.leg_index(leg)
         self.leg_name = C.LEGS[self.leg]
         self.kin = kin
@@ -302,6 +302,9 @@ class ThreeLegStance:
         self.kd_three = np.asarray(kd_three, dtype=float).reshape(3)
         self.com_xy = COM_XY_LIFT if com_xy is None else np.asarray(
             com_xy, dtype=float).reshape(2)
+        #: N, what the load split carries: the design's here, the WEIGHED
+        #: robot's on the robot (`hw.balance.config.WEIGHT`, 2026-10-06).
+        self.weight = float(weight)
 
         # latched at `enter`
         self.xy0 = np.array(ST.FOOT_XY, dtype=float)      # (4, 2) hip frame
@@ -313,7 +316,7 @@ class ThreeLegStance:
         self.p_des = np.zeros((C.N_LEGS, 3))
         self.v_des = np.zeros((C.N_LEGS, 3))
         self.contact = np.ones(C.N_LEGS)
-        self.fz = np.full(C.N_LEGS, P.WEIGHT / C.N_LEGS)
+        self.fz = np.full(C.N_LEGS, self.weight / C.N_LEGS)
         self.foot_hip = np.zeros((C.N_LEGS, 3))
         self.swing_error = 0.0
         self.h_stance = float("nan")
@@ -434,7 +437,7 @@ class ThreeLegStance:
         qd = C.unflat(qd)
         p_des, v_des, contact = self.targets(phase, t)
         fz = static_load_split(p_des[:, :2] + P.HIP_OFFSET[:, :2], self.com_xy,
-                               P.WEIGHT, contact)
+                               self.weight, contact)
         kp = self.kp + self.blend * (self.kp_three - self.kp)
         kd = self.kd + self.blend * (self.kd_three - self.kd)
 

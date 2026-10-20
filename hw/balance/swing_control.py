@@ -1,12 +1,13 @@
 """The swing leg's control law while walking.  TRUNK frame.  Two laws:
 
     swing_osc_torque(state, leg, ref, wn=..., zeta=..., inertia=...)
-        -> (tau (3,), tau_ff (3,))           THE WALK'S DEFAULT ("osc")
+        -> (tau (3,), tau_ff (3,))           "osc"
     tau = M0 J^-1 (a_ref + wn^2 (p_ref - x) + 2 zeta wn (v_ref - J qd)
                    - Jdot qd)
 
     swing_control_torque(state, leg, ref, kp, kd, ff=..., inertia=...)
-        -> (tau (3,), tau_ff (3,))           "impedance"
+        -> (tau (3,), tau_ff (3,))           "impedance", THE WALK'S DEFAULT
+                                             (2026-10-20, on the robot)
     tau = J^T [ Kp (p_ref - x) + Kd (v_ref - J qd) ]
         + M0 J^-1 (a_ref - Jdot qd_ref)                         --swing-ff
 

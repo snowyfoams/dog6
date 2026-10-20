@@ -33,7 +33,8 @@ operator's best fold trot by default, on request: 0.6 s, 20 mm apex, slew
 has the run).
 
     $V -m hw.trot --period 0.8                  the clock before 2026-10-02
-    $V -m hw.trot --settle 0                    no four-foot re-level
+    $V -m hw.trot --settle 0.2                  DOG5's four-foot re-level (off
+                                                since 2026-10-20: DOG6 needs none)
     $V -m hw.trot --kp-joint 3 --kd-joint 0.1   the joint layer (these are
                                                 the defaults)
     $V -m hw.trot --no-joint-hold               the SRB law alone: body free
