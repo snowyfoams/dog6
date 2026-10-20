@@ -523,6 +523,26 @@ class HwSim:
                            out.contact is not None else np.full(4, np.nan)),
                 swing_s=(out.swing_s.copy() if out is not None and
                          out.swing_s is not None else np.full(4, np.nan)),
+                # touchdown detection (scheme A), when the law has one
+                td_state=(np.asarray(out.contact_est.state, dtype=float)
+                          if out is not None
+                          and getattr(out, "contact_est", None) is not None
+                          else np.full(4, np.nan)),
+                td_probe=(out.contact_est.probe.copy() if out is not None
+                          and getattr(out, "contact_est", None) is not None
+                          else np.full(4, np.nan)),
+                td_fz=(out.contact_est.fz_push.copy() if out is not None
+                       and getattr(out, "contact_est", None) is not None
+                       else np.full(4, np.nan)),
+                td_clear=(out.contact_est.z_clear.copy() if out is not None
+                          and getattr(out, "contact_est", None) is not None
+                          else np.full(4, np.nan)),
+                td_ref=(out.contact_est.z_ref.copy() if out is not None
+                        and getattr(out, "contact_est", None) is not None
+                        else np.full(4, np.nan)),
+                p_swing=(out.p_swing.copy() if out is not None
+                         and out.p_swing is not None
+                         else np.full((4, 3), np.nan)),
                 cap=(gate.cap_now(now) if gate.started_at is not None else 0.0),
                 x_b=body.x_b.copy(),
                 com_w=d.subtree_com[self.trunk].copy(),

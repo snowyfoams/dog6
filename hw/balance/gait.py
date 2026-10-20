@@ -23,7 +23,11 @@ for DOG6:
 A PURE TIMETABLE, AS BOTH OF THEM WERE
     There is no contact sensor on DOG6.  A foot is in stance because the
     clock says so, and the allocator is told what the clock says.  Early and
-    late touchdown are not detected, and nothing here pretends otherwise.
+    late touchdown are not detected HERE, and nothing here pretends
+    otherwise.  Since 2026-10-20 `contact.ContactDetector` can override the
+    sample leg by leg from the swing law's own commanded push (scheme A) --
+    the law samples this clock, hands the sample to the detector, and acts
+    on what comes back.  The clock itself stays a timetable.
 
 THE WARP, AND WHY EVERYTHING GOES THROUGH phase()
     The settle is a FLAT in the map from wall time to gait time: once every
@@ -68,6 +72,9 @@ class GaitSample(NamedTuple):
     weight: np.ndarray       # (4,) in [0, 1]
     swing_s: np.ndarray      # (4,) swing progress, 0 in stance
     full_support: bool       # all four down at full weight
+    #: (4,) the phase itself, in [0, 1): 0 touchdown, `duty` liftoff.  What
+    #: `contact.ContactDetector` rebuilds the liftoff ramp from (2026-10-20).
+    phase: np.ndarray | None = None
 
 
 def smoothstep(u):
@@ -216,7 +223,8 @@ class TrotGait:
         weight = self._weight_from_phase(ph)
         swing_s = np.where(contact, 0.0, (ph - self.duty) / (1.0 - self.duty))
         return GaitSample(contact=contact, weight=weight, swing_s=swing_s,
-                          full_support=bool(np.all(weight >= 1.0 - 1e-9)))
+                          full_support=bool(np.all(weight >= 1.0 - 1e-9)),
+                          phase=ph)
 
     def full_support(self, t: float) -> bool:
         """All four feet down at full weight -- where the trot may be left.

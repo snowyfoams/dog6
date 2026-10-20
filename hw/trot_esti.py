@@ -406,6 +406,14 @@ class EstimatorTap:
             stand.phase_name)
         if gait is None:
             return None
+        det = getattr(stand.balance, "contact_detector", None)
+        if det is not None and det.active:
+            # TOUCHDOWN DETECTION (scheme A, 2026-10-20): the schedule with
+            # what the detector felt this sweep in it -- a probing foot is
+            # in the air (no trust), a landed one has been down since its
+            # detection.  The tap runs after slot 0, so the state is this
+            # sweep's.
+            return det.stance_phase(now, gait.phase(now), gait.duty)
         return ADAPT.stance_phase(gait.phase(now), gait.duty)
 
     # -- what the operator reads -------------------------------------------

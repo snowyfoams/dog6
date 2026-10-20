@@ -232,6 +232,12 @@ class LawOutput:
     #: The fall hold drove this sweep (`BalanceLaw.fall_hold_deg`): `tau` is
     #: its joint PD, the wrench and the forces are zero -- nothing asked.
     fallen: bool = False
+    #: Touchdown detection (`BalanceLaw.contact_detector`, scheme A): the
+    #: detector's `contact.ContactSnapshot` this sweep -- each leg's state,
+    #: the push it read, the foot clearances, the probe depths.  None when
+    #: no detector is attached or the robot is not trotting.  With one, the
+    #: `contact` and `swing_s` above are the EFFECTIVE ones it handed the law.
+    contact_est: object = None
 
 
 @dataclass
@@ -484,6 +490,21 @@ class BalanceLaw:
     #: reference, the heading, the joint layer's targets and the swing
     #: (walk.py: one reference, every target taken from it).
     walk: object | None = None
+    #: TOUCHDOWN DETECTION, 2026-10-20 (scheme A, contact.py): a
+    #: `contact.ContactDetector`, or None -- the flown law, the clock's word
+    #: for which foot is down.  Attached, every trot sweep's clock sample is
+    #: handed to it BEFORE the height is taken over the stance feet, and
+    #: what comes back is what the law acts on: a foot the swing law's own
+    #: commanded push says has LANDED is in the allocator (its weight ramped
+    #: in from the detection), the joint layer and the walk's anchors from
+    #: that sweep, whatever the clock says; a foot the clock has landed but
+    #: nothing has felt is PROBING -- out of the allocator, its reference the
+    #: arc's end carried down until the floor answers.  The swing law's
+    #: commanded force is reported back to it every swing sweep
+    #: (`observe`), one sweep late by construction.  `hw.fold2_trot` and
+    #: `hw.fold2_walk` attach one by default (`--no-touchdown`); the other
+    #: trots offer `--touchdown`.  [SIM-TUNED, NOT FLOWN]
+    contact_detector: object | None = None
 
     def __post_init__(self) -> None:
         if self.swing not in SWING.SWING_MODES:
@@ -1127,8 +1148,20 @@ class BalanceLaw:
             if tilt > self.fall_hold_deg:
                 self._fall(now, state, tilt)
         if self.q_fall is not None:
+            if self.contact_detector is not None:
+                self.contact_detector.idle()
             return self._fall_output(now, state, clock, started)
         clock_now = None if gait is None else gait.sample(now)
+        det = self.contact_detector
+        if det is not None:
+            if clock_now is None:
+                det.idle()
+            else:
+                # SCHEME A: the clock's sample, overridden leg by leg by what
+                # the swing law's own push said last sweep (contact.py) --
+                # a landed foot into the stance set, an airborne one out of
+                # it -- BEFORE the height is taken over that set.
+                clock_now = det.update(now, state, clock_now, gait)
         if clock_now is not None:
             # THE HEIGHT FROM THE FEET THAT ARE DOWN -- see `state.on_stance`.
             state = STATE.on_stance(state, clock_now.contact, self.srb)
@@ -1233,21 +1266,42 @@ class BalanceLaw:
             for i in np.flatnonzero(swinging):
                 sref = self.walk.swing_ref(int(i), float(swing_s[i]), self,
                                            state, ref, est)
+                if det is not None and det.probing[i]:
+                    # PROBING (contact.py): the clock has landed this foot
+                    # and nothing has felt it -- the arc's end (swing_s is
+                    # 1.0 here) carried down until the floor answers, and
+                    # the leg pushed down along gravity, open loop.
+                    p_pr, v_pr, a_pr = det.probe(int(i), sref.p, sref.v,
+                                                 sref.a, now)
+                    sref = sref._replace(p=p_pr, v=v_pr, a=a_pr)
+                    tau[3 * i:3 * i + 3] += state.jac[i].T @ det.probe_force(
+                        TRQ.gravity_direction_body(state.R))
                 p_swing[i] = sref.p
                 land_w[i] = sref.land_w
+                force = None
                 if self.walk.swing_law == "osc":
                     t_sw, t_ff = SC.swing_osc_torque(
                         state, int(i), sref, wn=self.walk.wn_swing,
                         zeta=self.walk.zeta_swing,
                         inertia=self.walk.ff_inertia)
                 else:
+                    force = SC.swing_impedance_force(
+                        state, int(i), sref, kp=self.walk.kp_swing,
+                        kd=self.walk.kd_swing)
                     t_sw, t_ff = SC.swing_control_torque(
                         state, int(i), sref, kp=self.walk.kp_swing,
                         kd=self.walk.kd_swing, ff=self.walk.swing_ff,
-                        inertia=self.walk.ff_inertia)
+                        inertia=self.walk.ff_inertia, force=force)
                 tau[3 * i:3 * i + 3] += t_sw
                 tau_ff[3 * i:3 * i + 3] = t_ff
                 q_ref[i] = q4[i]
+                if det is not None:
+                    # What the swing law asked of the foot, for next sweep's
+                    # test: the impedance's force as it is, the task-space
+                    # law's through J^T (one 3x3 solve, swing legs only).
+                    det.observe(int(i), force if force is not None else
+                                SWING.solve_jacobian(state.jac[i].T, t_sw),
+                                sref.v, sref.p)
         elif clock_now is not None:
             swinging = ~clock_now.contact
             if self.foot_xy_to is not None:
@@ -1270,7 +1324,18 @@ class BalanceLaw:
                         height=self.swing_height, land_b=land[i])
                     if level is not None:            # `swing_roll`
                         p, v, a = SWING.roll_level(p, v, a, *level)
+                    if det is not None and det.probing[i]:
+                        # PROBING (contact.py), the Cartesian arc only: the
+                        # joint and knee swings below land where they
+                        # lifted and read none of `p`.  The push down along
+                        # gravity goes to every swing law.
+                        p, v, a = det.probe(int(i), p, v, a, now)
+                        tau[3 * i:3 * i + 3] += state.jac[i].T @ det.probe_force(
+                            TRQ.gravity_direction_body(state.R))
                     p_swing[i] = p
+                    v_obs = v                     # the arc's rate, for `observe`
+                    force = None
+                    tau_sw = np.zeros(3)
                     if self.swing == "joint":
                         # z only, abd held: no step destination to go to.
                         # THE ARC STARTS WHERE THE FOOT IS, LATCHED AT LIFTOFF
@@ -1292,8 +1357,9 @@ class BalanceLaw:
                         p_swing[i], v, a = SWING.swing_reference_pva(
                             self._lift_x[i], float(swing_s[i]),
                             gait.swing_duration, height=self.swing_height)
-                        tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
-                            state, i, qj, qdj)
+                        tau_sw = SWING.joint_swing_torque(state, i, qj, qdj)
+                        tau[3 * i:3 * i + 3] += tau_sw
+                        v_obs = None              # not the arc the PD tracks
                     elif self.swing == "knee":
                         # THE SHIN ALONE, IN THE KNEE FRAME -- swing.py, "THE
                         # KNEE SWING".  Latched at liftoff as the joint swing
@@ -1313,15 +1379,21 @@ class BalanceLaw:
                             self._lift_q[i], float(self._knee_amp[i]),
                             float(swing_s[i]), gait.swing_duration)
                         p_swing[i] = HK.foot_position(i, qj)
-                        tau[3 * i:3 * i + 3] += SWING.joint_swing_torque(
+                        tau_sw = SWING.joint_swing_torque(
                             state, i, qj, qdj,
                             kp=(cfg.KP_SWING_KNEE if self.kp_swing_knee is None
                                 else self.kp_swing_knee),
                             kd=(cfg.KD_SWING_KNEE if self.kd_swing_knee is None
                                 else self.kd_swing_knee))
+                        tau[3 * i:3 * i + 3] += tau_sw
+                        v_obs = None              # the bump is not this arc
                     else:
-                        tau[3 * i:3 * i + 3] += SWING.swing_torque(
-                            state, i, p, v, kp=self.kp_swing, kd=self.kd_swing)
+                        force = SWING.swing_force(state, i, p, v,
+                                                  kp=self.kp_swing,
+                                                  kd=self.kd_swing)
+                        tau_sw = SWING.swing_torque(state, i, p, v,
+                                                    force=force)
+                        tau[3 * i:3 * i + 3] += tau_sw
                     if self.swing_ff and self.swing == "knee":
                         # M0 qdd_ref: the bump's own acceleration, knee only.
                         ff = (SWING.JOINT_INERTIA_M0 if self.ff_inertia is None
@@ -1346,6 +1418,15 @@ class BalanceLaw:
                     # q_ref did: pinned at the stance IK, the trip would read
                     # a 40 mm apex as a leg gone wrong.
                     q_ref[i] = q4[i]
+                    if det is not None:
+                        # The swing law's commanded foot force for next
+                        # sweep's test (contact.py): the impedance's as it
+                        # is; a joint PD's through J^T, with no arc rate to
+                        # test the stopped foot against (the push alone).
+                        det.observe(int(i), force if force is not None else
+                                    SWING.solve_jacobian(state.jac[i].T, tau_sw),
+                                    np.full(3, np.nan) if v_obs is None
+                                    else v_obs, p_swing[i])
             self._lift_x[~swinging] = np.nan
             self._lift_q[~swinging] = np.nan
             self._knee_amp[~swinging] = np.nan
@@ -1441,7 +1522,9 @@ class BalanceLaw:
                                     else float(now) - float(est.t)),
                          xy_des=(None if self.xy_des is None
                                  else self.xy_des.copy()),
-                         xy_on=xy is not None, ref=ref, land_w=land_w)
+                         xy_on=xy is not None, ref=ref, land_w=land_w,
+                         contact_est=(None if det is None or clock_now is None
+                                      else det.snapshot()))
 
     def _trip(self, state, allocation, q_ref,
               monitor_residual: bool = True) -> str | None:
@@ -1496,4 +1579,6 @@ class BalanceLaw:
             % (1e3 * self.xy_err_peak, self.xy_acc_peak,
                cfg.MASS * self.xy_acc_peak, self.xy_acc_max),
         ]) + ([] if self.qp is None else ["  " + self.qp.report()])
-            + ([] if self.walk is None else [self.walk.report()]))
+            + ([] if self.walk is None else [self.walk.report()])
+            + ([] if self.contact_detector is None
+               else [self.contact_detector.report()]))

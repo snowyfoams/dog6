@@ -71,6 +71,7 @@ and `r_w` are never spelled the same way.
 | `footstep.py` | walking: eq (33) + Raibert's term for the foothold; the arc in the world (x/y) and the trunk (z). At rest (zero command) the arc is in the trunk frame onto the leg's own site, no velocity term -- hw.fold_trot's in-place target (2026-10-05; `place_at_rest` undoes it) |
 | `swing_control.py` | walking: the swing leg's law — task-space computed torque, or the Cartesian impedance |
 | `walk.py` | walking: ONE reference, and every target taken from it — x/y rows, heading, the joint layer's world-anchored stance targets, the footholds. [doc/walk](../../doc/walk/README.md) |
+| `contact.py` | touchdown detection, **scheme A** (2026-10-20): which foot is DOWN, from the swing law's own commanded push on the floor and the foot's clearance — no sensor. Overrides the clock's sample leg by leg before the height is taken; a late foot PROBES. `hw.fold2_trot` / `hw.fold2_walk` fly it by default. [doc/contact](../../doc/contact/README.md). **Not flown** |
 | `selftest.py` | gates the lot offline |
 
 ## Three things that are exactly zero error at the identity
@@ -469,6 +470,107 @@ Two details that are not cosmetic:
 `SETPOINT_DYNAMIC = False` falls back to the config statics and reproduces
 exactly what DOG5 flew before 2026-08-28.
 
+## Touchdown detection, scheme A: `contact.py` — which foot is down, without a sensor
+
+Until 2026-10-20 a foot was in stance because the clock said so. The
+2026-10-06 walk fell on exactly that: a late FR/RL landing, the clock
+handing the allocator a foot still in the air, the trunk rolling +0.9 → +7.6°
+in 80 ms on the force that foot could not give ([doc/walk](../../doc/walk/README.md)).
+`contact.py` decides it from what the law already has. `hw.fold2_trot` and
+`hw.fold2_walk` attach it by default (`--no-touchdown` is the clock alone);
+every other trot offers `--touchdown`. **[SIM-TUNED, NOT FLOWN]**
+
+**Why not the current.** The drivers run a q-axis current loop (0xA1): iq
+follows the *command* whatever the load, so the floor is not in `tau_meas` —
+`safety.TorqueReadback` reads that field as "did the current loop follow",
+not as a force. The floor is in the **encoders**: the foot stops, the
+reference goes on, and the swing impedance's error — and the force it
+commands — grows. That force, `-[Kp (p_ref − x) + Kd (v_ref − v)]_z`, is
+what the detector reads (`swing_control.swing_impedance_force`,
+`swing.swing_force`; the task-space and joint swings through `J^T`).
+
+**A foot has TOUCHED DOWN** when, for `TD_STREAK` (2) sweeps running:
+
+1. it is on the way down (swing progress ≥ `TD_S_MIN` 0.3) or probing;
+2. **it is where the floor is, and so is its reference**: the foot's
+   clearance above the plane of the planted feet — kinematics, IMU-levelled,
+   `z_origin − r_foot + (R x_b)_z` — is within `TD_CLEAR_MAX` (4 mm), and the
+   swing law's own reference, measured the same way, is within
+   `TD_REF_CLEAR_MAX` (3 mm) of that plane or below it. The second gate is
+   what tells contact from **lag**: the floor can only be what stops a foot
+   once the reference has reached the floor. (The robot's walking swing runs
+   15 / 27 mm off its arc; MuJoCo's hovers at 7–9 mm under a diving
+   reference, 17 N of push against nothing.)
+3. the floor is answering, by either witness: the commanded **push** on the
+   floor is at least `TD_FZ_N` (8 N: Kd_z 40 × the arc's 0.3–0.4 m/s is
+   12–16 N at once on a stopped foot; under the probe 8 N + 80 N/s), or the
+   foot has **stopped** descending (`v_z ≥ −TD_V_STOP`, 0.03 m/s, from the
+   encoders through J) while the reference still descends at
+   `TD_VREF_MIN` (0.10 m/s) or more.
+
+**A foot is STILL AIRBORNE** when the clock's touchdown arrives and nothing
+above has fired. It **PROBES**: out of the allocator (weight 0, contact
+False — no force is asked of a foot that cannot push), out of the height
+average, its reference the arc's end carried straight down at `TD_PROBE_V`
+(0.20 m/s; the planned x/y kept, world-fixed when walking), and the leg
+**pushed down along gravity** by `TD_PROBE_PUSH_N` (10 N), open loop, beside
+the impedance — the clock's "load it anyway" made deliberate, without the
+allocator counting on a foot that is not there — until the floor answers.
+The impedance's Kd brakes the foot against the reference (0.2 + 10/40 =
+0.45 m/s, the arc's own peak descent), and the push is not in what the
+detector reads, so it cannot call its own touchdown. Past `TD_PROBE_MAX`
+(30 mm) the foot is declared down anyway (counted as *gave up*); and when
+the other diagonal is halfway through its liftoff ramp every probe is
+declared down so the allocator is never left with one foot (the walk's
+four-foot window is 120 ms; the probe gets 93 of them, 19 mm).
+
+**What the law does with it**, leg by leg — `ContactDetector.update` hands
+`BalanceLaw.update` a `GaitSample` in the clock's place:
+
+| state | contact | weight in the allocator | swing progress |
+|---|---|---|---|
+| trust (never lifted this trot) | clock's | clock's | clock's |
+| swing | False | 0 | clock's |
+| landed | True | smoothstep from the detection over `TD_RAMP_S` 30 ms, then the clock's liftoff ramp | 0 |
+| probing | False | 0 | 1.0, the arc's end |
+| landed, then lifted past `TD_LIFT_MAX` (8 mm) | → probing again, from its own x/y | 0 | 1.0 |
+
+A landed foot gets the stance torque, the joint layer and (walking) its
+world anchor from that sweep — the clock notwithstanding — and no swing
+torque; a probing foot keeps the swing law on the probe. The state
+estimator's trust reads it too (`hw.trot_esti`): a probing foot has none, a
+landed one is trusted from its detection. Nothing changes for a swing that
+lands when the clock says: the stance set is then the clock's, the load ramp
+30 ms instead of 54.
+
+**A landed foot that leaves the floor** — its clearance past `TD_LIFT_MAX`
+(8 mm, two sweeps) while the clock still has it in stance — has lifted off:
+the trunk is tipping away from it, or what it stood on gave. It goes back to
+probing from where it is: out of the allocator, its own x/y, the reference
+carried down until the floor answers again. MuJoCo found the need (doc/contact):
+a sideways push rolled the trunk, the high side's planted foot rose 10 mm
+with 0 N under it and, still "landed", pulled the planted plane up with it;
+the other foot on that side was then believed landed 8 mm in the air, and
+the next liftoff left the robot on one foot. The plane is now the two
+*lowest* planted feet's, so a lifted foot cannot move it.
+
+**What it cannot see.** A foot resting on a step above the plane (8 mm up)
+is, to the kinematics, a foot hovering 8 mm up — above the clearance gate —
+so it probes and is landed by the two-foot rule ~90 ms on: the price of
+refusing the hover, documented in `selftest` §17. A foot that is down but
+carrying nothing — sliding, or lifted less than 8 mm — is not un-landed:
+whether a foot that is down still carries load is the measured torque's to
+tell (`J^-T (tau_meas − G)`, scheme B), and this is written to be joined by
+it. The force it reads is the request *before* the safety gate's slew and
+clip.
+
+`python -m hw.balance.contact` prints the sizing; the runner's `--td-*`
+flags move every threshold; the status line prints each leg's state and the
+last detection against the clock; the log's `td_*` columns keep it; the
+exit report counts early / late / probed / gave up. `selftest` §17 drives it
+on a kinematic plant — a rolled trunk over a flat floor, a step, a 60 ms
+lag — and [doc/contact](../../doc/contact/README.md) has MuJoCo.
+
 ## What is still open
 
 - **The setpoint statics are DOG5's, unverified on DOG6.**
@@ -481,5 +583,8 @@ exactly what DOG5 flew before 2026-08-28.
 - **Nothing measures whether a foot stayed put.** The cone bounds what the
   allocator *asks* the floor for. The rear-foot slide that ended the
   2026-09-15 runs is still invisible to a law reading joint encoders only.
+  `contact.py` (2026-10-20) says when a foot is DOWN, not whether it stays
+  put: slip and loss of contact are scheme B's, the measured torque through
+  `J^-T`, not yet written.
 - **The handover is still one sweep.** The torque cap ramps over 1.0 s, which
   bounds how hard the new law can push; it does not blend the two laws.

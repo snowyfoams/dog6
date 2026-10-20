@@ -293,20 +293,32 @@ def leg_gains(gains, leg: int) -> np.ndarray:
     return gains[leg] if gains.ndim == 2 else gains
 
 
-def swing_torque(state, leg: int, p_ref, v_ref, kp=None, kd=None) -> np.ndarray:
-    """(3,) the swing impedance for `leg`, from this sweep's encoders.
-
-    Uses the Jacobian `state.read` already computed -- no second chain walk.
-    `kp` / `kd` are (3,) for every leg or (4, 3) a row per leg
-    (`leg_gains`); None is `config.KP_SWING` / `KD_SWING`.
-    """
+def swing_force(state, leg: int, p_ref, v_ref, kp=None, kd=None) -> np.ndarray:
+    """(3,) the swing impedance's commanded foot force for `leg`, TRUNK
+    frame -- what the leg applies to the foot, Kp (p_ref - x) + Kd (v_ref -
+    J qd).  `swing_torque` is J^T of it; `contact.ContactDetector` reads it
+    (scheme A, 2026-10-20): a foot stopped on the floor under a descending
+    reference commands a push DOWN, negative z."""
     kp = leg_gains(cfg.KP_SWING if kp is None else kp, leg)
     kd = leg_gains(cfg.KD_SWING if kd is None else kd, leg)
     jac = state.jac[leg]
     qd = C.unflat(state.qd)[leg]
-    force = (kp * (np.asarray(p_ref, dtype=float) - state.x_b[leg])
-             + kd * (np.asarray(v_ref, dtype=float) - jac @ qd))
-    return jac.T @ force
+    return (kp * (np.asarray(p_ref, dtype=float) - state.x_b[leg])
+            + kd * (np.asarray(v_ref, dtype=float) - jac @ qd))
+
+
+def swing_torque(state, leg: int, p_ref, v_ref, kp=None, kd=None,
+                 force=None) -> np.ndarray:
+    """(3,) the swing impedance for `leg`, from this sweep's encoders.
+
+    Uses the Jacobian `state.read` already computed -- no second chain walk.
+    `kp` / `kd` are (3,) for every leg or (4, 3) a row per leg
+    (`leg_gains`); None is `config.KP_SWING` / `KD_SWING`.  `force` is
+    `swing_force`'s answer if the caller already has it.
+    """
+    if force is None:
+        force = swing_force(state, leg, p_ref, v_ref, kp, kd)
+    return state.jac[leg].T @ force
 
 
 def joint_swing_reference(leg: int, rest_b, progress: float, duration: float,

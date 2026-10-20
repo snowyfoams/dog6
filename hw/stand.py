@@ -236,6 +236,7 @@ from . import realtime as RT         # noqa: E402
 from . import safety as SAFE         # noqa: E402
 from . import velocity_estimator as VEL  # noqa: E402
 from .balance import config as BCFG  # noqa: E402
+from .balance import contact as BCONTACT  # noqa: E402
 from .balance import controller as BCTRL   # noqa: E402
 from .balance import law as BLAW     # noqa: E402
 from .balance import posture as POSE  # noqa: E402
@@ -325,6 +326,13 @@ class StandLog:
         # the trot: NaN outside it.  x_b beside p_swing is the swing error.
         "contact_w": (C.N_LEGS,), "swing_s": (C.N_LEGS,),
         "p_swing": (C.N_LEGS, 3), "x_b": (C.N_LEGS, 3),
+        # touchdown detection (--touchdown, scheme A): each leg's state (0
+        # trust / 1 swing / 2 landed / 3 probe), the push the swing law
+        # commanded on the floor (N), the foot's clearance above the planted
+        # feet's plane (m) and the probe's depth (m).  NaN without it.
+        "td_state": (C.N_LEGS,), "td_fz": (C.N_LEGS,),
+        "td_clear": (C.N_LEGS,), "td_ref": (C.N_LEGS,),
+        "td_probe": (C.N_LEGS,),
         # the state estimator, when one is FED to the law (a trot's --est-xy):
         # the estimate the law read (trunk origin, world), its age, the CoM
         # x/y setpoint the trot holds, and 1 on the sweeps the x/y rows were
@@ -405,6 +413,16 @@ class KeyPoller:
 def _print_phase(stand: StandSequence) -> None:
     print("\n>> phase %d %-6s : %s"
           % (stand.phase, stand.phase_name, phase_blurb(stand)), flush=True)
+
+
+def _td_columns(out) -> dict:
+    """The touchdown detector's four log columns, or nothing."""
+    snap = None if out is None else getattr(out, "contact_est", None)
+    if snap is None:
+        return {}
+    return dict(td_state=np.asarray(snap.state, dtype=float),
+                td_fz=snap.fz_push, td_clear=snap.z_clear, td_ref=snap.z_ref,
+                td_probe=snap.probe)
 
 
 def _torque_lines(tau_cmd, tau_meas) -> str:
@@ -862,6 +880,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                                   or stand.phase_name != "hold"
                                   else stand.com.last.copy()),
                         com_pin=np.array(stand.balance.srb.com_body[:2]),
+                        **_td_columns(out),
                         **({} if not feed or out is None
                            or out.estimate is None else dict(
                                p_est=out.estimate.p_w, v_est=out.estimate.v_w,
@@ -912,6 +931,9 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                               flush=True)
                         print("          " + swing_z.status(
                             stand.balance.swing_height), flush=True)
+                        det = getattr(stand.balance, "contact_detector", None)
+                        if det is not None:
+                            print("          " + det.status(now), flush=True)
                     if not terse:
                         print("          %s  imu %3.0f ms%s%s"
                               % (watch.moment_status(),
@@ -1077,7 +1099,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          stand_xy=None, slide_from: float = None,
          est_xy: bool = None, alloc: str = "qp",
          fall_hold: float = None, kp_joint: float = None,
-         kp_joint_abd: float = None, kp_rise: float = None) -> int:
+         kp_joint_abd: float = None, kp_rise: float = None,
+         touchdown: bool = False) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
     returns to; `dynamic_setpoint` None defers to `config.SETPOINT_DYNAMIC`;
     `only_law` pins the lift law and drops `--law` from the parser.
@@ -1139,6 +1162,14 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     `config.FALL_HOLD_DEG` through `trot.trot_options`; None is off, the
     stands' default -- on their 5 N*m/s slew it whirls the legs, and
     `--fall-hold` is refused below `config.FALL_HOLD_MIN_SLEW_NM_S`.
+
+    `touchdown` is `--touchdown`'s default, TOUCHDOWN DETECTION
+    (`law.BalanceLaw.contact_detector`, scheme A, hw/balance/contact.py):
+    the swing law's own commanded push on the floor, gated by the foot's
+    clearance, decides which foot is down -- a landed foot into the
+    allocator at once, a foot the clock landed but nothing felt out of it
+    and probing down.  Needs a gait.  `hw.fold2_trot` and `hw.fold2_walk`
+    pass True (2026-10-20); every other trot offers the flag, off.
 
     They are arguments rather than flags-only so that `hw.fold_stand` is three
     lines instead of a copy of this parser.
@@ -1386,6 +1417,81 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           help="T steps the gait by HAND, half a cycle a "
                                "press: one diagonal lifts and lands, HOLD by "
                                "itself, and the next T swings the other one")
+        td = ap.add_argument_group(
+            "touchdown detection (scheme A, hw/balance/contact.py)",
+            "which foot is DOWN, from the swing law's own commanded push on "
+            "the floor and the foot's clearance -- no sensor.  A foot that "
+            "has landed goes to the allocator at once, before the clock; a "
+            "foot the clock has landed but nothing has felt stays OUT of it "
+            "and probes down until the floor answers.  `python -m "
+            "hw.balance.contact` prints the sizing.  [SIM-TUNED, NOT FLOWN]")
+        td.add_argument("--touchdown", dest="touchdown", action="store_true",
+                        default=bool(touchdown),
+                        help="ON: the detector overrides the clock's contact "
+                             "set leg by leg (hw.fold2_trot / hw.fold2_walk "
+                             "default)")
+        td.add_argument("--no-touchdown", dest="touchdown",
+                        action="store_false", default=argparse.SUPPRESS,
+                        help="OFF: the clock's word alone, the flown law")
+        td.add_argument("--td-fz", type=float, default=BCFG.TD_FZ_N,
+                        metavar="N",
+                        help="the push the swing law must command on the "
+                             "floor, -(Kp e + Kd e_dot)_z, to call a "
+                             "touchdown")
+        td.add_argument("--td-streak", type=int, default=BCFG.TD_STREAK,
+                        metavar="SWEEPS", help="...for this many sweeps running")
+        td.add_argument("--td-s-min", type=float, default=BCFG.TD_S_MIN,
+                        metavar="FRACTION",
+                        help="swing progress from which the test runs (the "
+                             "liftoff half never counts)")
+        td.add_argument("--td-clear", type=float,
+                        default=1e3 * BCFG.TD_CLEAR_MAX, metavar="MM",
+                        help="the clearance gate: no touchdown is believed "
+                             "with the foot higher than this above the "
+                             "planted feet's plane (IMU-levelled)")
+        td.add_argument("--td-lift", type=float,
+                        default=1e3 * BCFG.TD_LIFT_MAX, metavar="MM",
+                        help="a foot the detector has DOWN that rises past "
+                             "this while the clock has it in stance has "
+                             "lifted off: back to probing from where it is "
+                             "(config.TD_LIFT_MAX)")
+        td.add_argument("--td-ref-clear", type=float,
+                        default=1e3 * BCFG.TD_REF_CLEAR_MAX, metavar="MM",
+                        help="...and the swing law's own REFERENCE must have "
+                             "come within this of that plane, or below it: "
+                             "the floor can only be what stops a foot once "
+                             "the reference has reached the floor (the gate "
+                             "that tells contact from a lagging swing; "
+                             "config.TD_REF_CLEAR_MAX)")
+        td.add_argument("--td-v-stop", type=float, default=BCFG.TD_V_STOP,
+                        metavar="M_S",
+                        help="the second witness: a foot descending slower "
+                             "than this while the reference still descends "
+                             "at --td-vref-min or more has STOPPED on "
+                             "something")
+        td.add_argument("--td-vref-min", type=float,
+                        default=BCFG.TD_VREF_MIN, metavar="M_S")
+        td.add_argument("--td-probe", type=float, default=BCFG.TD_PROBE_V,
+                        metavar="M_S",
+                        help="a foot the clock has landed but nothing has "
+                             "felt PROBES: its reference, the arc's end, "
+                             "descends at this speed, the leg out of the "
+                             "allocator, until the floor answers")
+        td.add_argument("--td-probe-max", type=float,
+                        default=1e3 * BCFG.TD_PROBE_MAX, metavar="MM",
+                        help="...to at most this depth; past it the foot is "
+                             "declared down anyway (counted as `gave up`)")
+        td.add_argument("--td-push", type=float, default=BCFG.TD_PROBE_PUSH_N,
+                        metavar="N",
+                        help="...and is pushed DOWN along gravity by this "
+                             "much, open loop, beside the impedance -- the "
+                             "leg driven to find the floor.  Not in what the "
+                             "detector reads.  0 is the impedance alone "
+                             "(config.TD_PROBE_PUSH_N)")
+        td.add_argument("--td-ramp", type=float, default=1e3 * BCFG.TD_RAMP_S,
+                        metavar="MS",
+                        help="a landed foot's load ramps 0 -> 1 in the "
+                             "allocator over this, from its detection")
         if step_to is not None:
             trot.add_argument("--step-period", type=float,
                               default=(gait.period if step_period is None
@@ -1722,6 +1828,18 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                      "raise --tau-slew knowing what it is"
                      % (knee_plan[0]["slew"], 1e3 * gait.swing_duration, slew,
                         t_fit / (1.0 - gait.duty), 1e3 * t_fit))
+    detector = None
+    if gait is not None and args.touchdown:
+        try:
+            detector = BCONTACT.ContactDetector(
+                fz_td=args.td_fz, streak=args.td_streak, s_min=args.td_s_min,
+                clear_max=1e-3 * args.td_clear, lift_max=1e-3 * args.td_lift,
+                ref_clear_max=1e-3 * args.td_ref_clear, v_stop=args.td_v_stop,
+                vref_min=args.td_vref_min, probe_v=args.td_probe,
+                probe_max=1e-3 * args.td_probe_max,
+                probe_push=args.td_push, ramp_s=1e-3 * args.td_ramp)
+        except ValueError as refusal:
+            ap.error("touchdown detection: %s" % refusal)
     balance = BLAW.BalanceLaw(gains=gains, rise_s=args.rise,
                               h_lift=1e-3 * args.height,
                               gravity_legs_per_sweep=args.gravity_legs,
@@ -1764,6 +1882,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                               **({} if hook is None
                                  or not hasattr(hook, "law_kwargs")
                                  else hook.law_kwargs(args)),
+                              contact_detector=detector,
                               est_xy=xy_loop)
     stand = StandSequence(gate, law=args.law, balance=balance, crouch=crouch,
                           gait=gait, step_to=step_to, step_gait=step_gait,
@@ -1934,6 +2053,18 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   "held, the body free to shift")
         print("       residual trip counts four-foot sweeps only while "
               "trotting")
+        if detector is not None:
+            print("       TOUCHDOWN DETECTION ON (scheme A, hw/balance/contact.py; "
+                  "--no-touchdown is the clock alone):")
+            print("       %s" % detector.describe())
+            print("       a foot it lands goes to the allocator, the joint "
+                  "layer and the walk's anchors from that sweep; a foot the "
+                  "clock lands that it has not felt stays out of the "
+                  "allocator and probes.  The status line reads it; the "
+                  "log's td_* columns keep it.  NOT FLOWN")
+        else:
+            print("       touchdown detection OFF: the clock's word for which "
+                  "foot is down (--touchdown turns scheme A on)")
         if est_xy is not None and not xy_loop:
             print("       x/y LOOP OFF (--no-est-xy): the Kalman filter is "
                   "printed, not fed -- the hold's and the trot's x/y rows "
@@ -2200,6 +2331,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         print("[stand] the trot (%d run%s, the last one below):"
               % (stand.trot_runs, "" if stand.trot_runs == 1 else "s"))
         print(stand.trot.report().replace("  hold  ", "  trot  "))
+        det = getattr(stand.balance, "contact_detector", None)
+        if det is not None:
+            print("[stand] touchdown detection (scheme A), every trot:")
+            print(det.report())
     if stand.com is not None:
         print("[stand] the CoM, measured in each HOLD and applied at T:")
         print(stand.com_report())

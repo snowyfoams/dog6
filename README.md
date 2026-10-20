@@ -151,6 +151,12 @@ written against one reads the other correctly.
       found: horizontal foot forces cannot stop a tip about an edge that
       lies on the floor, so on three feet the vertical spring is what holds
       the trunk up, and the stand's 500 N/m is exactly marginal there.
+- [ ] touchdown detection — `hw/balance/contact.py` (2026-10-20, scheme A):
+      which foot is down, from the swing law's own commanded push and the
+      foot's clearance, no sensor; a late foot probes instead of being loaded
+      in the air. On by default in `hw.fold2_trot` / `hw.fold2_walk`
+      (`--no-touchdown`), gated in `hw.balance.selftest` §17 and in MuJoCo
+      (`doc/contact/`). **Not flown.**
 - [ ] state estimation — the controller is handed ground truth. Everything it
       achieves is an upper bound on what it does behind a real filter.
 - [x] `hw` — assembled, wired and measured: zero, twelve directions,
