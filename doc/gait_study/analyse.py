@@ -322,6 +322,15 @@ class Run:
         self.z_clear = 1e3 * (z - plane[:, None])   # mm, (n, 4)
         zr = self.x_lev[:, :, 2]
         self.z_clear_raw = 1e3 * (zr - plane[:, None] - 1e-3 * self.plane_offset.mean())
+        # THE CLOCK'S OWN ARC: the swing reference `p_swing` (trunk frame,
+        # NaN in stance), levelled and measured against the same plane and
+        # the same per-foot offset -- what the law asked the foot to do,
+        # beside what it did.
+        R = rotations(self.d["roll"][self.sel], self.d["pitch"][self.sel])
+        p_lev = np.einsum("nij,nkj->nki", R, np.nan_to_num(self.p_swing, nan=0.0))
+        z_ref = p_lev[:, :, 2] - 1e-3 * self.plane_offset[None, :]
+        self.z_ref = 1e3 * (z_ref - plane[:, None])
+        self.z_ref[~np.isfinite(self.p_swing[:, :, 2])] = np.nan
 
     # -- per swing -------------------------------------------------------------
     def _swings(self):
@@ -1006,7 +1015,9 @@ def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
         ax.fill_between(cyc[s], -3, ymax, where=sw[s], color=col, alpha=0.9, lw=0,
                         label="clock: %s+%s SWING" % (LEGS[i], LEGS[j]))
     for i, leg in enumerate(LEGS):
-        ax.plot(cyc[s], run.z_clear[s, i], lw=0.9, color=colors[i], label=leg)
+        ax.plot(cyc[s], run.z_ref[s, i], lw=1.2, ls="--", color=colors[i], alpha=0.7,
+                label="%s commanded arc" % leg)
+        ax.plot(cyc[s], run.z_clear[s, i], lw=0.9, color=colors[i], label="%s measured" % leg)
     ax.axhline(CLEAR_MM, color="k", lw=0.6, ls="--", label="4 mm gate")
     ax.axhline(0, color="0.6", lw=0.5)
     if run.t_tip is not None:
@@ -1016,9 +1027,9 @@ def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
     ax.set_xlabel("gait cycle since the trot started (t / period, period %.2f s)" % run.period)
     ax.set_ylabel("foot height above the planted plane, mm")
     ax.grid(axis="x", color="0.9", lw=0.5)
-    ax.legend(fontsize=8, ncol=7, loc="upper right")
-    ax.set_title("%s: the four feet's FK height by gait cycle; shaded = the clock has that "
-                 "diagonal in swing, unshaded = all four in stance" % name)
+    ax.legend(fontsize=7, ncol=6, loc="upper right")
+    ax.set_title("%s: each foot's height by gait cycle -- dashed: the arc the clock commands, "
+                 "solid: the foot (FK); shaded = the clock has that diagonal in swing" % name)
     fig.tight_layout()
     p = os.path.join(out_dir, "%s_10_height_one_axis.png" % name)
     fig.savefig(p, dpi=110)
