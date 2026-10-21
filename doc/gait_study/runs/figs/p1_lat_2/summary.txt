@@ -1,0 +1,46 @@
+== p1_lat_2 ==
+  trot 38.5 s, 48 cycles; period 0.800 s, swing 160 ms, ramp 96 ms; sweep 5.48 ms; no fall hold; TIPPED past 15 deg at 38.3 s, left side down, 41 deg at the end
+  attitude from the setpoint (-0.29 / 0.12 deg): roll mean +1.35  rms 2.83  min -41.07 max +7.71;  pitch mean -0.55 rms 0.67;  tilt max 41.07;  lean max 24.91
+  tilt rms per 10 s: 1.68 2.58 2.26 4.43
+  height mean 159.5 mm (cmd 160.0), min 120.1;  yaw drift +3.51 deg
+  THE IMU AGAINST THE FEET.  Trunk attitude relative to the plane of the four feet (roll, pitch, deg): HOLD -0.13 / -0.02, trot four-foot windows -0.55 / +0.04;  the IMU says HOLD +1.01 / -0.27, trot +1.01 / -0.47.  IMU minus feet: HOLD +1.14 / -0.25, trot +1.56 / -0.50 -- on a flat floor that is the IMU's datum error (mount + statics)
+  levelled foot heights with all four loaded, minus the mean (mm, FL FR RL RR): +3.7 +0.2 -0.2 -3.7 (std 3.2 2.3 2.9 3.9), from 836 four-foot full-weight sweeps of the trot -- subtracted from every clearance below
+  FL  swings  48: apex med  19.7 mm (p10  17.7), scuffed   0 %, liftoff lag med  33 ms, track rms 11.0 mm, end y err med  -0.6 mm | h_td med  8.9 p90 14.0 mm, Phi med 0.02 max 1.60 N s, in air  22 ms med, roll step toward med -0.39 p90 +1.01 deg
+  FR  swings  48: apex med  18.7 mm (p10  16.9), scuffed   0 %, liftoff lag med  44 ms, track rms 10.8 mm, end y err med  -3.1 mm | h_td med 10.3 p90 15.3 mm, Phi med 0.09 max 1.74 N s, in air  27 ms med, roll step toward med +0.01 p90 +1.24 deg
+  RL  swings  48: apex med  19.9 mm (p10  17.4), scuffed   0 %, liftoff lag med  34 ms, track rms 10.5 mm, end y err med  -0.2 mm | h_td med 12.4 p90 17.2 mm, Phi med 0.11 max 1.03 N s, in air  49 ms med, roll step toward med -0.01 p90 +1.38 deg
+  RR  swings  48: apex med  20.5 mm (p10  18.4), scuffed   0 %, liftoff lag med  44 ms, track rms 12.1 mm, end y err med  -3.8 mm | h_td med 14.7 p90 19.1 mm, Phi med 0.23 max 0.97 N s, in air  49 ms med, roll step toward med +0.39 p90 +1.82 deg
+  the ratchet (each foot's landing against its liftoff, over the floor as the planted feet show it): dy mean +2.62 mm per swing -> +126 mm over the run (+2.62 mm per cycle, averaged over the four feet); dx +0.25 mm per swing -> +12 mm.  A real drift that is NOT here moved the planted feet: slip.  Roll at landing minus at liftoff: mean -0.20 deg
+      FL: dy +1.96 mm/swing (levelled, before the trunk's motion +0.60), roll at lo +1.31 at td +0.57
+      FR: dy +1.76 mm/swing (levelled, before the trunk's motion +1.08), roll at lo +1.52 at td +1.87
+      RL: dy +3.47 mm/swing (levelled, before the trunk's motion +2.80), roll at lo +1.52 at td +1.87
+      RR: dy +3.29 mm/swing (levelled, before the trunk's motion +1.93), roll at lo +1.31 at td +0.57
+  stance width front 126.9 -> 122.0 mm (slope -6.74 mm/min), rear 127.9 -> 120.4 (-5.81 mm/min)
+  foot offset from the HOLD site, y (mm, start -> end): FL -1.8->-17.2, FR -0.5->-11.0, RL -3.5->-20.2, RR -4.2->-13.4;  x: FL +7.3->-3.2, FR +4.2->+2.3, RL -2.5->-5.0, RR -9.2->-11.3
+  e_R cycle mean (deg) roll -1.00 -> -0.03 (slope +1.370 deg/min), pitch +0.31 -> +0.73;  commanded moment mean x -0.264 y +0.191 N m (slope x +0.2633 N m/min)
+  two-foot phases 96 (154 ms median).  Moment about the support line, per phase: commanded |median| 0.311 N m, delivered |median| 0.267, and the weight's own toppling moment W d |median| 0.301 -- delivered minus toppling median -0.288 (two feet can make no other).  Roll excursion over a phase median +0.03 deg, |peak| median 1.03
+  torque per amp by joint, first fifth -> last fifth of the trot (abd/pitch/knee): FL 0.70>0.94/0.88>0.81/0.97>0.97  FR 0.71>0.87/0.89>0.86/0.98>0.95  RL 0.75>0.92/0.93>0.95/0.95>0.95  RR 0.78>0.71/0.95>0.85/0.86>0.78
+  load left / right, first fifth -> last fifth: 22.7 / 26.7 -> 26.2 / 23.5 N
+  fz mean per leg (N): FL 11.2 FR 13.0 RL 11.8 RR 13.7;  left 23.0 right 26.7;  f_w y mean per leg (N): +0.14 +0.05 +0.18 +0.12
+  estimator: p_est drift x +4.6 y +195.5 mm over the trot; v_est mean x -7.8 y -7.8 mm/s; x/y rows on 100 % of sweeps; their mean force x +0.16 y +0.51 N; commanded moment mean x -0.224 y +0.179 z -0.025 N m
+  torque per amp, |meas|/|cmd| on planted legs by joint (abd pitch knee): FL 0.86/0.88/0.96  FR 0.88/0.88/0.98  RL 0.89/0.93/0.94  RR 0.86/0.94/0.86
+  peak |tau_cmd| 6.06 N m; slew deficit 0.000 N m s; sweeps at the 9 N m clip 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
