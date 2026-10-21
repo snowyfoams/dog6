@@ -673,7 +673,7 @@ RUN="python -m hw.fold2_walk $B0"
 
 | # | cell, runs | command line | schedule after T (stopwatch) | reads |
 |---|---|---|---|---|
-| 1 | `inplace`, 1 | `$RUN --log gs1_inplace_1.npz` | 120 s in place, T, ENTER | the null distribution of every metric; `τ_td` in place |
+| 1 | `inplace`, 1 | `$RUN --log gs1_inplace_1.npz` | 120 s in place, T, ENTER | the null distribution of every metric; `h_td` and `Φ` in place |
 | 2–5 | `B0_lat`, 4 | `$RUN --log gs1_B0_lat_<rep>.npz` | 5 s in place; the lateral shuttle (A 8 s, D·D 8 s, A·A …) to the fall or 120 s; SPACE; 5 s; T; ENTER | E1-C: `t_fall`, the fall anatomy, `h_td`, `Φ`, `Δφ`, `w_stance` |
 | 6–8 | `B0_latpause`, 3 | `$RUN --log gs1_B0_latpause_<rep>.npz` | 5 s in place; A 8 s, SPACE 10 s, D 8 s, SPACE 10 s, … to the fall or 180 s | E1-B: does the pause reset `w_stance`, `s_land`, `ē_R` |
 | 9–10 | `B0_fwd`, 2 | `$RUN --log gs1_B0_fwd_<rep>.npz` | the forward shuttle (W 8 s, S·S 8 s, …), 120 s | E3: the same metrics at a quarter of the `v_⊥` |
@@ -767,8 +767,8 @@ same check for free on the feet known to be down.
 
 The robot-like plant's swing is *worse* than the robot's (doc/contact §3:
 7–9 mm of a 20 mm arc, 33–40 ms late at DOG5's rotor; the operator calls
-the robot's apex good), so the sim's `τ_td` is an upper bound, not an
-estimate; the sim loop runs at 4 ms where the robot's runs at 5.5; there
+the robot's apex good), so the sim's `h_td` and `Φ` are upper bounds, not
+estimates; the sim loop runs at 4 ms where the robot's runs at 5.5; there
 is no thermal drift, no backlash, no cable loom; and the fall of
 2026-10-06 was *not* reproduced by the model (doc/walk §11.9: "the model
 does not reproduce the robot's lagging swing").  The sim ranks the cells
@@ -778,7 +778,7 @@ and calibrates the instrument; the robot decides.
 
 ### 7.1 Models
 
-- Per-landing responses (`τ_td`, `Φ`, `Δφ`, `e_land`) are nested in runs:
+- Per-landing responses (`h_td`, `Φ`, `Δφ`, `e_land`) are nested in runs:
   run medians and p90s are the unit for cell comparisons (Kruskal–Wallis
   across levels, Mann–Whitney pairwise, bootstrap CIs on the medians);
   within-run Spearman ρ between `Φ_n` and `Δφ_n` for H2's coupling.
@@ -827,7 +827,7 @@ A chapter, *Experimental validation of the time-driven gait on DOG6*:
    the cells labelled, and `Δφ` vs `Φ` within runs; E3's fall rate vs
    `v_⊥` with the matched pair; E4's phase histogram.
 6. **The parameter map** — one table: each gait parameter, its tested
-   range, its effect on `τ_td`, `Φ`, `Δφ` p90 and the fall rate, with CIs;
+   range, its effect on `h_td`, `Φ`, `Δφ` p90 and the fall rate, with CIs;
    the best cell found and its margin to B0.
 7. **Discussion** — the decision table's row that the data landed in, what
    it says about the SRB-PD architecture's limit (a memoryless balance law
