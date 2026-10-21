@@ -1025,6 +1025,35 @@ def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
     plt.close(fig)
     paths.append(p)
 
+    # -- 11. the same shading, roll / pitch / yaw on the axis ------------------------
+    fig, ax = plt.subplots(1, 1, figsize=(14, 5.5))
+    rpy = (run.roll_e, run.pitch_e, run.yaw - run.yaw[0])
+    lim = float(np.nanmax(np.abs(np.concatenate([r[s] for r in rpy])))) * 1.1 + 0.5
+    for (i, j), col in zip(pairs, pair_col):
+        sw = (~run.contact[:, i]) | (~run.contact[:, j])
+        ax.fill_between(cyc[s], -lim, lim, where=sw[s], color=col, alpha=0.9, lw=0,
+                        label="clock: %s+%s SWING" % (LEGS[i], LEGS[j]))
+    for arr, lab, col in zip(rpy, ("roll (from setpoint)", "pitch (from setpoint)",
+                                   "yaw (from the trot's start)"), ("C0", "C1", "C2")):
+        ax.plot(cyc[s], arr[s], lw=0.9, color=col, label=lab)
+    ax.axhline(0, color="0.6", lw=0.5)
+    if run.t_tip is not None:
+        ax.axvline(run.t_tip / run.period, color="k", lw=0.8, ls=":")
+    ax.set_ylim(-lim, lim)
+    ax.set_xlim(c0, c1)
+    ax.set_xlabel("gait cycle since the trot started (t / period, period %.2f s)" % run.period)
+    ax.set_ylabel("deg")
+    ax.grid(axis="x", color="0.9", lw=0.5)
+    ax.legend(fontsize=8, ncol=5, loc="upper right")
+    ax.set_title("%s: roll, pitch, yaw by gait cycle; shaded = the clock has that diagonal "
+                 "in swing (roll > 0: right side down, pitch > 0: nose down, yaw > 0: nose left)"
+                 % name)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "%s_11_rpy_one_axis.png" % name)
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
     # -- 6. torque -------------------------------------------------------------------
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     labels = ["%s %s" % (LEGS[i], j) for i in range(4) for j in ("abd", "pitch", "knee")]
