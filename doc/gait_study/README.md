@@ -50,6 +50,109 @@ Two things found while writing it, both to settle before the first run:
   "Fairly stable" was observed with the governor pressing SPACE; section
   3.1 writes B0 out in full.
 
+## 0. Phase 1 first: the minimal programme, today's configuration only
+
+*Added 2026-10-21 after the operator's reading of the plan: the gait has
+too many knobs to decouple at once, the true touchdown time cannot be
+estimated on this robot, and a fall is the fall hold at 45°.  Phase 1
+varies **nothing**.  It records the configuration flown today, in place,
+sideways and forward, and asks the logs one question: is the failure a
+limit of the architecture — a memoryless SRB-PD on a time-driven clock
+with no contact information — and if so, through which of its limits.
+Sections 1–9 are the extended programme and come after.*
+
+### 0.1 What counts as what
+
+| | definition | from |
+|---|---|---|
+| a **fall** | the fall hold engaging: the log's `phase` reads `fall` (45° from the setpoint, `FALL_HOLD_DEG`); `t_fall` is its first row, the side is the sign of roll there | `phase`, `roll` |
+| a **near-fall** | a governor pause: the law's own flag, replayed offline from roll and pitch through the governor's 1.5 Hz filter (the exit report counts them too) | `roll`, `pitch` |
+| the **attitude** | roll and pitch from the setpoint the law holds (FOLD2 flies the config statics, §1.2); the same from true level kept beside it | `roll`, `pitch` |
+| a foot's **height** `z_clear` | its height above the plane of the two lowest planted feet, IMU-levelled: `z_origin − r_foot + (R x_b)_z` | `x_b`, `roll`, `pitch`, `contact_w` |
+| the **support diagonal** | the line through the two feet the clock has in stance during a two-foot phase; its unit vector `û` and the CoM's offset `d` from it, from those feet's `x_b` and the pin | `x_b`, `contact_w`, `com_pin` |
+
+No touchdown *time* is estimated anywhere.  Everything about contact is
+read as a height or a force at an instant the clock defines.
+
+### 0.2 The argument, in four claims, and the evidence each one needs
+
+| claim | what it says | the evidence, from the log | the figure |
+|---|---|---|---|
+| **A — no authority about the diagonal** (structural) | on two feet the law cannot make the moment it asks about the support line, whatever its gains: forces at two points on a line have no moment about it | `residual` (the wrench the allocator could not deliver) projected on `û` against `b_d[3:6]` projected on `û`, every two-foot sweep: a ratio near 1 is a request that is entirely undeliverable.  Then the roll excursion inside each two-foot phase against the CoM's offset `d` at its start: open-loop growth is a slope near e^{T_sw/τ} = 2.6 at 120 ms, τ = √(h/g) = 0.128 s | residual vs command over one cycle; excursion vs `d` scatter, in place / lateral / forward |
+| **B — no contact information** (structural) | the clock hands the allocator feet that are in the air and lifts feet that are on the floor; the law has no term that could know | per landing: `h_td`, the foot's `z_clear` on the sweep the clock's `contact_w` leaves 0 (a landed foot reads ≈ 0, an airborne one > 4 mm), and `Φ`, the `fz` the allocator asked of it while `z_clear > 4 mm`, integrated; per swing: the apex reached, and whether `z_clear` ever exceeded 4 mm (a **scuffed** swing); and the roll step `Δφ` across the 80 ms after the landing | `h_td` histograms by leg and by side; `Φ` against `Δφ`; scuffed fraction in place / lateral / forward |
+| **C — why A/D** (geometry) | a lateral command crosses the diagonal 3.4× faster than a forward one (§1.4) | the same A and B quantities, lateral against forward at the same 0.06 m/s | roll excursion per two-foot phase, lateral vs forward |
+| **D — does it accumulate** (the operator's hypothesis) | a state drifts with the distance walked and the memoryless PD follows it | per cycle: each foot's mid-stance x/y against its HOLD site, the stance width, the cycle mean of `e_R` and of the commanded moment, the estimator's `xy_des − p_est`; against time, with the pauses marked | the four trends with pause boundaries; continuous shuttle against shuttle-with-pauses |
+
+How the claims close the argument.  A and B are facts of the architecture
+if the data show them: a null space of the grasp map and a contact set
+the law cannot observe are not gains.  D decides *which* limit the
+failure runs through: a trend that a pause resets says the stance drifts
+and nothing re-centres it while walking (no integrator, no re-centring
+term); a flat trend with sudden falls says the failure is a per-step
+event — B, amplified by A, placed by C — and the clock's "load it anyway"
+is the trigger.  Both readings end at the same sentence: **the gait
+parameters move the size of the mistiming and the length of the fall, not
+their existence**; the exit is contact information and a planning term,
+which the SRB-PD does not have.  One contrast after phase 1 (section 0.4)
+confirms the link the data chose.
+
+### 0.3 Phase 1: thirteen runs, one session, today's line unchanged
+
+```
+python -m hw.fold2_walk --duty 0.8 --contact-ramp 0.15 --tau-slew 300 \
+    --kp-joint 4 --kp-joint-abd 5 --log p1_<kind>_<n>.npz
+```
+
+The governor stays on, as flown (its pauses are the near-falls above).
+HOLD still ≥ 2 s so `--com-auto` reads the CoM; the notice at T goes on
+the run sheet.  5 s in place after T before any key.  The lateral command
+is the shuttle of §4 E1: A 8 s, D twice in quick succession, 8 s, A twice,
+… so the robot stays within ±0.5 m; forward likewise with W and S.
+
+| kind | n | after T | to | answers |
+|---|---|---|---|---|
+| `inplace` | 2 | nothing | 120 s | the null of every quantity: `h_td`, `Φ`, scuffs, the residual, the trends, in place |
+| `lat` | 5 | the lateral shuttle | the fall, or 120 s then SPACE | A, B, C, D (continuous) |
+| `fwd` | 3 | the forward shuttle | 120 s then SPACE | C: the same quantities at a quarter of the crossing speed |
+| `latpause` | 3 | A 8 s, SPACE 10 s, D 8 s, SPACE 10 s, … | the fall, or 180 s | D: does ten seconds of the at-rest trot reset the trends |
+
+Then T, ENTER.  ≥ 3 min between runs; the order interleaved (in place,
+lat, fwd, latpause, lat, …) so no kind is always the warmer robot.
+
+**The run sheet**, one row a run: the file name; the full command line;
+the banner's gait and swing lines; the CoM notice at T (read x/y, spread,
+applied or not); each key and SPACE with its stopwatch time; what
+happened (a fall and its side, the fall hold, a bus gap, anything seen —
+a scuff, a leg not lifting, a lean); the exit report's `law timing`,
+`walk … touchdowns anchored, leash acted on … sweeps`, `swing foot apex …
+reached`, `xy … refused` and the governor's line.  The npz keeps no
+arguments; the sheet is the record.
+
+**The data, as a list.**  From each npz: `t`, `phase`, `roll`, `pitch`,
+`contact_w`, `swing_s`, `x_b`, `p_swing`, `fz`, `residual`, `b_d`, `e_R`,
+`q`, `tau_req`, `tau_cmd`, `tau_meas`, `xy_des`, `p_est`, `com_pin`,
+`com_meas`.  Derived offline, by the script of §9: `z_clear`, `h_td`, `Φ`,
+`Δφ`, the apex and the scuffs, the residual and command projections on
+`û`, `d` and the excursion per two-foot phase, the site offsets and the
+stance width per cycle, the cycle means of `e_R` and the moment, the
+estimator error, the governor's lean replayed, `fell` and `t_fall`.  Two
+rules: velocities are differentiated from `q` or `x_b` (the log's `qd`
+column is one row repeated) and every duration is from `t` (the loop runs
+~5.5 ms a sweep, not 4).
+
+### 0.4 The one contrast after phase 1
+
+Chosen by the data, six runs, the lateral shuttle only: if B is the link
+(airborne feet loaded, `Φ` tracking `Δφ`), the contact ramp at its
+ceiling, `--contact-ramp 0.1875`, which lowers the load asked of a late
+foot from 0.58 to 0.41 of its share at a 40 ms lag (§1.3) and changes
+nothing else; if A/C is the link (the excursion about the diagonal), duty
+0.70, which lengthens the two-foot phase from 120 to 180 ms and should make
+the excursion worse by the ratio 4.1/2.6.  A contrast that moves the
+quantity in the predicted direction *and still falls* is the thesis's
+sentence above with a number on it; one that removes the falls is a
+result the thesis reports as such.
+
 ## 1. The observations, and three mechanisms that would produce them
 
 ### 1.1 What the operator sees
@@ -130,8 +233,10 @@ parameters that move the lag are the swing duration, the apex, the gate's
 slew and the swing law's damping, and the parameters that move the load
 asked at a given lag are the ramp and the duty.  **H2 predicts that falls
 track the product — the "phantom impulse" of section 2 — whichever knob
-sets it.**  In MuJoCo the lag was 39–62 ms (doc/contact §5, `late`); on the
-robot it has never been measured, and measuring it is E0.
+sets it.**  In MuJoCo the lag was 39–62 ms (doc/contact §5, `late`).  On
+the robot the lag itself cannot be measured without a sensor; what can
+is the foot's height when the clock loads it (`h_td`) and the force it is
+then asked for (`Φ`), both in §2, and measuring those is E0.
 
 ### 1.4 H3 — a lateral command crosses the support diagonal
 
@@ -180,7 +285,7 @@ that lowers the margin with each step walked.  What distinguishes them is
 | hazard of a fall over time at constant command | **rising** (Weibull shape > 1) | constant per step (memoryless, shape ≈ 1) | constant per step |
 | a SPACE pause of a few cycles | resets it | changes nothing about the next landing | changes nothing |
 | the gait parameter that helps most | none; the foothold's noise and the joint layer | ramp ↑, slew ↑, swing Kd_z ↑, apex ↓ | duty ↑ (shorter two-foot phase), `k_v` ↑ |
-| the pre-fall signature in the log | stance width / site offsets trending for seconds | an asymmetric landing (low side early, high side late) 1–3 cycles before | the first landing after the command, at the phase where the CoM is farthest across |
+| the pre-fall signature in the log | stance width / site offsets trending for seconds | a side-asymmetric landing height 1–3 cycles before: the low-side foot already at the floor when the clock lands it (`h_td` ≈ 0, a scuffed swing), the high-side foot still above it and loaded (`h_td` > 4 mm, `Φ` > 0) | the first landing after the command, at the phase where the CoM is farthest across |
 | direction dependence | weak | via the roll coupling of §1.3 step 3 only | strong, and collapses onto `v_⊥` |
 
 ## 2. The metrics, all from the existing log
@@ -196,10 +301,10 @@ analysis script of §9; nothing on the robot changes.
 | # | tier | quantity | one line | unit | per | tests |
 |---|---|---|---|---|---|---|
 | 1 | 1 | **attitude** | roll and pitch from the setpoint; tilt = max(\|roll\|, \|pitch\|); its rms per 10 s, its peak, the governor's 1.5 Hz lean replayed | deg | sweep → window | all |
-| 2 | 1 | **outcome** | fell (tilt from the setpoint > 15° before the fall hold), the stopwatch time and the side; the number of landings before it | — | run | all |
+| 2 | 1 | **outcome** | fell: the fall hold engaged (`phase` reads `fall`, 45° from the setpoint); `t_fall`, the side, the number of landings before it; governor pauses as the near-falls | — | run | all |
 | 3 | 1 | **real swing height** | `z_clear`: each foot's height above the plane of the planted feet, IMU-levelled; per swing its apex against the 20 mm asked, and whether it ever cleared 4 mm (a **scuffed** swing) | mm | sweep → swing | O3, O4, H2 |
 | 4 | 1 | **swing tracking error** | `p_swing − x_b` per axis; its rms over the swing and its lateral value at the end of the arc (the fall's 24–27 mm) | mm | swing | O3, H2/H3 |
-| 5 | 2 | **touchdown lag `τ_td`** | the floor's touchdown minus the clock's, per landing; + late, − early | ms | landing | **H2** |
+| 5 | 2 | **height at the clock's touchdown `h_td`** | the foot's `z_clear` on the sweep the clock lands it: ≈ 0 for a foot already down, > 4 mm for one still in the air.  No touchdown *time* is estimated | mm | landing | **H2** |
 | 6 | 2 | **phantom impulse `Φ`** | the normal force the allocator asked of a foot while it was still above 4 mm, integrated | N·s | landing | **H2** |
 | 7 | 2 | **roll step `Δφ`** | the roll change across the 80 ms after each landing, signed toward the landing foot's side | deg | landing | H2, H3 |
 | 8 | 2 | **liftoff lag `τ_lo`** | the clock's liftoff to the foot clearing 4 mm; ∞ if it never does | ms | swing | O4, H2 |
@@ -207,17 +312,16 @@ analysis script of §9; nothing on the robot changes.
 | 10 | 3 | **attitude bias** | the cycle mean of `e_R` and of the commanded moment: what "PD error" would be if it grew | deg, N·m | cycle | H1 |
 | 11 | 3 | **estimator** | `xy_des − (p_est + R c)`, the fraction of sweeps at the 1 m/s² clamp, `p_est`'s drift per leg of the shuttle | mm | cycle | H1 |
 | 12 | 3 | **torque** | the swing joints' request the slew did not pass; sweeps at the 9 N·m clip; `Σ\|tau_meas\| / Σ\|tau_cmd\|` on the planted legs as the thermal proxy | N·m·s, count, — | cycle | H2, E5 |
+| 13 | 2 | **undeliverable moment** | the allocator's `residual` projected on the support diagonal, against the commanded moment's projection, every two-foot sweep; and the roll excursion per two-foot phase against the CoM's offset from the diagonal at its start | N·m, deg | sweep → two-foot phase | claim A (§0.2) |
 
-Three definitions have to be fixed before the first log is read, and are
-fixed here: the **attitude reference** is the setpoint the law holds
-(FOLD2 flies the config statics, §1.2), with roll and pitch from true level
-kept beside it; the **floor plane** for `z_clear` is the two lowest planted
-feet's (the reverted detector's rule, so a planted foot lifted by a roll
-cannot raise it); and the **touchdown instant** without a sensor is
-§2.1's two-witness rule — the foot within 4 mm of the plane and stopped
-while the arc still descends, or the swing impedance commanding 8 N or
-more of push — calibrated against MuJoCo's contact truth (§6.3) before any
-robot number is quoted.
+Three definitions are fixed before the first log is read (§0.1): the
+**attitude reference** is the setpoint the law holds (FOLD2 flies the
+config statics, §1.2), with roll and pitch from true level kept beside it;
+the **floor plane** for `z_clear` is the two lowest planted feet's (the
+reverted detector's rule, so a planted foot lifted by a roll cannot raise
+it); and a **fall** is the fall hold engaging.  No touchdown instant is
+estimated: contact is read as a height (`h_td`) and a force (`Φ`) at the
+instants the clock defines.
 
 `hw.stand --log` writes one row per sweep (`StandLog.FIELDS`): `t`,
 `phase`, `roll/pitch/yaw`, `omega_b`, `b_d`, `e_R`, `fz`, `f_w`, `q`,
@@ -242,7 +346,9 @@ known defects shape what can be computed:
 | symbol | definition | columns | tests |
 |---|---|---|---|
 | `z_clear,i` | the foot's clearance above the plane of the two lowest *planted* feet, IMU-levelled: `z_origin − r_foot + (R x_b,i)_z` with `z_origin` from the planted feet (`hw.stand.SwingHeight`'s number, the detector's `z_clear`) | `x_b`, `roll`, `pitch`, `contact_w` | — |
-| **`τ_td`** (touchdown lag) | `t_td,actual − t_td,clock`; + late, − early.  `t_td,clock` is where `contact_w` leaves 0; `t_td,actual` is the first sweep after `s ≥ 0.3` on which **either** `z_clear < 4 mm` and the foot has stopped descending (`ż_clear ≥ −0.03 m/s`) while the arc still descends, **or** the swing impedance's commanded push `f_push = −[Kp (p_swing − x_b) + Kd (ṗ_swing − ẋ_b)]_z ≥ 8 N` — the reverted detector's three-condition test (`6f51e56`, contact.py), run offline with hindsight.  Thresholds are `config.TD_*`'s of that commit; E0 and the sim calibrate them (§6.3) | `x_b`, `p_swing`, `swing_s`, `contact_w`, `roll`, `pitch` | H2 |
+| **`h_td`** (height at the clock's touchdown) | `z_clear,i` on the sweep where `contact_w,i` leaves 0.  A foot that is down reads within the kinematics' noise of 0; one still in the air reads its real height; one that landed early reads 0 *and* its swing was scuffed (§2.2).  Side-asymmetry of `h_td` across a landing pair is the rolled-trunk signature of §1.3 step 3 | `x_b`, `contact_w`, `roll`, `pitch` | H2 |
+| `M_⊥` (undeliverable moment) | on every two-foot sweep, `residual[3:6] · û` against `b_d[3:6] · û`, `û` the unit vector of the support diagonal from the two stance feet's `x_b`; the per-phase ratio of the two | `residual`, `b_d`, `x_b`, `contact_w` | claim A |
+| `d`, `Δφ_phase` (the diagonal's open loop) | the CoM's signed offset from the support line at the two-foot phase's first sweep (the pin `com_pin` with the SRB's z, through `R`, against the line through the two stance feet), and the roll excursion from that sweep to the phase's last | `x_b`, `contact_w`, `com_pin`, `roll` | claim A, C |
 | **`Φ_i,n`** (phantom impulse) | `∫ fz_i dt` over the sweeps where `contact_w,i > 0` and `z_clear,i > 4 mm` — the normal force the allocator asked of a foot that was in the air, N·s | `fz`, `contact_w`, `x_b`, `roll`, `pitch` | H2 |
 | `Δφ_n` (roll step) | `roll(t_td + 80 ms) − roll(t_td − 10 ms)` across the landing, signed toward the landing foot's side (the 2026-10-06 signature was +6.7° in 80 ms) | `roll`, `contact_w` | H2, H3 |
 | `e_land,i` | the landing's trunk-frame x/y against the plan: `x_b,i` at `t_td,actual` minus `p_swing,i` on the arc's last sweep; its lateral part is the "24–27 mm to the right" of the fall | `x_b`, `p_swing` | H2, H3 |
@@ -272,10 +378,12 @@ known defects shape what can be computed:
 
 ### 2.4 Per run
 
-`fell` (tilt from the setpoint past 15°, `hwsim.trot_metrics`' rule, before
-the fall hold at 45°), `t_fall` (s of command before it), `t_tilt15`, the
-number of landings before the fall, peak torque, the fraction of swings
-scuffed, and the per-landing distributions above as median / p90.
+`fell` (the fall hold engaged: `phase` reads `fall`), `t_fall` (s of command
+before it) and the side, the governor's pauses (replayed) and `t_tilt15`
+as the near-falls, the number of landings before the fall, peak torque,
+the fraction of swings scuffed, and the per-landing distributions above
+as median / p90.  (`hwsim.trot_metrics` calls 15° a fall; on the robot the
+fall is the fall hold, and 15° is kept as a near-fall count.)
 
 ## 3. The factors
 
@@ -307,8 +415,10 @@ observed**: a walk that leans past 5° is paused by the law before the
 operator sees it fall, so "fairly stable" is B0 *with* the governor
 pressing SPACE, and its exit report (`governor N pauses, … s paused, lean
 peak …`) is the one number from today's runs that says how often it did.
-The hypothesis runs therefore fly `--pause-lean 0` and the governor's
-contribution is measured as its own cell (§5.4).  **The CoM reading is a
+Phase 1 (§0) keeps it on, as flown: its pauses are events in their own
+right — the law's own near-fall flag, replayable offline from roll and
+pitch through its 1.5 Hz filter — and the fall hold is the fall criterion;
+a `--pause-lean 0` cell (§5.4) measures what it contributes.  **The CoM reading is a
 covariate** (§3.3): the notice at T (read x/y, spread, applied or NOT
 APPLIED) goes on every run sheet, and the log's `com_meas` / `com_pin`
 columns keep it.
@@ -352,7 +462,7 @@ the x/y loop (9/6, 1 m/s²), the leash 30 mm, `STEP_MAX_XY`,
 | the operator | key timing, burst length, the SPACE | a fixed schedule read aloud from a stopwatch for now; the scripted schedule of §9 as soon as it exists |
 | the floor patch | the latched setpoint holds the slope of the patch the robot limped on | the same start mark and heading every run; W/S and A/D bursts in both senses (S after W, D after A) so the robot stays on the patch |
 | the IMU's age and the sweep time | an attitude 40 ms old is the roll gains' stability limit (hw/balance/README) | `imu_age` and the sweep interval from `t` are per-run covariates; a run with `imu_age` p95 > 30 ms or sweeps > 7 ms is excluded |
-| the detector thresholds (offline) | an offline touchdown estimate that is wrong makes H2 untestable | calibrated against MuJoCo's `foot_fn` truth on the same plant family (§6.3) before any robot log is read |
+| the 4 mm gate on `z_clear` (offline) | `h_td`, `Φ` and the scuffs all read "down" as `z_clear < 4 mm`; if the kinematics' noise crosses it, B is measured with a biased instrument | checked against MuJoCo's `foot_fn` truth on the same plant family (§6.3) before any robot log is read; the robot's own in-place null (two feet known to be down read what) |
 
 ## 4. The experiments
 
@@ -364,20 +474,20 @@ written down first: `fold2_walk_2.npz` (17 min, the fall at 629 s), the
 2026-10-20 runs (impedance, no settle) and the 2026-10-21 trot that would
 not run with the detector.
 
-*What it produces.*  For the 2026-10-06 fall: `τ_td` for every landing of
+*What it produces.*  For the 2026-10-06 fall: `h_td` for every landing of
 the last 10 cycles, `Φ`, `Δφ`, `e_land` and `w_stance` against time, the
 scuffed-swing fraction per 30 s of the whole walk, `ē_R` and `M̄` per cycle
 over the 413 s in place and over each commanded burst, the hazard of the
 five SPACE moments.  For the in-place trot: the same, as the null
 distribution every walking metric is compared against.
 
-*Reads.*  H2 predicts `τ_td` asymmetric by side in the three cycles before
+*Reads.*  H2 predicts `h_td` asymmetric by side in the three cycles before
 the fall and `Φ` on the FR/RL pair; H1 predicts `w_stance` or `s_land`
 trending over the 4 s of A, and the 413 s in place flat; H3 predicts the
 first large `Δφ` at the landing where the CoM is farthest across the
-diagonal.  If `τ_td`'s median in place is already past the ramp duration,
-the robot's clock is loading every foot in the air and H2 is live before
-any walking is commanded.
+diagonal.  If `h_td` is already above 4 mm and `Φ` non-zero in place, the
+robot's clock is loading feet in the air before any walking is commanded,
+and H2 is live from the first swing.
 
 ### E1 — Time structure: does anything accumulate, and does a pause reset it
 
@@ -441,7 +551,7 @@ the spring.
 About 200 robot runs at 2–3 min each (B0 is shared across the cells);
 §5.3 says how to cut it to the first hundred without losing the decision.
 
-*Responses.*  Per landing `τ_td`, `Φ`, `Δφ`; per run `fell`, `t_fall`, the
+*Responses.*  Per landing `h_td`, `Φ`, `Δφ`; per run `fell`, `t_fall`, the
 scuffed fraction, `H_reached`.
 
 *Reads.*  Under H2 the roll step per landing and the fall rate are a
@@ -449,7 +559,7 @@ function of `Φ` across *all* cells (Spearman ρ between cell-median `Φ` and
 fall rate, and within-run between `Φ_n` and `Δφ_n`): the slew and the Kd_z
 cells lower `Φ` by lowering the lag, the ramp cells by lowering the load,
 and all three lower the falls in proportion.  The duty cell is the
-discriminator: if 0.80 wins *despite* a larger `τ_td` and `Φ`, the
+discriminator: if 0.80 wins *despite* a larger `h_td` and `Φ`, the
 two-foot phase length matters more than the mistiming (H3); if 0.70 wins
 with the smaller `Φ`, H2.  The apex cell tests §1.3 step 3 directly: 30 mm
 should cut the early landings on the low side and add lag on the high
@@ -467,8 +577,8 @@ N = 6 each, and one cell with `STEP_MAX_XY`'s y at 60 mm.
 the label.  Under H3 the points collapse onto one curve and the matched
 pair agrees; `k_v` 0.13 moves the A/D points down and the W/S points not
 at all.  Under H2 the A/D points sit above the curve at the same `v_⊥`
-*because* their `τ_td` is more asymmetric (the roll coupling), and `k_v`
-does nothing to `τ_td`.  Under H1 the fall rate follows the distance,
+*because* their `h_td` is more side-asymmetric (the roll coupling), and
+`k_v` does nothing to `h_td`.  Under H1 the fall rate follows the distance,
 i.e. the speed, with no direction structure.
 
 ### E4 — The gait phase at the command
@@ -495,8 +605,9 @@ applied is repeated), the floor row (one cell re-run on a second patch).
 
 ### 5.1 One run
 
-1. `hw.fold2_walk --log gs_<cell>_<cmd>_<rep>.npz <the cell's flags>
-   --pause-lean 0`, from the same start mark, the same heading.  The
+1. `hw.fold2_walk --log gs_<cell>_<cmd>_<rep>.npz <the cell's flags>`,
+   from the same start mark, the same heading; the governor on, as flown
+   (phase 1, §0.3), `--pause-lean 0` only in the cell that measures it.  The
    banner is photographed or copied into the run sheet (the npz carries no
    arguments — §9).
 2. Limp, settle, crouch, rise; **HOLD still for ≥ 2 s** so `--com-auto`
@@ -527,13 +638,13 @@ read not applied, a bus gap, or a press outside its window by > 1 s.
 With a fall rate of 5/8 against 1/8 Fisher's exact test gives a one-sided
 p ≈ 0.06 (two-sided ≈ 0.12), so binary outcomes need N = 8 per cell for
 the key comparisons and a directional hypothesis stated in advance; the
-continuous responses (`τ_td`, `Φ`, `Δφ`, ~50 landings a run) separate
+continuous responses (`h_td`, `Φ`, `Δφ`, ~50 landings a run) separate
 cells at N = 4–6.  The decision does not need all 250 runs of E2.  The
 first hundred, in order:
 
 | # | runs | what it settles |
 |---|---|---|
-| 1 | E0 | the metrics, and whether `τ_td` is already past the ramp in place |
+| 1 | E0 | the metrics, and whether feet are already loaded in the air in place (`h_td`, `Φ`) |
 | 2 | E1-C and E1-B (16) | accumulation vs memoryless; the pause |
 | 3 | E2 slew (32) | the lag knob alone |
 | 4 | E2 ramp (32) | the load knob alone |
@@ -550,19 +661,23 @@ the first three E2 cells — the ones that move the touchdown lag and the
 load separately.  Every line below is a complete command; `<cell>` and
 `<rep>` go into the file name because the npz does not keep the arguments.
 
+*Superseded for the first session by phase 1 (§0.3): runs 1–10 below are
+phase 1's thirteen, the governor on; the cells from run 11 on are the
+extended programme and come after phase 1 has been read.*
+
 ```
 # the common part of every run (the 2026-10-21 line; T = 0.6 s is fold2_trot's default)
 B0="--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --kp-joint 4 --kp-joint-abd 5"
-RUN="python -m hw.fold2_walk $B0 --pause-lean 0"
+RUN="python -m hw.fold2_walk $B0"
 ```
 
 | # | cell, runs | command line | schedule after T (stopwatch) | reads |
 |---|---|---|---|---|
 | 1 | `inplace`, 1 | `$RUN --log gs1_inplace_1.npz` | 120 s in place, T, ENTER | the null distribution of every metric; `τ_td` in place |
-| 2–5 | `B0_lat`, 4 | `$RUN --log gs1_B0_lat_<rep>.npz` | 5 s in place; the lateral shuttle (A 8 s, D·D 8 s, A·A …) to the fall or 120 s; SPACE; 5 s; T; ENTER | E1-C: `t_fall`, the fall anatomy, `τ_td`, `Φ`, `Δφ`, `w_stance` |
+| 2–5 | `B0_lat`, 4 | `$RUN --log gs1_B0_lat_<rep>.npz` | 5 s in place; the lateral shuttle (A 8 s, D·D 8 s, A·A …) to the fall or 120 s; SPACE; 5 s; T; ENTER | E1-C: `t_fall`, the fall anatomy, `h_td`, `Φ`, `Δφ`, `w_stance` |
 | 6–8 | `B0_latpause`, 3 | `$RUN --log gs1_B0_latpause_<rep>.npz` | 5 s in place; A 8 s, SPACE 10 s, D 8 s, SPACE 10 s, … to the fall or 180 s | E1-B: does the pause reset `w_stance`, `s_land`, `ē_R` |
 | 9–10 | `B0_fwd`, 2 | `$RUN --log gs1_B0_fwd_<rep>.npz` | the forward shuttle (W 8 s, S·S 8 s, …), 120 s | E3: the same metrics at a quarter of the `v_⊥` |
-| 11–12 | `B0gov_lat`, 2 | `python -m hw.fold2_walk $B0 --log gs1_B0gov_lat_<rep>.npz` | the lateral shuttle, 120 s | today's configuration as flown: the governor's pauses and paused seconds from the exit report, against runs 2–5 |
+| 11–12 | `B0nogov_lat`, 2 | `$RUN --pause-lean 0 --log gs1_B0nogov_lat_<rep>.npz` | the lateral shuttle, 120 s | the governor off: the same shuttle with nothing pausing it, against runs 2–5 — what the governor was contributing |
 | 13–15 | `slew120_lat`, 3 | `$RUN --tau-slew 120 --log gs1_slew120_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the lag knob alone |
 | 16–18 | `ramp1875_lat`, 3 | `$RUN --contact-ramp 0.1875 --log gs1_ramp1875_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the load knob, the ceiling |
 | 19–21 | `ramp075_lat`, 3 | `$RUN --contact-ramp 0.075 --log gs1_ramp075_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the load knob, half |
@@ -590,7 +705,7 @@ exists:
 
 **What Session 1 yields once the analysis script (§9, item 1) exists**:
 the fall-anatomy timeline of every fall (roll, `contact_w`, `z_clear` and
-`fz` of the four legs over the last 1.5 s); the `τ_td` distribution per
+`fz` of the four legs over the last 1.5 s); the `h_td` distribution per
 leg for B0 in place, lateral and forward, and for the slew, ramp and duty
 cells beside it; `Φ` against `Δφ` within every run; `w_stance` and the
 site offsets against time with the pause boundaries marked; the count of
@@ -601,8 +716,9 @@ section for the baseline, and the first test of H1 (the pause rows), H2
 
 ### 5.5 Safety
 
-Governor off is a decision to *observe* the failure; the fall hold at 45°
-(the joint PD at 5/0.2 + gravity, every fall in MuJoCo settled within
+Phase 1 keeps the governor on, as flown; a `--pause-lean 0` cell is a
+decision to *observe* the failure unmasked.  Either way the fall hold at
+45° (the joint PD at 5/0.2 + gravity, every fall in MuJoCo settled within
 1.8° of the stand, hw/balance/README) is what protects the robot and it
 stays on.  Bursts are bounded (30 s) in E2–E3; only E1 runs to the fall.
 A session ends on any bus gap, any driver over-temperature flag (0x9A), or
@@ -632,19 +748,20 @@ afternoon.  Two things it answers that the robot cannot cheaply:
 
 - the full factor map with the phase controlled, so the robot's hundred
   runs are spent on the cells the sim ranks as decisive;
-- `τ_td` and `Φ` against the floor's truth (`foot_fn`), which is §6.3.
+- `h_td` and `Φ` against the floor's truth (`foot_fn`), which is §6.3.
 
-### 6.3 Calibrating the offline touchdown estimate
+### 6.3 Checking the 4 mm gate against the floor's truth
 
-On every sim run the offline estimator of §2.1 is computed from the same
-columns the robot log has (`x_b`, `p_swing`, `swing_s`, `contact_w`, roll,
-pitch — the sim logs them) and compared with `foot_fn`'s first newton: its
-median and p90 error, its false-early rate, per plant and per cell.  The
-thresholds (4 mm, 8 N, 0.03 m/s, s ≥ 0.3) are moved until the false-early
-rate is under 5 % on both plants and the p90 error under 15 ms; those are
-the thresholds the robot logs are then read with, and their sim error is
-quoted beside every robot `τ_td` in the thesis.  Without this step H2 is
-tested with an instrument of unknown accuracy.
+`h_td`, `Φ` and the scuffs all read "down" as `z_clear < 4 mm`, from the
+kinematics and the IMU.  On every sim run `z_clear` is computed from the
+same columns the robot log has (`x_b`, `contact_w`, roll, pitch — the sim
+logs them) and compared with `foot_fn`: the fraction of sweeps with
+`foot_fn ≥ 1 N` that read above 4 mm (a loaded foot called airborne) and
+the fraction with `foot_fn = 0` that read below it (an airborne foot
+called down), per plant and per cell.  If either is above a few percent
+the gate moves, and the sim's two numbers are quoted beside every robot
+`h_td` and `Φ` in the thesis.  On the robot the in-place run gives the
+same check for free on the feet known to be down.
 
 ### 6.4 What the sim will not settle
 
@@ -680,11 +797,11 @@ and calibrates the instrument; the robot decides.
 
 | pattern of results | supports | what the controller needs next |
 |---|---|---|
-| Weibull k ≈ 1; E1-B bursts start fresh; no trend in `w_stance`, `ē_R`; falls track `Φ` across the slew/ramp/Kd_z cells; the pre-fall landings are side-asymmetric in `τ_td` | **H2** | contact-driven loading: the clock's touchdown replaced or gated by a detected one (the reverted scheme A re-tried from E0's robot numbers, or a measured-torque witness), and the ramp at its ceiling meanwhile |
+| Weibull k ≈ 1; E1-B bursts start fresh; no trend in `w_stance`, `ē_R`; falls track `Φ` across the slew/ramp/Kd_z cells; the pre-fall landings are side-asymmetric in `h_td` | **H2** | contact-driven loading: the clock's touchdown replaced or gated by a detected one (the reverted scheme A re-tried from E0's robot numbers, or a measured-torque witness), and the ramp at its ceiling meanwhile |
 | falls collapse onto `v_⊥`; the matched pair agrees; `k_v` 0.13 helps A/D only; duty 0.80 wins even at larger `Φ` | **H3** | a capture-point lateral foothold (`k_v` → √(h/g)), the step bound widened in y, and a shorter two-foot phase |
 | k > 1.5; bursts resume where they left off; `w_stance` or `s_land` trends with distance; E1-S fails at the same distance; the in-place null is flat | **H1** (stance drift) | the foothold's noise (the placement's low-pass, `v_hat`) and a stance that is re-centred on the sites while walking, not only at rest |
 | k > 1.5; bursts resume; `kt_n` or temperature trends; E1-S fails at the same *time*; E1-P drifts too | H1's thermal row | a torque-constant compensation, and shorter sessions |
-| k ≈ 1 but `τ_td` is small (< ramp) and `Φ` ≈ 0; falls do not track `Φ`; no `v_⊥` structure | none of the three | the SRB gains and the x/y loop, next (doc/walk §11.3's CoM path first) |
+| k ≈ 1 but `h_td` ≈ 0 and `Φ` ≈ 0; falls do not track `Φ`; no `v_⊥` structure | none of the three | the SRB gains and the x/y loop, next (doc/walk §11.3's CoM path first) |
 
 Mixed patterns are read in the order H2, H3, H1: a rising hazard with
 asymmetric landings is H2 triggered more often as H1 lowers the margin,
@@ -700,8 +817,9 @@ A chapter, *Experimental validation of the time-driven gait on DOG6*:
 2. **Hypotheses and mechanisms** — §1, with two figures: the diagonal
    geometry (the FOLD2 stance, the support line, `v_⊥` for W and A) and the
    phantom-load curve (weight asked vs lag, one line per ramp).
-3. **Metrics** — §2's tables, and the calibration of the offline touchdown
-   estimate against MuJoCo truth (§6.3): error histograms per plant.
+3. **Metrics** — §2's tables, and the check of the 4 mm gate against
+   MuJoCo's contact truth (§6.3): the two misclassification rates per
+   plant.
 4. **Method** — §3–6: the factors, the confounds and their controls, the
    protocol, the sim pre-study.
 5. **Results** — per experiment: E1's survival curves and Weibull shapes
@@ -723,10 +841,11 @@ A chapter, *Experimental validation of the time-driven gait on DOG6*:
 In the order the study needs it:
 
 1. `doc/gait_study/analyse.py` — the offline metrics of §2 from an
-   `hw.stand` npz (and from `hwsim`'s result dict): the touchdown estimate,
-   `Φ`, `Δφ`, scuffs, stance width, the per-cycle biases, the trends, the
-   hazard; a table per run and the figures of §8.  E0 is this script on
-   the existing logs.
+   `hw.stand` npz (and from `hwsim`'s result dict): `z_clear`, `h_td`,
+   `Φ`, `Δφ`, scuffs and the apex, the residual and the excursion about
+   the diagonal, stance width and site offsets, the per-cycle biases, the
+   trends, the governor's lean replayed, the hazard; a table per run and
+   the figures of §0.2 and §8.  E0 is this script on the existing logs.
 2. Logging additions in `hw/stand.py`: the drivers' temperature per sweep
    (`MotorBus.temps()` reads the 0xA1 reply's byte), the walk's `v_ref`,
    `leashed` and the governor's lean, and a sidecar JSON of the parsed
