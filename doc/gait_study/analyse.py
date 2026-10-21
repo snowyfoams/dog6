@@ -674,7 +674,7 @@ class Run:
 # ===========================================================================
 # figures
 # ===========================================================================
-def figures(run: Run, out_dir: str, zoom=None) -> list:
+def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -960,6 +960,42 @@ def figures(run: Run, out_dir: str, zoom=None) -> list:
     plt.close(fig)
     paths.append(p)
 
+    # -- 9. height against the gait count, the clock's swing and stance in colour ----
+    cyc = t / (run.period if np.isfinite(run.period) else 0.8)
+    c0, c1 = (0.0, cyc[-1]) if cycles is None else cycles
+    s = (cyc >= c0) & (cyc <= c1)
+    fig, ax = plt.subplots(4, 1, figsize=(14, 10), sharex=True, sharey=True)
+    for i, leg in enumerate(LEGS):
+        z = run.z_clear[:, i]
+        stance = np.where(run.contact[:, i], z, np.nan)
+        swing = np.where(~run.contact[:, i], z, np.nan)
+        # one sample of overlap at each edge, so the line does not break
+        edge = np.flatnonzero(run.contact[1:, i] != run.contact[:-1, i]) + 1
+        swing_e, stance_e = swing.copy(), stance.copy()
+        for k in edge:
+            swing_e[k - 1:k + 1] = z[k - 1:k + 1]
+        ax[i].plot(cyc[s], stance_e[s], lw=0.9, color="C0", label="clock: STANCE")
+        ax[i].plot(cyc[s], swing_e[s], lw=0.9, color="C3", label="clock: SWING")
+        ax[i].axhline(CLEAR_MM, color="k", lw=0.6, ls="--", label="4 mm gate")
+        ax[i].axhline(0, color="0.8", lw=0.5)
+        ax[i].set_ylabel("%s height, mm" % leg)
+        ax[i].grid(axis="x", color="0.9", lw=0.5)
+        if i == 0:
+            ax[i].legend(fontsize=8, ncol=3, loc="upper right")
+    ax[-1].set_xlabel("gait cycle since the trot started (t / period, period %.2f s)"
+                      % run.period)
+    ax[0].set_ylim(-3, 32)
+    if run.t_tip is not None:
+        for a in ax:
+            a.axvline(run.t_tip / run.period, color="k", lw=0.8, ls=":")
+    fig.suptitle("%s: each foot's FK height above the planted plane, by gait cycle; "
+                 "red where the clock has the leg in swing, blue in stance" % name)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "%s_9_height_by_gait.png" % name)
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
     # -- 6. torque -------------------------------------------------------------------
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     labels = ["%s %s" % (LEGS[i], j) for i in range(4) for j in ("abd", "pitch", "knee")]
@@ -992,6 +1028,9 @@ def main(argv=None) -> int:
     ap.add_argument("--zoom", type=float, nargs=2, default=None, metavar=("T0", "T1"),
                     help="the anatomy figure's window, s into the trot (default: "
                          "the fall's last 2 s, or three cycles mid-run)")
+    ap.add_argument("--cycles", type=float, nargs=2, default=None, metavar=("C0", "C1"),
+                    help="the height-by-gait figure's window, in gait cycles "
+                         "(default: the whole trot)")
     ap.add_argument("--setpoint", type=float, nargs=2, default=(None, None),
                     metavar=("ROLL_DEG", "PITCH_DEG"),
                     help="the attitude setpoint the law held (default: config's "
@@ -1003,7 +1042,7 @@ def main(argv=None) -> int:
         print(run.summary())
         if not args.no_fig:
             out = args.out or os.path.dirname(os.path.abspath(path))
-            for p in figures(run, out, args.zoom):
+            for p in figures(run, out, args.zoom, args.cycles):
                 print("  fig: %s" % p)
     return 0
 
