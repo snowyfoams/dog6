@@ -178,7 +178,10 @@ class Run:
         self.tau_req = d["tau_req"][trot]
         self.com_pin = d["com_pin"][trot]
         self.q = d["q"][trot]
-        # the fall, if any: the first `fall` row, in trot seconds
+        # the fall, if any: the first `fall` row, in trot seconds; and the
+        # tip, the first sweep past 15 deg from the setpoint (a run the
+        # operator stopped before the fall hold took it has the tip and no
+        # fall)
         self.t_fall = None
         self.fall_side = None
         fall = np.flatnonzero(ph == "fall")
@@ -186,6 +189,14 @@ class Run:
             self.t_fall = float(t_abs[fall[0]] - t_abs[trot[0]])
             r = float(np.degrees(d["roll"][fall[0]]))
             self.fall_side = "right" if r > 0 else "left"
+        self.t_tip = None
+        self.tip_side = None
+        tip = np.flatnonzero(self.tilt > 15.0)
+        if tip.size:
+            self.t_tip = float(self.t[tip[0]])
+            self.tip_side = ("right" if self.roll_e[tip[0]] > 0 else "left"
+                             if abs(self.roll_e[tip[0]]) > abs(self.pitch_e[tip[0]])
+                             else "nose" if self.pitch_e[tip[0]] > 0 else "tail")
         # the levelled frame
         R = rotations(d["roll"][trot], d["pitch"][trot])
         self.x_lev = np.einsum("nij,nkj->nki", R, self.x_b)   # (n, 4, 3)
@@ -515,12 +526,15 @@ class Run:
         ld = self.landings
         cy = self.cycles
         w("== %s ==" % self.name)
+        outcome = ("FELL (the fall hold) at %.1f s to the %s" % (self.t_fall, self.fall_side)
+                   if self.fell else "no fall hold")
+        if self.t_tip is not None:
+            outcome += "; TIPPED past 15 deg at %.1f s, %s side down, %.0f deg at the end" % (
+                self.t_tip, self.tip_side, self.tilt[-1])
         w("  trot %.1f s, %d cycles; period %.3f s, swing %.0f ms, ramp %.0f ms; "
           "sweep %.2f ms; %s"
           % (self.t[-1], self.n_cycles, self.period, 1e3 * self.swing_s_median,
-             1e3 * self.ramp_s_median, 1e3 * self.dt,
-             "FELL at %.1f s to the %s" % (self.t_fall, self.fall_side)
-             if self.fell else "no fall"))
+             1e3 * self.ramp_s_median, 1e3 * self.dt, outcome))
         w("  attitude from the setpoint (%.2f / %.2f deg): roll mean %+.2f  rms %.2f  "
           "min %+.2f max %+.2f;  pitch mean %+.2f rms %.2f;  tilt max %.2f;  lean max %.2f"
           % (self.sp[0], self.sp[1], self.roll_e.mean(),
@@ -706,9 +720,11 @@ def figures(run: Run, out_dir: str, zoom=None) -> list:
     ax[4].set_ylabel("N / mm s^-1")
     ax[4].set_xlabel("s into the trot")
     ax[4].legend(loc="upper right", ncol=3, fontsize=8)
-    if run.t_fall is not None:
-        for a in ax:
+    for a in ax:
+        if run.t_fall is not None:
             a.axvline(run.t_fall, color="r", lw=1.0)
+        if run.t_tip is not None:
+            a.axvline(run.t_tip, color="r", lw=0.8, ls="--")
     fig.suptitle("%s: overview" % name)
     fig.tight_layout()
     p = os.path.join(out_dir, "%s_1_overview.png" % name)
@@ -718,8 +734,9 @@ def figures(run: Run, out_dir: str, zoom=None) -> list:
 
     # -- 2. the anatomy: a zoom with the clock, the heights and the forces ------
     if zoom is None:
-        if run.t_fall is not None:
-            zoom = (max(0.0, run.t_fall - 2.0), run.t_fall + 0.3)
+        t_end = run.t_fall if run.t_fall is not None else run.t_tip
+        if t_end is not None:
+            zoom = (max(0.0, t_end - 2.4), min(t[-1], t_end + 0.4))
         else:
             mid = 0.5 * t[-1]
             zoom = (mid, mid + 3.0 * (run.period if np.isfinite(run.period) else 0.8))
