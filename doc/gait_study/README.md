@@ -42,6 +42,12 @@ Two things found while writing it, both to settle before the first run:
   tested.**  The SRB PD has no integrator and no memory; its error is
   whatever the sensors read this sweep.  What *can* accumulate is listed in
   section 1.2, and H1 is stated against those states.
+- **The baseline's silent defaults.**  The line flown on 2026-10-21
+  (`--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --period 0.6`) runs with
+  the governor **on** (the law pauses the walk at 5° of lean) and with the
+  CoM **not measured** (`--com-auto` needs a joint spring the walk's
+  damping-only stance does not have).  "Fairly stable" was observed with
+  the governor pressing SPACE; section 3.1 writes B0 out in full.
 
 ## 1. The observations, and three mechanisms that would produce them
 
@@ -240,37 +246,66 @@ scuffed, and the per-landing distributions above as median / p90.
 
 ### 3.1 The baseline, B0
 
-The configuration the operator flies today, **as read off a log's banner**
-(section 0): `hw.fold2_walk` with the impedance swing (`KP_SWING_WALK`
-150/150/400, `KD_SWING_WALK` 6/6/40), T = 0.6 s, the apex 20 mm, `--com-auto`,
-the governor **off** (`--pause-lean 0`, §5), the fall hold at 45°, and the
-duty / ramp / settle / joint Kp / slew the operator's current line sets.
-If that is the 2026-10-07 line, it is duty 0.80, ramp ≤ 0.1875, settle 0.2
-every 2 cycles, `--kp-joint 4 --kp-joint-abd 5`, `--tau-slew 300`; if it is
-the defaults since 2026-10-20, duty 0.70, ramp 0.129, no settle, Kp 0, slew
-120.  **The two differ in five factors at once**, which is why the study
-varies one at a time from whichever is B0 and includes the other as a
-single cell (B1).
+The configuration the operator flew on 2026-10-21 and judged "fairly
+stable", by eye and without a log to say so:
+
+```
+hw.fold2_walk --duty 0.8 --contact-ramp 0.15 --tau-slew 300 --period 0.6
+```
+
+Everything that line does not name is a default, and three of those
+defaults are not neutral.  Written out, B0 is:
+
+| | value | where it comes from |
+|---|---|---|
+| clock | T 0.6 s, duty 0.80 (swing 120 ms, four-foot window 180 ms), ramp 0.15 (72 ms), **no settle** | the line; `SETTLE_S` 0 since 2026-10-20 |
+| gate | slew 300 N·m/s, clip 9 N·m | the line; `TAU_HARD_NM` |
+| swing | the Cartesian impedance 150/150/400, 6/6/40, apex 20 mm, no feedforward | `WALK_SWING_LAW`, `KP/KD_SWING_WALK`, `fold2_trot.SWING_HEIGHT` |
+| planted legs | **damping only**: joint Kp 0, Kd 0.2 (`WALK_KP_JOINT`); the rise keeps Kp 5 | `fold_walk.walking` |
+| the CoM | **not measured and not applied**: `--com-auto` is on only where the HOLD is held by a joint spring (`hw.stand`'s `com_able` needs `--kp-joint > 0`), so with Kp 0 it is silently off | `hw/stand.py` |
+| the governor | **on**: the keys are paused at 5° of lean and resumed after 1 s under 3° | `WALK_PAUSE_LEAN_DEG` |
+| keys | 0.06 m/s a press in x/y (the box 0.12 / 0.06), 6 °/s a press | `WALK_V_STEP`, 2026-10-20 |
+| the rest | FOLD2 at 160 mm, QP, the x/y loop on the filter (9/6, 1 m/s²), the fixed attitude setpoint, the fall hold at 45° | `fold2_trot.stand_options` |
+
+Two consequences for the study.  **The governor is part of what was
+observed**: a walk that leans past 5° is paused by the law before the
+operator sees it fall, so "fairly stable" is B0 *with* the governor
+pressing SPACE, and its exit report (`governor N pauses, … s paused, lean
+peak …`) is the one number from today's runs that says how often it did.
+The hypothesis runs therefore fly `--pause-lean 0` and the governor's
+contribution is measured as its own cell (§5.5).  **The CoM is a
+covariate the study needs** (§3.3), and B0 cannot read it; the joint
+spring that makes it readable (`--kp-joint 5 --kp-joint-abd 5`, the
+2026-10-07 line's stance) is itself a change to the stance, so it is a
+cell of its own (B0+spring) and not folded into B0.
+
+B1 is the tree's defaults since 2026-10-20 — duty 0.70, ramp 0.129, slew
+120, otherwise B0 — the configuration B0 was reached from by hand, and the
+one cell of E2 that moves three factors at once.  The 2026-10-07 line
+(duty 0.80, settle 0.2, Kp 4/5, slew 300, a ramp ≤ 0.1875) is B0 + spring
++ settle, which E2's settle and spring cells cover.
 
 ### 3.2 The gait factors and what each one moves
 
 | factor | B0 | levels | moves | predicted sign under H1 / H2 / H3 |
 |---|---|---|---|---|
-| duty `d` | 0.70 or 0.80 | 0.70, 0.75, 0.80 | swing 180/150/120 ms (torque-rate lag ↑ with d), four-foot window 120/150/180 ms (re-level time ↑), two-foot phase ↓ with d | 0 / **worse** (lag ↑) / **better** (e^{T_sw/τ}: 4.1 → 2.6) |
+| duty `d` | 0.80 | 0.70, 0.75, 0.80 | swing 180/150/120 ms (torque-rate lag ↑ with d), four-foot window 120/150/180 ms (re-level time ↑), two-foot phase ↓ with d | 0 / **worse** (lag ↑) / **better** (e^{T_sw/τ}: 4.1 → 2.6) |
 | period `T` | 0.6 s | 0.5, 0.6, 0.8 s | at fixed d: swing and window scale together; step length per cycle ↑ with T at a given speed | worse (longer steps) / better (lag ↓) / worse (two-foot phase ↑) |
-| contact ramp `r` | 0.129 / 0.15 | half, B0, the ceiling `(d−0.5)/(2d)` | the load asked of a late foot (§1.3 table); the unloading of a foot still carrying | 0 / **better** with r ↑ / 0 |
+| contact ramp `r` | 0.15 (72 ms) | 0.075, 0.15, 0.1875 (the ceiling `(d−0.5)/(2d)` at duty 0.80) | the load asked of a late foot (§1.3 table); the unloading of a foot still carrying | 0 / **better** with r ↑ / 0 |
 | apex `H` | 20 mm | 15, 20, 30 mm | clearance against the roll-induced early landing (65 mm × sin 5° = 5.7 mm; sin 10° = 11.3 mm) ↑; torque rate ∝ H ↑ (lag ↑) | 0 / U-shaped / 0 |
-| gate slew `S` | 120 or 300 N·m/s | 120, 300 | the swing's lag (doc/walk §4: 120 passes triangles of a 12–15 N·m request) | 0 / **better** / 0 |
+| gate slew `S` | 300 N·m/s | 120, 300 | the swing's lag (doc/walk §4: 120 passes triangles of a 12–15 N·m request) | 0 / **better** / 0 |
 | swing damping `Kd_z` (`Kp_z`) | 40 (400) | 40, 60 (400, 600) | `Kd_z v_ref` is the velocity feedforward that carries the arc (swing.py, "what flew on the bench") | 0 / better / 0 |
-| settle | 0 or 0.2 s / 2 cycles | 0, 0.2 | a four-foot re-level every 1.2 s; the reference keeps moving over planted feet (6–12 mm at 0.03–0.06 m/s) | better (a reset) / mixed / mixed |
+| settle | 0 | 0, 0.2 s every 2 cycles | a four-foot re-level every 1.2 s; the reference keeps moving over planted feet (6–12 mm at 0.03–0.06 m/s) | better (a reset) / mixed / mixed |
+| the joint spring (+ `--com-auto`) | Kp 0, no CoM | Kp 0; Kp 5/5 with the CoM measured | the stance's stiffness, and whether the CoM covariate exists | better (a stiffer stance drifts less) / 0 / 0 |
+| the governor | on at 5° | off, on | whether the law pauses the walk before it falls | — (a measurement of today's observation, not a hypothesis) |
 | foothold gain `k_v` | 0.03 s | 0.03, 0.08, 0.13 | the lateral capture term | 0 / 0 / **better** for A/D |
 | command | — | W/S 0.06, 0.12; A/D 0.03, 0.06; Q/E 6, 12 °/s; W 0.10 + A 0.03 (matched `v_⊥`) | `v_⊥` and the step length | — |
-| burst length | — | 20 s, continuous | the distance walked | **the H1 lever** |
+| burst structure | — | shuttle without SPACE; shuttle with 10 s of SPACE between legs (§5.5) | the distance walked, and whether the at-rest trot resets the state | **the H1 lever** |
 
 Factors held fixed across the study and recorded in every run's name: the
 posture (FOLD2), height 160 mm, the SRB gains (kp_att 90/17, roll 290/23),
-the x/y loop (9/6, 1 m/s²), the joint layer's Kp/Kd, the leash 30 mm,
-`STEP_MAX_XY`, `--v-filter-hz 1`, the allocator (QP), `--com-auto` on.
+the x/y loop (9/6, 1 m/s²), the leash 30 mm, `STEP_MAX_XY`,
+`--v-filter-hz 1`, the allocator (QP), the fall hold 45°.
 
 ### 3.3 Confounds, and the control for each (E5)
 
@@ -312,17 +347,25 @@ any walking is commanded.
 
 ### E1 — Time structure: does anything accumulate, and does a pause reset it
 
-*Design.*  B0, A at 0.03 m/s (the direction and speed of the recorded
-fall), governor off, two schedules:
+*Design.*  B0, the lateral command at 0.06 m/s (one press), governor off.
+A lab floor does not allow 180 s of one-way lateral walking (10 m), so the
+command is a **shuttle**: 8 s of A, then D pressed twice in quick
+succession (the keys sum through zero to −0.06 m/s; pressed within 0.1 s of
+each other the reference never lands on exactly zero, so no swing is flown
+"at rest"), 8 s of D, and so on, ±0.5 m about the start mark.  Three
+schedules:
 
-- **E1-C (continuous):** A held until the fall or 180 s, N = 8.  The
-  response is `t_fall` (censored at 180 s).
-- **E1-B (bursts):** [A 20 s, SPACE 10 s] repeated until the fall or 300 s,
-  N = 8.  The responses are `t_fall` counted in *commanded* seconds, and
-  every per-cycle metric at the *start* of burst k against the *end* of
-  burst k−1.
-- **E1-S (speed):** A at 0.06 m/s continuous, N = 6: the same distance in
-  half the time.
+- **E1-C (continuous shuttle):** [A 8 s, D·D 8 s, A·A 8 s, …] until the
+  fall or 180 s, N = 8.  The response is `t_fall` (censored at 180 s).
+  Every reversal is a transient of its own (E4); they are the same in every
+  schedule.
+- **E1-B (shuttle with pauses):** [A 8 s, SPACE 10 s, D 8 s, SPACE 10 s, …]
+  until the fall or 300 s, N = 8: the same legs, with ~16 cycles of the
+  at-rest trot (the arcs back onto the sites) between them.  The responses
+  are `t_fall` counted in *commanded* seconds, and every per-cycle metric
+  at the *start* of leg k against the *end* of leg k−1.
+- **E1-S (speed):** the continuous shuttle at 0.03 m/s (`--v-step 0.03`,
+  16 s legs: the same distance per leg in twice the time), N = 6.
 - **E1-P (in place):** the trot in place for 600 s, N = 2: the trend null.
 
 *Reads.*  Fit a Weibull to `t_fall`: shape k > 1.5 is a rising hazard
@@ -340,24 +383,26 @@ estimator rows over 10 minutes with nothing walked.
 ### E2 — The clock–contact mismatch: one factor at a time around B0
 
 *Design.*  Each factor of §3.2 at its levels, every other factor at B0;
-two commands per cell — A 0.03 m/s and W 0.06 m/s — each a fixed 30 s
-burst (or the fall), governor off.  N = 6 per cell per command; the key
-cells (ramp, slew, duty) N = 8.  Order: the slew first (it is the one knob
-the operator has already found decisive and it moves only the lag), then
-the ramp (it moves only the load at a given lag), then the duty (it moves
-both, in opposite directions, and is the cell where H2 and H3 disagree),
-then Kd_z, apex, period, settle.
+two commands per cell — the lateral shuttle and the forward shuttle (W 8 s,
+S·S 8 s, …), both at 0.06 m/s — each a fixed 60 s (or the fall), governor
+off.  N = 6 per cell per command; the key cells (ramp, slew, duty) N = 8.
+Order: the slew first (it is the one knob the operator has already found
+decisive and it moves only the lag), then the ramp (it moves only the load
+at a given lag), then the duty (it moves both, in opposite directions, and
+is the cell where H2 and H3 disagree), then Kd_z, apex, period, settle,
+the spring.
 
-| cell | levels | runs (A + W) |
+| cell | levels | runs (lateral + forward) |
 |---|---|---|
-| slew | 120, 300 | 2 × 8 × 2 = 32 |
-| ramp | half of B0, B0, the ceiling | 3 × 8 × 2 = 48 (B0 shared) |
-| duty | 0.70, 0.75, 0.80 (ramp at each one's ceiling × 0.9) | 48 (B0 shared) |
-| Kd_z / Kp_z | 40/400, 60/400, 60/600 | 3 × 6 × 2 = 36 |
-| apex | 15, 20, 30 | 36 |
-| period | 0.5, 0.6, 0.8 (d = B0's) | 36 |
-| settle | 0, 0.2 | 24 |
-| B1 | the other flown configuration | 16 |
+| slew | 120, **300** | 2 × 8 × 2 = 32 |
+| ramp | 0.075, **0.15**, 0.1875 | 3 × 8 × 2 = 48 (B0 shared) |
+| duty | 0.70 (ramp 0.129), 0.75 (0.15), **0.80** | 48 (B0 shared) |
+| Kd_z / Kp_z | **40/400**, 60/400, 60/600 | 3 × 6 × 2 = 36 |
+| apex | 15, **20**, 30 | 36 |
+| period | 0.5, **0.6**, 0.8 (d = 0.80) | 36 |
+| settle | **0**, 0.2 | 24 |
+| spring + CoM | **Kp 0**, Kp 5/5 with `--com-auto` | 24 |
+| B1 | the 2026-10-20 defaults (duty 0.70, ramp 0.129, slew 120) | 16 |
 
 About 200 robot runs at 2–3 min each (B0 is shared across the cells);
 §5.3 says how to cut it to the first hundred without losing the decision.
@@ -420,9 +465,10 @@ applied is repeated), the floor row (one cell re-run on a second patch).
    --pause-lean 0`, from the same start mark, the same heading.  The
    banner is photographed or copied into the run sheet (the npz carries no
    arguments — §9).
-2. Limp, settle, crouch, rise; **HOLD still for ≥ 2 s** so `--com-auto`
-   reads the CoM (its notice at T says what it read and whether it applied
-   it; NOT APPLIED → park and repeat).
+2. Limp, settle, crouch, rise; **HOLD still for ≥ 2 s** in every cell, so
+   that the cells which fly `--com-auto` (the spring cell, §3.2) read the
+   CoM (the notice at T says what it read and whether it applied it; NOT
+   APPLIED → park and repeat) and the others start from the same stillness.
 3. T; 5 s in place (the at-rest arcs, the null segment of every metric).
 4. The scheduled command, read from a stopwatch: the burst, then SPACE.
    The operator presses nothing else.  Past 45° the fall hold takes it;
@@ -462,7 +508,64 @@ first hundred, in order:
 Everything after is refinement of the parameter map (§8's table), not of
 the hypothesis.
 
-### 5.4 Safety
+### 5.4 Session 1: the first recorded session, about 25 runs
+
+What today's observation lacks is a log.  Session 1 records B0 with the
+failure observable, measures what the governor was contributing, and takes
+the first three E2 cells — the ones that move the touchdown lag and the
+load separately.  Every line below is a complete command; `<cell>` and
+`<rep>` go into the file name because the npz does not keep the arguments.
+
+```
+# the common part of every run
+B0="--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --period 0.6"
+RUN="python -m hw.fold2_walk $B0 --pause-lean 0"
+```
+
+| # | cell, runs | command line | schedule after T (stopwatch) | reads |
+|---|---|---|---|---|
+| 1 | `inplace`, 1 | `$RUN --log gs1_inplace_1.npz` | 120 s in place, T, ENTER | the null distribution of every metric; `τ_td` in place |
+| 2–5 | `B0_lat`, 4 | `$RUN --log gs1_B0_lat_<rep>.npz` | 5 s in place; the lateral shuttle (A 8 s, D·D 8 s, A·A …) to the fall or 120 s; SPACE; 5 s; T; ENTER | E1-C: `t_fall`, the fall anatomy, `τ_td`, `Φ`, `Δφ`, `w_stance` |
+| 6–8 | `B0_latpause`, 3 | `$RUN --log gs1_B0_latpause_<rep>.npz` | 5 s in place; A 8 s, SPACE 10 s, D 8 s, SPACE 10 s, … to the fall or 180 s | E1-B: does the pause reset `w_stance`, `s_land`, `ē_R` |
+| 9–10 | `B0_fwd`, 2 | `$RUN --log gs1_B0_fwd_<rep>.npz` | the forward shuttle (W 8 s, S·S 8 s, …), 120 s | E3: the same metrics at a quarter of the `v_⊥` |
+| 11–12 | `B0gov_lat`, 2 | `python -m hw.fold2_walk $B0 --log gs1_B0gov_lat_<rep>.npz` | the lateral shuttle, 120 s | today's configuration as flown: the governor's pauses and paused seconds from the exit report, against runs 2–5 |
+| 13–15 | `slew120_lat`, 3 | `$RUN --tau-slew 120 --log gs1_slew120_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the lag knob alone |
+| 16–18 | `ramp1875_lat`, 3 | `$RUN --contact-ramp 0.1875 --log gs1_ramp1875_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the load knob, the ceiling |
+| 19–21 | `ramp075_lat`, 3 | `$RUN --contact-ramp 0.075 --log gs1_ramp075_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the load knob, half |
+| 22–24 | `duty70_lat`, 3 | `$RUN --duty 0.7 --contact-ramp 0.129 --log gs1_duty70_lat_<rep>.npz` | the lateral shuttle, 120 s | E2: the H2/H3 discriminator |
+| 25–26 | `B0_lat`, 2 more | `$RUN --log gs1_B0_lat_<rep>.npz` | the lateral shuttle, 120 s | the session's drift check against runs 2–5 |
+
+(Flags later in a line override `$B0`'s; `--contact-ramp 0.1875` is the
+ceiling at duty 0.80 and 0.19 is refused.)  Interleave the cells rather
+than running each block whole, so that no cell is always the warmer
+robot; three minutes between runs.
+
+**The run sheet**, one row per run, written by hand until §9's sidecar
+exists:
+
+| column | from |
+|---|---|
+| run name, the full command line | typed |
+| the banner's gait line (`gait … s at duty … (… ms of swing)`) and the swing line | the terminal at start |
+| battery voltage at start and end | the pack |
+| session time since power-on, and the motors' temperature if read (`hw.bringup` prints `temps()`; nothing in `hw.stand` does yet) | the clock |
+| the CoM notice at T, if `--com-auto` ran (`read x/y, spread, applied / NOT APPLIED`) | the terminal at T |
+| each key press and SPACE with its stopwatch time; the ENTER | the stopwatch |
+| what happened: fell (which side, stopwatch time), fall hold taken, a bus gap, anything the operator saw (a scuff, a leg "not lifting", a lean) | the operator |
+| the exit report: `law timing`, `walk … touchdowns anchored, leash acted on … sweeps, … landings clamped`, `swing foot apex … reached`, `xy … refused`, the governor's line | the terminal at exit |
+
+**What Session 1 yields once the analysis script (§9, item 1) exists**:
+the fall-anatomy timeline of every fall (roll, `contact_w`, `z_clear` and
+`fz` of the four legs over the last 1.5 s); the `τ_td` distribution per
+leg for B0 in place, lateral and forward, and for the slew, ramp and duty
+cells beside it; `Φ` against `Δφ` within every run; `w_stance` and the
+site offsets against time with the pause boundaries marked; the count of
+scuffed swings per cell; the governor's pause count per 120 s of lateral
+walking under B0.  Those six figures are the thesis chapter's results
+section for the baseline, and the first test of H1 (the pause rows), H2
+(the lag and load cells) and H3 (lateral against forward).
+
+### 5.5 Safety
 
 Governor off is a decision to *observe* the failure; the fall hold at 45°
 (the joint PD at 5/0.2 + gravity, every fall in MuJoCo settled within
