@@ -1,0 +1,12 @@
+# Phase 1, the lateral shuttle WITH PAUSES: A 8 s, SPACE 10 s, D 8 s, SPACE
+# 10 s, ... for 180 s -- the same legs as p1_lat with ten seconds of the
+# trot in place between them (the at-rest arcs back onto the sites).
+#   python -m hw.fold2_walk --duty 0.8 --contact-ramp 0.15 --tau-slew 300 \
+#       --kp-joint 4 --kp-joint-abd 5 --script hw/scripts/p1_latpause.txt --log p1_latpause_1.npz
+hold        +3.0    T
+trot        +5.0    shuttle A D leg=8 pause=10 total=180
+trot        +190.0  T
+hold[2]     +2.0    ENTER
+park        +6.0    ENTER
+done        +1.0    ENTER
+fall        +3.0    ENTER

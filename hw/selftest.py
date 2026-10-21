@@ -533,6 +533,10 @@ def main() -> int:
     print("\nhw.stand --wave: sim.wave's five phases through the phase machine")
     _wave_phases()
 
+    # -- 9. hw.script: the operator's keys from a file ---------------------
+    print("\nhw.script: the scripted keys, on the phase clock")
+    _script_checks()
+
     # ----------------------------------------------------------------------
     print("\n%d checks, %d failed" % (_PASSES + len(_FAILURES), len(_FAILURES)))
     print("The stand's balance controller is gated separately, and this file "
@@ -907,6 +911,114 @@ def _wave_phases() -> None:
         check("ENTER from the fall hold parks, not shifts",
               refused is None and s3.phase_name == "park",
               refused or s3.phase_name)
+
+
+def _script_checks() -> None:
+    """`hw.script` against a stub sequence: the file parses the way the
+    docstring says, a shuttle expands to the presses it promises, the keys
+    go out on the phase clock one a sweep, a phase that ends takes its
+    pending events with it, and a key from the keyboard cancels the rest."""
+    from . import script as SC
+
+    class Stub:
+        phase_name = "limp"
+        t_phase = 0.0
+        t_trot = 0.0
+
+    text = "\n".join([
+        "# a comment",
+        "hold       +3.0   T",
+        "trot       +5.0   shuttle A D leg=8 total=120",
+        "trot     +130.0   T",
+        "hold[2]    +2.0   ENTER",
+        "fall       +3.0   enter",
+    ])
+    ev = SC.parse(text)
+    legs = [e for e in ev if e.text.startswith("shuttle")]
+    check("the file parses: 4 lines, the shuttle expanded",
+          len(ev) == 4 + len(legs) and len(legs) == 16,
+          "%d events, %d from the shuttle" % (len(ev), len(legs)))
+    check("the shuttle: A at +5, then the other key TWICE every 8 s",
+          legs[0].t == 5.0 and legs[0].keys == ["a"]
+          and legs[1].t == 13.0 and legs[1].keys == ["d", "d"]
+          and legs[2].t == 21.0 and legs[2].keys == ["a", "a"]
+          and legs[14].t == 117.0,
+          "%s" % [(e.t, "".join(e.keys)) for e in legs[:3]])
+    check("...and ends with SPACE at +total",
+          legs[-1].t == 125.0 and legs[-1].keys == [" "],
+          "%.1f %r" % (legs[-1].t, legs[-1].keys))
+    paused = SC.shuttle("A", "D", 8.0, 180.0, pause=10.0)
+    check("with pause: SPACE after each leg, the other key ONCE after it",
+          paused[0] == (0.0, ["a"], "A (leg 1)") and paused[1][0] == 8.0
+          and paused[1][1] == [" "] and paused[2][0] == 18.0
+          and paused[2][1] == ["d"] and paused[-1][1] == [" "]
+          and paused[-1][0] <= 180.0,
+          "%s ... %s" % (paused[:3], paused[-1]))
+    check("ENTER / enter are one key, hold[2] is the second entry",
+          ev[-1].keys == ["\r"] and ev[-2].index == 2 and ev[0].index is None,
+          "%r %r" % (ev[-1].keys, ev[-2].anchor))
+    for bad, why in (("hold +1 X", "X"), ("walk +1 T", "a phase"),
+                     ("hold 1.0 T", "+seconds"), ("hold +1 shuttle A A leg=8 total=9", "two keys"),
+                     ("hold[0] +1 T", "from 1"), ("hold +1 Z", "a key")):
+        raises("refused: %s (%s)" % (bad, why),
+               lambda b=bad: SC.parse(b), ValueError)
+    check("key_name reads the runner's characters back",
+          SC.key_name("\r") == "ENTER" and SC.key_name(" ") == "SPACE"
+          and SC.key_name("t") == "T" and SC.key_name("a") == "A",
+          "")
+    check("--auto beside a script keeps the position phases only",
+          "hold" not in SC.AUTO_PHASES and "trot" not in SC.AUTO_PHASES
+          and "crouch" in SC.AUTO_PHASES, " ".join(SC.AUTO_PHASES))
+
+    # the phase clock, on the stub
+    s = SC.KeyScript(SC.parse(text), "stub")
+    st = Stub()
+    check("limp: nothing due", s.poll(0.0, st) is None
+          and "waiting for hold" in s.status(0.0, st), s.status(0.0, st))
+    st.phase_name, st.t_phase = "hold", 10.0
+    out = [s.poll(t, st) for t in (10.0, 12.9, 13.0, 13.1)]
+    check("hold +3: T on the sweep it is due, once",
+          out == [None, None, "t", None], "%r" % out)
+    st.phase_name, st.t_phase, st.t_trot = "recentre", 13.2, 0.0
+    check("recentre: nothing scripted there", s.poll(13.3, st) is None, "")
+    st.phase_name, st.t_phase, st.t_trot = "trot", 14.0, 14.0
+    out = [s.poll(t, st) for t in (14.0, 18.9, 19.0, 26.9, 27.0, 27.004, 27.1)]
+    check("trot +5: A; +13: D then D on consecutive sweeps",
+          out == [None, None, "a", None, "d", "d", None], "%r" % out)
+    check("the status line names the next press",
+          "shuttle: A A" in s.status(28.0, st) and "in 7.0 s" in s.status(28.0, st),
+          s.status(28.0, st))
+    # the trot ends early (an operator T, or a fall): the rest is skipped
+    st.phase_name, st.t_phase = "hold", 40.0
+    out = [s.poll(t, st) for t in (40.0, 41.9, 42.0)]
+    check("hold[2] +2: ENTER on the second HOLD, not hold[1]'s T again",
+          out == [None, None, "\r"], "%r" % out)
+    # 17 trot events (16 of the shuttle, the +130 T); A and D D fired
+    check("the trot's remaining presses were SKIPPED, and counted",
+          s.skipped == 15 and all(
+              isinstance(e.outcome.get(1), str) for e in s.events
+              if e.phase == "trot" and e.t > 27.0),
+          "%d skipped" % s.skipped)
+    st.phase_name, st.t_phase = "fall", 50.0
+    said = s.cancel("operator pressed SPACE")
+    out = [s.poll(t, st) for t in (53.0, 54.0)]
+    check("a key from the keyboard cancels: nothing more goes out",
+          out == [None, None] and "CANCELLED" in said
+          and "CANCELLED" in s.status(54.0, st), said)
+    rep = s.report()
+    check("the report says what fired, what was skipped, and the cancel",
+          "fired" in rep and "skipped" in rep and "CANCELLED" in rep
+          and "not reached" in rep, rep.splitlines()[0])
+    # every entry: hold[*]
+    s2 = SC.KeyScript(SC.parse("hold[*] +1.0 T"), "every")
+    st2 = Stub()
+    st2.phase_name, st2.t_phase = "hold", 0.0
+    a = s2.poll(1.0, st2)
+    st2.phase_name, st2.t_phase = "trot", 2.0
+    s2.poll(2.0, st2)
+    st2.phase_name, st2.t_phase = "hold", 5.0
+    b = s2.poll(6.0, st2)
+    check("[*] fires on every entry", (a, b) == ("t", "t"), "%r" % ((a, b),))
 
 
 if __name__ == "__main__":

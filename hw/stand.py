@@ -234,6 +234,7 @@ from . import hardware_map as HM     # noqa: E402
 from . import imu as IMU             # noqa: E402
 from . import realtime as RT         # noqa: E402
 from . import safety as SAFE         # noqa: E402
+from . import script as SCRIPT       # noqa: E402
 from . import velocity_estimator as VEL  # noqa: E402
 from .balance import config as BCFG  # noqa: E402
 from .balance import controller as BCTRL   # noqa: E402
@@ -593,7 +594,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
         imu=None, log: "StandLog | None" = None,
         velocity: "VelocityTap | None" = None, estimator=None,
         hook=None, terse: bool = False, feed: bool = False,
-        gcq: "RT.QuietGC | None" = None) -> str | None:
+        gcq: "RT.QuietGC | None" = None,
+        script: "SCRIPT.KeyScript | None" = None) -> str | None:
     """Drive `stand` on an ARMED `mb` until done, X, or a trip.
 
     Returns the stop reason, or None for a clean exit from "done".  Does not
@@ -720,6 +722,23 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
 
             # -- operator ---------------------------------------------------
             pressed = key.get() if key is not None else None
+            # THE SCRIPT (hw.script) PRESSES WHERE THE OPERATOR WOULD, one
+            # key a sweep, and a key from the keyboard cancels it: whoever is
+            # at the robot overrides the file.  With a script, --auto keeps
+            # only the position phases; HOLD and the trot are the script's.
+            auto_now = auto_s
+            if script is not None:
+                if pressed is not None:
+                    print("\n   " + script.cancel("operator pressed %s"
+                                                  % SCRIPT.key_name(pressed)),
+                          flush=True)
+                else:
+                    pressed = script.poll(now, stand)
+                    if pressed is not None:
+                        print("\n   [script] %s" % script.describe_last(),
+                              flush=True)
+                if stand.phase_name not in SCRIPT.AUTO_PHASES:
+                    auto_now = None
             if pressed in ("x", "X"):
                 return "operator X"
             if pressed in ("t", "T"):
@@ -739,29 +758,29 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
             # ramp_remaining about `auto_s` ago is exactly that test.  With a
             # gait, the hold presses T once and the trot latches its own exit
             # after two settles' worth of cycles.
-            auto_trot = (auto_s is not None and stand.gait is not None
+            auto_trot = (auto_now is not None and stand.gait is not None
                          and (stand.trotting or (stand.phase_name == "hold"
                                                  and stand.trot_runs == 0)))
             # With a step: the first hold presses W, the trot runs from the
             # stepped stance, and the final ENTER steps back before parking.
-            auto_step = (auto_s is not None and stand.step_to is not None
+            auto_step = (auto_now is not None and stand.step_to is not None
                          and stand.phase_name == "hold"
                          and stand.step_runs == 0)
             if auto_step:
-                if now - stand.t_phase >= auto_s:
+                if now - stand.t_phase >= auto_now:
                     print("\n   " + stand.toggle_step(now), flush=True)
             elif auto_trot:
                 trot_s = stand.gait.cycle_start(2 * stand.gait.settle_every)
                 # A T already pressed and waiting for the HOLD's CoM is not
                 # pressed again (`StandSequence.trot_pending`).
                 if (not stand.trotting and not stand.trot_pending
-                        and now - stand.t_phase >= auto_s) or (
+                        and now - stand.t_phase >= auto_now) or (
                         stand.trotting and not stand.trot_exit
                         and now - stand.t_phase >= trot_s):
                     print("\n   " + stand.toggle_trot(now), flush=True)
-            elif (auto_s is not None and now - stand.t_phase >= auto_s
+            elif (auto_now is not None and now - stand.t_phase >= auto_now
                     and stand.phase_name not in ("step", "recentre")
-                    and stand.ramp_remaining(now - auto_s) <= 0.0):
+                    and stand.ramp_remaining(now - auto_now) <= 0.0):
                 wants_next = True
             if wants_next and hook is not None:
                 veto = hook.blocks_advance(stand)
@@ -947,6 +966,8 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                 if (hook is not None and not terse
                         and stand.phase_name in ("hold", "trot")):
                     print("          " + hook.status(now, stand), flush=True)
+                if script is not None and not terse:
+                    print("          " + script.status(now, stand), flush=True)
                 if stand.phase_name == "hold" and not terse:
                     # THE HOLD'S JOINT ANGLES, every status line: what the
                     # joint layer holds beside what the encoders read.
@@ -1169,6 +1190,14 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     ap.add_argument("--auto", type=float, default=None, metavar="SECONDS",
                     help="advance phases by themselves, SECONDS after each "
                          "ramp arrives (--fake only)")
+    ap.add_argument("--script", default=None, metavar="FILE",
+                    help="the operator's keys from a file, on the phase clock "
+                         "(hw.script): T, the walk's keys, SPACE and ENTER at "
+                         "scheduled seconds after each phase is entered, the "
+                         "same in every run.  Any key pressed by hand cancels "
+                         "the rest.  Beside --auto (--fake) the position "
+                         "phases still step by themselves and the script owns "
+                         "HOLD and the trot")
 
     law = ap.add_argument_group(
         "the lift law",
@@ -1558,6 +1587,19 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     if args.auto is not None and not args.fake:
         ap.error("--auto is only allowed with --fake: on the robot a person "
                  "steps the phases")
+    # THE SCRIPTED KEYS (hw.script), parsed before the bus opens so a bad
+    # line refuses here and not mid-run.
+    script = None
+    if args.script:
+        try:
+            script = SCRIPT.KeyScript.load(args.script)
+        except (OSError, ValueError) as refusal:
+            ap.error("--script: %s" % refusal)
+        if gait is None and script.presses("t"):
+            ap.error("--script presses T, and this entry point has no trot")
+        if hook is None and any(script.presses(ch) for ch in "wasdqe "):
+            ap.error("--script presses the walk's keys, and this entry point "
+                     "does not walk")
     if args.law == "per-leg" and not args.no_imu:
         # Not an error: the baseline reads no IMU by construction, and saying
         # so beats letting an operator think the A/B differs in two ways.
@@ -2063,6 +2105,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     print("  ENTER steps the phase (RISE ends on its own).  X is an E-STOP "
           "-- from rise or hold it DROPS the robot.")
     if hook is not None:
+        if script is not None:
+            for line in script.banner():
+                print("  " + line)
         for line in hook.banner(args):
             print("  " + line)
     if step_gait is not None:
@@ -2170,7 +2215,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
             stop = run(mb, stand, rate_hz=args.rate, key=key,
                        auto_s=args.auto, imu=imu, log=log, velocity=tap,
                        estimator=est_tap, hook=hook, terse=terse,
-                       feed=xy_loop, gcq=gcq)
+                       feed=xy_loop, gcq=gcq, script=script)
     except KeyboardInterrupt:
         stop = "Ctrl-C"
     finally:
@@ -2203,6 +2248,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     if stand.com is not None:
         print("[stand] the CoM, measured in each HOLD and applied at T:")
         print(stand.com_report())
+    if script is not None:
+        print("[stand] the script, as it ran:")
+        print(script.report())
     if gate.started_at is not None:
         print("[stand] peak joint speed, driver / encoder (rad/s; trip %s at "
               "%.1f):" % ("ON" if gate.overspeed_trip else "OFF",

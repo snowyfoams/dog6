@@ -1,0 +1,9 @@
+# A short run for `--fake --no-imu --auto 1`: the whole key path in ~40 s.
+#   python -m hw.fold2_walk --fake --no-imu --auto 1 --script hw/scripts/dryrun.txt
+hold        +2.0    T
+trot        +3.0    shuttle A D leg=3 total=10
+trot        +14.0   T
+hold[2]     +1.0    ENTER
+park        +5.0    ENTER
+done        +0.5    ENTER
+fall        +2.0    ENTER
