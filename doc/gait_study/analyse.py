@@ -876,6 +876,73 @@ def figures(run: Run, out_dir: str, zoom=None) -> list:
         plt.close(fig)
         paths.append(p)
 
+    # -- 7. the foot's height at the clock's instants, per gait cycle ----------------
+    fig, ax = plt.subplots(4, 1, figsize=(12, 10), sharex=True, sharey=True)
+    for i, leg in enumerate(LEGS):
+        ld = [r for r in run.landings if r["leg"] == i]
+        sw = [r for r in run.swings if r["leg"] == i]
+        if ld:
+            ax[i].plot(range(1, len(ld) + 1), [r["h_td"] for r in ld], "o-", ms=3, lw=0.7,
+                       color=colors[i], label="h_td: height when the clock lands it")
+        if sw:
+            ax[i].plot(range(1, len(sw) + 1), [r["apex"] for r in sw], ".", ms=3,
+                       color="0.5", label="apex reached in the swing")
+            ax[i].plot(range(1, len(sw) + 1),
+                       [run.z_clear[r["i_lo"], i] for r in sw], "x", ms=3,
+                       color="0.3", label="height when the clock lifts it")
+        ax[i].axhline(CLEAR_MM, color="k", lw=0.5, ls="--")
+        ax[i].axhline(0, color="0.8", lw=0.5)
+        ax[i].set_ylabel("%s  mm" % leg)
+        if i == 0:
+            ax[i].legend(fontsize=8, ncol=3, loc="upper right")
+    ax[-1].set_xlabel("gait cycle since the trot started")
+    fig.suptitle("%s: each foot's height above the planted plane at the clock's liftoff and "
+                 "touchdown, per cycle (the dashed line is the 4 mm gate)" % name)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "%s_7_htd_per_cycle.png" % name)
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
+    # -- 8. every cycle on the leg's own clock: height against gait phase -------------
+    per_ms = 1e3 * (run.period if np.isfinite(run.period) else 0.8)
+    sw_ms = 1e3 * run.swing_s_median
+    fig, ax = plt.subplots(4, 1, figsize=(12, 11), sharex=True, sharey=True)
+    cmap = plt.get_cmap("viridis")
+    for i, leg in enumerate(LEGS):
+        lo = run.lo[i]
+        ncyc = max(1, lo.size - 1)
+        for k in range(lo.size - 1):
+            a, b = int(lo[k]), int(lo[k + 1])
+            tt = 1e3 * (run.t[a:b] - run.t[a])
+            ax[i].plot(tt, run.z_clear[a:b, i], lw=0.4, color=cmap(k / ncyc), alpha=0.7)
+        ld = [r for r in run.landings if r["leg"] == i]
+        if ld and lo.size:
+            # each landing against its own cycle's liftoff
+            xs, ys = [], []
+            for r in ld:
+                prev = lo[lo <= r["i_td"]]
+                if prev.size:
+                    xs.append(1e3 * (run.t[r["i_td"]] - run.t[prev[-1]]))
+                    ys.append(r["h_td"])
+            ax[i].plot(xs, ys, "k.", ms=3, label="h_td at the clock's touchdown")
+        ax[i].axvline(0.0, color="k", lw=0.8, ls=":", label="clock: liftoff")
+        ax[i].axvline(sw_ms, color="k", lw=0.8, ls="--", label="clock: touchdown")
+        ax[i].axhline(CLEAR_MM, color="0.5", lw=0.5, ls="--")
+        ax[i].set_ylabel("%s  mm" % leg)
+        ax[i].set_xlim(-5.0, per_ms)
+        if i == 0:
+            ax[i].legend(fontsize=8, ncol=3, loc="upper right")
+    ax[-1].set_xlabel("ms after the clock's liftoff of that leg (one line per cycle, "
+                      "dark = early in the trot, yellow = late)")
+    ax[0].set_ylim(-3, 30)
+    fig.suptitle("%s: foot height against the gait clock, every cycle overlaid" % name)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "%s_8_height_vs_phase.png" % name)
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
     # -- 6. torque -------------------------------------------------------------------
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     labels = ["%s %s" % (LEGS[i], j) for i in range(4) for j in ("abd", "pitch", "knee")]
