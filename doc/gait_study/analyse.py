@@ -1159,6 +1159,50 @@ def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
          legs(np.abs(run.tau_cmd[:, 1::3]), "cmd") + legs(np.abs(run.tau_req[:, 1::3]), "req", ls="--", alpha=0.7)),
     ])
 
+    # -- 21. the load handover: fz asked, the clock's weight and the foot's height,
+    #        aligned on the clock's touchdown and averaged over the landings ------------
+    k_pre, k_post = int(round(0.06 / run.dt)), int(round(0.24 / run.dt))
+    tau = (np.arange(-k_pre, k_post + 1) * run.dt) * 1e3
+    fig, ax = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    for i, leg in enumerate(LEGS):
+        a = ax[i // 2, i % 2]
+        tds = [b for b in run.td[i] if b - k_pre >= 0 and b + k_post < run.t.size]
+        if not tds:
+            continue
+        fz = np.array([run.fz[b - k_pre:b + k_post + 1, i] for b in tds])
+        w = np.array([run.cw[b - k_pre:b + k_post + 1, i] for b in tds])
+        z = np.array([run.z_clear[b - k_pre:b + k_post + 1, i] for b in tds])
+        a.fill_between(tau, np.nanpercentile(fz, 10, axis=0), np.nanpercentile(fz, 90, axis=0),
+                       color="C1", alpha=0.2)
+        a.plot(tau, np.nanmedian(fz, axis=0), color="C1", lw=1.4, label="fz asked, N (median, p10-p90)")
+        a.plot(tau, 30.0 * np.nanmedian(w, axis=0), color="k", lw=1.0, ls="--",
+               label="clock's weight x 30")
+        a2 = a.twinx()
+        a2.fill_between(tau, np.nanpercentile(z, 10, axis=0), np.nanpercentile(z, 90, axis=0),
+                        color="C0", alpha=0.15)
+        a2.plot(tau, np.nanmedian(z, axis=0), color="C0", lw=1.4, label="foot height, mm (median)")
+        a2.axhline(CLEAR_MM, color="C0", lw=0.6, ls=":")
+        a2.set_ylim(-3, 25)
+        a2.set_ylabel("mm", color="C0")
+        a.axvline(0, color="k", lw=0.8)
+        a.set_ylim(0, 40)
+        a.set_title("%s: %d landings" % (leg, len(tds)))
+        a.set_ylabel("N")
+        if i == 0:
+            h1, l1 = a.get_legend_handles_labels()
+            h2, l2 = a2.get_legend_handles_labels()
+            a.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
+    for a in ax[1]:
+        a.set_xlabel("ms after the clock's touchdown")
+    fig.suptitle("%s: the load handover -- what the allocator asks of a foot against where "
+                 "the foot is, aligned on the clock's touchdown (ramp %.0f ms)"
+                 % (name, 1e3 * run.ramp_s_median))
+    fig.tight_layout()
+    p = os.path.join(out_dir, "%s_21_handover.png" % name)
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
     # -- 6. torque -------------------------------------------------------------------
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     labels = ["%s %s" % (LEGS[i], j) for i in range(4) for j in ("abd", "pitch", "knee")]
