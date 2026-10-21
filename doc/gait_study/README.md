@@ -43,11 +43,12 @@ Two things found while writing it, both to settle before the first run:
   whatever the sensors read this sweep.  What *can* accumulate is listed in
   section 1.2, and H1 is stated against those states.
 - **The baseline's silent defaults.**  The line flown on 2026-10-21
-  (`--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --period 0.6`) runs with
-  the governor **on** (the law pauses the walk at 5° of lean) and with the
-  CoM **not measured** (`--com-auto` needs a joint spring the walk's
-  damping-only stance does not have).  "Fairly stable" was observed with
-  the governor pressing SPACE; section 3.1 writes B0 out in full.
+  (`--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --kp-joint 4
+  --kp-joint-abd 5`, T = 0.6 s) runs with the governor **on** (the law
+  pauses the walk at 5° of lean) and, because the joint spring is on, with
+  `--com-auto` **on** (the CoM read in every HOLD and applied at T).
+  "Fairly stable" was observed with the governor pressing SPACE; section
+  3.1 writes B0 out in full.
 
 ## 1. The observations, and three mechanisms that would produce them
 
@@ -184,6 +185,40 @@ that lowers the margin with each step walked.  What distinguishes them is
 
 ## 2. The metrics, all from the existing log
 
+### 2.0 The tracked set, in priority
+
+Twelve quantities, three tiers.  Tier 1 is read on every run before
+anything else; tier 2 is the mechanism, one number per landing or per
+swing; tier 3 is the slow part, one number per cycle or per window.
+Every one is computed offline from `hw.stand --log`'s columns by the
+analysis script of §9; nothing on the robot changes.
+
+| # | tier | quantity | one line | unit | per | tests |
+|---|---|---|---|---|---|---|
+| 1 | 1 | **attitude** | roll and pitch from the setpoint; tilt = max(\|roll\|, \|pitch\|); its rms per 10 s, its peak, the governor's 1.5 Hz lean replayed | deg | sweep → window | all |
+| 2 | 1 | **outcome** | fell (tilt from the setpoint > 15° before the fall hold), the stopwatch time and the side; the number of landings before it | — | run | all |
+| 3 | 1 | **real swing height** | `z_clear`: each foot's height above the plane of the planted feet, IMU-levelled; per swing its apex against the 20 mm asked, and whether it ever cleared 4 mm (a **scuffed** swing) | mm | sweep → swing | O3, O4, H2 |
+| 4 | 1 | **swing tracking error** | `p_swing − x_b` per axis; its rms over the swing and its lateral value at the end of the arc (the fall's 24–27 mm) | mm | swing | O3, H2/H3 |
+| 5 | 2 | **touchdown lag `τ_td`** | the floor's touchdown minus the clock's, per landing; + late, − early | ms | landing | **H2** |
+| 6 | 2 | **phantom impulse `Φ`** | the normal force the allocator asked of a foot while it was still above 4 mm, integrated | N·s | landing | **H2** |
+| 7 | 2 | **roll step `Δφ`** | the roll change across the 80 ms after each landing, signed toward the landing foot's side | deg | landing | H2, H3 |
+| 8 | 2 | **liftoff lag `τ_lo`** | the clock's liftoff to the foot clearing 4 mm; ∞ if it never does | ms | swing | O4, H2 |
+| 9 | 3 | **stance geometry** | each foot's mid-stance x/y against its site, and the stance width left–right, per cycle | mm | cycle | **H1** |
+| 10 | 3 | **attitude bias** | the cycle mean of `e_R` and of the commanded moment: what "PD error" would be if it grew | deg, N·m | cycle | H1 |
+| 11 | 3 | **estimator** | `xy_des − (p_est + R c)`, the fraction of sweeps at the 1 m/s² clamp, `p_est`'s drift per leg of the shuttle | mm | cycle | H1 |
+| 12 | 3 | **torque** | the swing joints' request the slew did not pass; sweeps at the 9 N·m clip; `Σ\|tau_meas\| / Σ\|tau_cmd\|` on the planted legs as the thermal proxy | N·m·s, count, — | cycle | H2, E5 |
+
+Three definitions have to be fixed before the first log is read, and are
+fixed here: the **attitude reference** is the setpoint the law holds
+(FOLD2 flies the config statics, §1.2), with roll and pitch from true level
+kept beside it; the **floor plane** for `z_clear` is the two lowest planted
+feet's (the reverted detector's rule, so a planted foot lifted by a roll
+cannot raise it); and the **touchdown instant** without a sensor is
+§2.1's two-witness rule — the foot within 4 mm of the plane and stopped
+while the arc still descends, or the swing impedance commanding 8 N or
+more of push — calibrated against MuJoCo's contact truth (§6.3) before any
+robot number is quoted.
+
 `hw.stand --log` writes one row per sweep (`StandLog.FIELDS`): `t`,
 `phase`, `roll/pitch/yaw`, `omega_b`, `b_d`, `e_R`, `fz`, `f_w`, `q`,
 `q_ref`, `tau_cmd/tau_meas/tau_req`, `contact_w`, `swing_s`, `p_swing`,
@@ -250,19 +285,19 @@ The configuration the operator flew on 2026-10-21 and judged "fairly
 stable", by eye and without a log to say so:
 
 ```
-hw.fold2_walk --duty 0.8 --contact-ramp 0.15 --tau-slew 300 --period 0.6
+hw.fold2_walk --duty 0.8 --contact-ramp 0.15 --tau-slew 300 --kp-joint 4 --kp-joint-abd 5
 ```
 
-Everything that line does not name is a default, and three of those
+Everything that line does not name is a default, and two of those
 defaults are not neutral.  Written out, B0 is:
 
 | | value | where it comes from |
 |---|---|---|
-| clock | T 0.6 s, duty 0.80 (swing 120 ms, four-foot window 180 ms), ramp 0.15 (72 ms), **no settle** | the line; `SETTLE_S` 0 since 2026-10-20 |
+| clock | T 0.6 s, duty 0.80 (swing 120 ms, four-foot window 180 ms), ramp 0.15 (72 ms), **no settle** | the line; `fold2_trot.PERIOD_S`; `SETTLE_S` 0 since 2026-10-20 |
 | gate | slew 300 N·m/s, clip 9 N·m | the line; `TAU_HARD_NM` |
 | swing | the Cartesian impedance 150/150/400, 6/6/40, apex 20 mm, no feedforward | `WALK_SWING_LAW`, `KP/KD_SWING_WALK`, `fold2_trot.SWING_HEIGHT` |
-| planted legs | **damping only**: joint Kp 0, Kd 0.2 (`WALK_KP_JOINT`); the rise keeps Kp 5 | `fold_walk.walking` |
-| the CoM | **not measured and not applied**: `--com-auto` is on only where the HOLD is held by a joint spring (`hw.stand`'s `com_able` needs `--kp-joint > 0`), so with Kp 0 it is silently off | `hw/stand.py` |
+| planted legs | the joint spring: Kp 4 on pitch and knee, 5 on abduction, Kd 0.2, targets world-anchored (walk.py) | the line |
+| the CoM | **measured in every HOLD and applied at T** (`--com-auto` is on by default once `--kp-joint` > 0): the pin and the stance sites move by measured − pinned, the trunk slides onto them for 0.5 s | `hw/stand.py`'s `com_able`, `sequence.py` |
 | the governor | **on**: the keys are paused at 5° of lean and resumed after 1 s under 3° | `WALK_PAUSE_LEAN_DEG` |
 | keys | 0.06 m/s a press in x/y (the box 0.12 / 0.06), 6 °/s a press | `WALK_V_STEP`, 2026-10-20 |
 | the rest | FOLD2 at 160 mm, QP, the x/y loop on the filter (9/6, 1 m/s²), the fixed attitude setpoint, the fall hold at 45° | `fold2_trot.stand_options` |
@@ -273,17 +308,16 @@ operator sees it fall, so "fairly stable" is B0 *with* the governor
 pressing SPACE, and its exit report (`governor N pauses, … s paused, lean
 peak …`) is the one number from today's runs that says how often it did.
 The hypothesis runs therefore fly `--pause-lean 0` and the governor's
-contribution is measured as its own cell (§5.5).  **The CoM is a
-covariate the study needs** (§3.3), and B0 cannot read it; the joint
-spring that makes it readable (`--kp-joint 5 --kp-joint-abd 5`, the
-2026-10-07 line's stance) is itself a change to the stance, so it is a
-cell of its own (B0+spring) and not folded into B0.
+contribution is measured as its own cell (§5.4).  **The CoM reading is a
+covariate** (§3.3): the notice at T (read x/y, spread, applied or NOT
+APPLIED) goes on every run sheet, and the log's `com_meas` / `com_pin`
+columns keep it.
 
 B1 is the tree's defaults since 2026-10-20 — duty 0.70, ramp 0.129, slew
-120, otherwise B0 — the configuration B0 was reached from by hand, and the
-one cell of E2 that moves three factors at once.  The 2026-10-07 line
-(duty 0.80, settle 0.2, Kp 4/5, slew 300, a ramp ≤ 0.1875) is B0 + spring
-+ settle, which E2's settle and spring cells cover.
+120, Kp 0 (damping only, and so no `--com-auto`) — the configuration B0
+was reached from by hand, and the one cell of E2 that moves four factors
+at once.  The 2026-10-07 line (the same spring, settle 0.2, a ramp
+≤ 0.1875) is B0 + settle, which E2's settle cell covers.
 
 ### 3.2 The gait factors and what each one moves
 
@@ -296,7 +330,7 @@ one cell of E2 that moves three factors at once.  The 2026-10-07 line
 | gate slew `S` | 300 N·m/s | 120, 300 | the swing's lag (doc/walk §4: 120 passes triangles of a 12–15 N·m request) | 0 / **better** / 0 |
 | swing damping `Kd_z` (`Kp_z`) | 40 (400) | 40, 60 (400, 600) | `Kd_z v_ref` is the velocity feedforward that carries the arc (swing.py, "what flew on the bench") | 0 / better / 0 |
 | settle | 0 | 0, 0.2 s every 2 cycles | a four-foot re-level every 1.2 s; the reference keeps moving over planted feet (6–12 mm at 0.03–0.06 m/s) | better (a reset) / mixed / mixed |
-| the joint spring (+ `--com-auto`) | Kp 0, no CoM | Kp 0; Kp 5/5 with the CoM measured | the stance's stiffness, and whether the CoM covariate exists | better (a stiffer stance drifts less) / 0 / 0 |
+| the joint spring (+ `--com-auto`) | Kp 4/5, the CoM measured | Kp 4/5 with the CoM; Kp 0 without it (the tree's default stance) | the stance's stiffness, and whether the CoM is corrected | worse without (a softer stance drifts more; doc/walk §11.7: the damping-only stance fell on the robot-like plant) / 0 / 0 |
 | the governor | on at 5° | off, on | whether the law pauses the walk before it falls | — (a measurement of today's observation, not a hypothesis) |
 | foothold gain `k_v` | 0.03 s | 0.03, 0.08, 0.13 | the lateral capture term | 0 / 0 / **better** for A/D |
 | command | — | W/S 0.06, 0.12; A/D 0.03, 0.06; Q/E 6, 12 °/s; W 0.10 + A 0.03 (matched `v_⊥`) | `v_⊥` and the step length | — |
@@ -401,8 +435,8 @@ the spring.
 | apex | 15, **20**, 30 | 36 |
 | period | 0.5, **0.6**, 0.8 (d = 0.80) | 36 |
 | settle | **0**, 0.2 | 24 |
-| spring + CoM | **Kp 0**, Kp 5/5 with `--com-auto` | 24 |
-| B1 | the 2026-10-20 defaults (duty 0.70, ramp 0.129, slew 120) | 16 |
+| spring + CoM | **Kp 4/5 with `--com-auto`**, Kp 0 without | 24 |
+| B1 | the 2026-10-20 defaults (duty 0.70, ramp 0.129, slew 120, Kp 0) | 16 |
 
 About 200 robot runs at 2–3 min each (B0 is shared across the cells);
 §5.3 says how to cut it to the first hundred without losing the decision.
@@ -465,10 +499,10 @@ applied is repeated), the floor row (one cell re-run on a second patch).
    --pause-lean 0`, from the same start mark, the same heading.  The
    banner is photographed or copied into the run sheet (the npz carries no
    arguments — §9).
-2. Limp, settle, crouch, rise; **HOLD still for ≥ 2 s** in every cell, so
-   that the cells which fly `--com-auto` (the spring cell, §3.2) read the
-   CoM (the notice at T says what it read and whether it applied it; NOT
-   APPLIED → park and repeat) and the others start from the same stillness.
+2. Limp, settle, crouch, rise; **HOLD still for ≥ 2 s** so `--com-auto`
+   reads the CoM (its notice at T says what it read and whether it applied
+   it; NOT APPLIED → park and repeat; the no-spring cell has no reading and
+   starts from the same stillness).
 3. T; 5 s in place (the at-rest arcs, the null segment of every metric).
 4. The scheduled command, read from a stopwatch: the burst, then SPACE.
    The operator presses nothing else.  Past 45° the fall hold takes it;
@@ -517,8 +551,8 @@ load separately.  Every line below is a complete command; `<cell>` and
 `<rep>` go into the file name because the npz does not keep the arguments.
 
 ```
-# the common part of every run
-B0="--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --period 0.6"
+# the common part of every run (the 2026-10-21 line; T = 0.6 s is fold2_trot's default)
+B0="--duty 0.8 --contact-ramp 0.15 --tau-slew 300 --kp-joint 4 --kp-joint-abd 5"
 RUN="python -m hw.fold2_walk $B0 --pause-lean 0"
 ```
 
