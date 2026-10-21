@@ -996,6 +996,35 @@ def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
     plt.close(fig)
     paths.append(p)
 
+    # -- 10. the same on ONE axis: four legs, the clock's swing windows shaded -------
+    fig, ax = plt.subplots(1, 1, figsize=(14, 5.5))
+    pairs = ((0, 3), (1, 2))                       # FL+RR, FR+RL: the trot's diagonals
+    pair_col = ("#f3e6b0", "#e8cde0")
+    ymax = 32.0
+    for (i, j), col in zip(pairs, pair_col):
+        sw = (~run.contact[:, i]) | (~run.contact[:, j])
+        ax.fill_between(cyc[s], -3, ymax, where=sw[s], color=col, alpha=0.9, lw=0,
+                        label="clock: %s+%s SWING" % (LEGS[i], LEGS[j]))
+    for i, leg in enumerate(LEGS):
+        ax.plot(cyc[s], run.z_clear[s, i], lw=0.9, color=colors[i], label=leg)
+    ax.axhline(CLEAR_MM, color="k", lw=0.6, ls="--", label="4 mm gate")
+    ax.axhline(0, color="0.6", lw=0.5)
+    if run.t_tip is not None:
+        ax.axvline(run.t_tip / run.period, color="k", lw=0.8, ls=":")
+    ax.set_ylim(-3, ymax)
+    ax.set_xlim(c0, c1)
+    ax.set_xlabel("gait cycle since the trot started (t / period, period %.2f s)" % run.period)
+    ax.set_ylabel("foot height above the planted plane, mm")
+    ax.grid(axis="x", color="0.9", lw=0.5)
+    ax.legend(fontsize=8, ncol=7, loc="upper right")
+    ax.set_title("%s: the four feet's FK height by gait cycle; shaded = the clock has that "
+                 "diagonal in swing, unshaded = all four in stance" % name)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "%s_10_height_one_axis.png" % name)
+    fig.savefig(p, dpi=110)
+    plt.close(fig)
+    paths.append(p)
+
     # -- 6. torque -------------------------------------------------------------------
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     labels = ["%s %s" % (LEGS[i], j) for i in range(4) for j in ("abd", "pitch", "knee")]
