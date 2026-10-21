@@ -1065,6 +1065,100 @@ def figures(run: Run, out_dir: str, zoom=None, cycles=None) -> list:
     plt.close(fig)
     paths.append(p)
 
+    # -- 12..20: every other column on the same gait axis -----------------------------
+    def shade(ax, lo, hi):
+        for (i, j), col in zip(pairs, pair_col):
+            sw = (~run.contact[:, i]) | (~run.contact[:, j])
+            ax.fill_between(cyc[s], lo, hi, where=sw[s], color=col, alpha=0.9, lw=0)
+
+    def gait_panels(tag, title, panels):
+        fig, axes = plt.subplots(len(panels), 1, figsize=(14, 2.9 * len(panels) + 1.0),
+                                 sharex=True, squeeze=False)
+        for ax, (ylabel, series) in zip(axes[:, 0], panels):
+            vals = np.concatenate([np.asarray(arr[s], dtype=float).ravel() for arr, _, _ in series])
+            vals = vals[np.isfinite(vals)]
+            lo, hi = (float(vals.min()), float(vals.max())) if vals.size else (-1.0, 1.0)
+            pad = 0.08 * (hi - lo if hi > lo else 1.0)
+            shade(ax, lo - pad, hi + pad)
+            for arr, lab, kw in series:
+                ax.plot(cyc[s], arr[s], label=lab, **kw)
+            ax.axhline(0, color="0.6", lw=0.5)
+            ax.set_ylim(lo - pad, hi + pad)
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="x", color="0.9", lw=0.5)
+            ax.legend(fontsize=7, ncol=min(8, len(series)), loc="upper right")
+            if run.t_tip is not None:
+                ax.axvline(run.t_tip / run.period, color="k", lw=0.8, ls=":")
+        axes[-1, 0].set_xlim(c0, c1)
+        axes[-1, 0].set_xlabel("gait cycle since the trot started (t / period, period %.2f s); "
+                               "shaded = the clock has FL+RR (yellow) or FR+RL (purple) in swing"
+                               % run.period)
+        fig.suptitle("%s: %s" % (name, title))
+        fig.tight_layout()
+        p = os.path.join(out_dir, "%s_%s.png" % (name, tag))
+        fig.savefig(p, dpi=110)
+        plt.close(fig)
+        paths.append(p)
+
+    L = lambda i, **kw: dict(lw=0.9, color=colors[i], **kw)          # noqa: E731
+    legs = lambda arr, lab, **kw: [(arr[:, i], "%s %s" % (LEGS[i], lab), L(i, **kw))  # noqa: E731
+                                   for i in range(4)]
+    xyz = lambda arr, lab, cols=("C0", "C1", "C2"): [                 # noqa: E731
+        (arr[:, k], "%s %s" % (lab, "xyz"[k]), dict(lw=0.9, color=cols[k])) for k in range(arr.shape[1])]
+
+    gait_panels("12_forces_by_gait", "the allocated foot forces, world frame", [
+        ("fz asked, N", legs(run.fz, "fz")),
+        ("f_w x, N", legs(run.f_w[:, :, 0], "fx")),
+        ("f_w y, N", legs(run.f_w[:, :, 1], "fy")),
+    ])
+    gait_panels("13_wrench_by_gait", "the wrench the PD asked for (b_d)", [
+        ("force x / y, N", xyz(run.b_d[:, 0:2], "F")),
+        ("force z, N", [(run.b_d[:, 2], "F z", dict(lw=0.9, color="C2")),
+                        (np.full(run.t.size, BCFG.WEIGHT), "weight", dict(lw=0.7, color="k", ls="--"))]),
+        ("moment, N m", xyz(run.b_d[:, 3:6], "M")),
+    ])
+    om = np.degrees(run.d["omega_b"][run.sel])
+    gait_panels("14_attitude_error_by_gait", "the attitude error and the gyro", [
+        ("e_R, deg", xyz(run.e_R, "e_R")),
+        ("omega_b, deg/s", xyz(om, "omega")),
+        ("height, mm", [(run.h, "measured", dict(lw=0.9, color="C0")),
+                        (run.h_cmd, "commanded", dict(lw=0.8, color="k", ls="--"))]),
+    ])
+    gait_panels("15_torque_by_gait", "joint torque: commanded (solid) and the drivers' measured (dashed)", [
+        ("%s, N m" % jn, legs(run.tau_cmd[:, k::3], "cmd") + legs(run.tau_meas[:, k::3], "meas", ls="--", alpha=0.7))
+        for k, jn in enumerate(("abduction", "hip pitch", "knee"))
+    ])
+    gait_panels("16_feet_xy_by_gait", "the feet in the trunk frame, against their HOLD sites", [
+        ("x minus site, mm", legs(1e3 * (run.x_b[:, :, 0] - run.sites[None, :, 0]), "x")),
+        ("y minus site, mm", legs(1e3 * (run.x_b[:, :, 1] - run.sites[None, :, 1]), "y")),
+        ("z, trunk frame, mm", legs(1e3 * run.x_b[:, :, 2], "z")),
+    ])
+    p0 = run.p_est[np.flatnonzero(np.isfinite(run.p_est[:, 0]))[0]] if np.isfinite(run.p_est[:, 0]).any() else np.zeros(3)
+    gait_panels("17_estimator_by_gait", "the state estimator, and the x/y rows that read it", [
+        ("position, mm (from the trot's start)",
+         xyz(1e3 * (run.p_est[:, :2] - p0[:2]), "p_est")
+         + xyz(1e3 * (run.xy_des - p0[:2]), "xy_des", cols=("0.3", "0.6"))),
+        ("velocity, mm/s", xyz(1e3 * run.v_est[:, :2], "v_est")),
+        ("x/y rows' force, N", xyz(run.b_d[:, 0:2], "F")),
+    ])
+    err = run.p_swing - run.x_b
+    gait_panels("18_swing_error_by_gait", "the swing foot against its arc (reference minus foot, trunk frame)", [
+        ("x error, mm", legs(1e3 * err[:, :, 0], "ex")),
+        ("y error, mm", legs(1e3 * err[:, :, 1], "ey")),
+        ("z error, mm", legs(1e3 * err[:, :, 2], "ez")),
+    ])
+    gait_panels("19_residual_by_gait", "what the allocator could not deliver, and the clock", [
+        ("residual force, N", xyz(run.residual[:, 0:3], "res F")),
+        ("residual moment, N m", xyz(run.residual[:, 3:6], "res M")),
+        ("clock: contact weight", legs(run.cw, "w")),
+    ])
+    gait_panels("20_torque_knee_vs_request_by_gait", "the knee: the law's request against what the gate passed", [
+        ("knee |tau_req| (dashed) and |tau_cmd|, N m",
+         legs(np.abs(run.tau_cmd[:, 2::3]), "cmd") + legs(np.abs(run.tau_req[:, 2::3]), "req", ls="--", alpha=0.7)),
+        ("hip pitch |tau_req| (dashed) and |tau_cmd|, N m",
+         legs(np.abs(run.tau_cmd[:, 1::3]), "cmd") + legs(np.abs(run.tau_req[:, 1::3]), "req", ls="--", alpha=0.7)),
+    ])
+
     # -- 6. torque -------------------------------------------------------------------
     fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     labels = ["%s %s" % (LEGS[i], j) for i in range(4) for j in ("abd", "pitch", "knee")]
