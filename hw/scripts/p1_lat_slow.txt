@@ -1,0 +1,14 @@
+# The lateral shuttle at HALF SPEED, the same distance per leg: run with
+# `--v-step 0.03` (one press is then 0.03 m/s), legs of 16 s, 240 s in all.
+# The H1 discriminator: a failure set by DISTANCE walked comes at the same
+# leg count as p1_lat; one set by TIME comes at the same second.
+#   python -m hw.fold2_walk --duty 0.8 --contact-ramp 0.15 --tau-slew 300 \
+#       --kp-joint 4 --kp-joint-abd 5 --v-step 0.03 \
+#       --script hw/scripts/p1_lat_slow.txt --log p1_latslow_1.npz
+hold        +3.0    T
+trot        +5.0    shuttle A D leg=16 total=240
+trot        +250.0  T
+hold[2]     +2.0    ENTER
+park        +6.0    ENTER
+done        +1.0    ENTER
+fall        +3.0    ENTER
