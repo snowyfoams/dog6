@@ -67,8 +67,8 @@ from .. import kinematics as HK      # noqa: E402
 from . import config as cfg          # noqa: E402
 from . import swing as SWING         # noqa: E402
 
-__all__ = ["swing_control_torque", "swing_impedance_force",
-           "swing_osc_torque", "inertial_feedforward", "SWING_LAWS"]
+__all__ = ["swing_control_torque", "swing_osc_torque", "inertial_feedforward",
+           "SWING_LAWS"]
 
 #: `walk.WalkPlan.swing_law`: the Cartesian impedance above, or the
 #: task-space computed torque below.
@@ -130,30 +130,18 @@ def swing_osc_torque(state, leg: int, ref, wn=None, zeta=None, inertia=None):
     return tau, tau_ff
 
 
-def swing_impedance_force(state, leg: int, ref, kp=None, kd=None) -> np.ndarray:
-    """(3,) the walking impedance's commanded foot force, TRUNK frame --
-    what the leg applies to the foot: Kp (p_ref - x) + Kd (v_ref - J qd).
-    The one quantity `contact.ContactDetector` reads (scheme A): a foot
-    stopped on the floor under a descending reference commands a push DOWN,
-    negative z.  `swing_control_torque` is J^T of this."""
+def swing_control_torque(state, leg: int, ref, kp=None, kd=None,
+                         ff: bool = False, inertia=None):
+    """``(tau, tau_ff)`` for swinging `leg`; `ref` is a `footstep.SwingRef`
+    (anything with p, v, a in the trunk frame).  `tau` includes `tau_ff`.
+    `kp` / `kd` are (3,) for every leg or (4, 3) a row per leg
+    (`swing.leg_gains`, `--kp-swing-walk-rl` etc., 2026-10-05)."""
     kp = SWING.leg_gains(cfg.KP_SWING_WALK if kp is None else kp, leg)
     kd = SWING.leg_gains(cfg.KD_SWING_WALK if kd is None else kd, leg)
     jac = state.jac[leg]
     qd = C.unflat(state.qd)[leg]
-    return (kp * (np.asarray(ref.p, dtype=float) - state.x_b[leg])
-            + kd * (np.asarray(ref.v, dtype=float) - jac @ qd))
-
-
-def swing_control_torque(state, leg: int, ref, kp=None, kd=None,
-                         ff: bool = False, inertia=None, force=None):
-    """``(tau, tau_ff)`` for swinging `leg`; `ref` is a `footstep.SwingRef`
-    (anything with p, v, a in the trunk frame).  `tau` includes `tau_ff`.
-    `kp` / `kd` are (3,) for every leg or (4, 3) a row per leg
-    (`swing.leg_gains`, `--kp-swing-walk-rl` etc., 2026-10-05).  `force` is
-    `swing_impedance_force`'s answer if the caller already has it."""
-    jac = state.jac[leg]
-    if force is None:
-        force = swing_impedance_force(state, leg, ref, kp, kd)
+    force = (kp * (np.asarray(ref.p, dtype=float) - state.x_b[leg])
+             + kd * (np.asarray(ref.v, dtype=float) - jac @ qd))
     tau = jac.T @ force
     tau_ff = np.zeros(3)
     if ff:

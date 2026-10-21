@@ -8,9 +8,6 @@
                                                    the CoM (swing.py, "THE KNEE
                                                    SWING"); refused at 0.6 s:
                                                    120 ms outruns the slew
-    $V -m hw.fold2_trot --no-touchdown             the clock's word for which
-                                                   foot is down -- the trot as
-                                                   flown before 2026-10-20
 
     limp -> settle -> crouch -> rise -> hold --T--> trot --T--> hold -> park
                                                (exit at the next four-foot window)
@@ -58,31 +55,6 @@ THE FRONT LEGS BEND THE OTHER WAY FROM `hw.fold_trot`'S
     and pitches up to 19 deg, and arrives.  Fold the front legs knee-forward
     by hand in limp and the crouch is a small move.
 
-TOUCHDOWN DETECTION, 2026-10-20 -- SCHEME A, ON BY DEFAULT HERE
-    `hw/balance/contact.py`: which foot is DOWN is decided from the swing
-    law's own commanded push on the floor, -(Kp e + Kd e_dot)_z, gated by
-    the foot's clearance above the planted feet (kinematics + IMU), with a
-    stopped foot under a still-descending reference as the second witness
-    -- no sensor, nothing new on the bus.  The drivers' iq cannot see the
-    floor (the current loop follows the COMMAND whatever the load); the
-    encoders can, and this reads them through the law that already runs.
-    What it changes: a foot that lands EARLY (a rolled trunk's low side) is
-    handed to the allocator, the joint layer and the walk's anchors on the
-    sweep it is felt, its swing law stopped, instead of being driven on
-    into the floor until the clock catches up; a foot the clock lands that
-    is still in the air (the high side) stays OUT of the allocator -- no
-    force is asked of a foot that cannot push -- and PROBES down at 0.20
-    m/s until the floor answers; a landed foot that then leaves the floor
-    (8 mm up while the clock has it in stance: the trunk tipping away from
-    it) re-probes from where it is.  The 2026-10-06 fall (doc/walk) was the
-    second case: a late FR/RL landing rolled the trunk +0.9 -> +7.6 deg in
-    80 ms.  The status line prints each leg's state and the detection
-    against the clock; the log's `td_*` columns keep it; the exit report
-    counts early / late / probed / gave up.  `--td-*` move the thresholds
-    (`python -m hw.balance.contact` prints the sizing).  Nothing changes
-    for a swing that lands when the clock says: the contact set is then
-    the clock's, the load ramp 30 ms instead of 54.  [SIM-TUNED, NOT FLOWN]
-
 WHAT IS `hw.fold_trot`'S, UNCHANGED
     The hold height (`HEIGHT`, 160 mm), the trot's clock and apex
     (`PERIOD_S` 0.6 s, `SWING_HEIGHT` 20 mm -- the operator's 2026-10-02
@@ -125,13 +97,6 @@ SWING_HEIGHT = 0.020                 # m
 #: m, floor to trunk bottom at the hold: `hw.fold_trot`'s stand height.
 HEIGHT = 0.160
 
-#: TOUCHDOWN DETECTION ON BY DEFAULT, 2026-10-20 (scheme A,
-#: hw/balance/contact.py; `--no-touchdown` is the clock alone, the trot as
-#: flown).  This entry point and `hw.fold2_walk`, which inherits it, are the
-#: two that fly it; `hw.fold_trot` / `hw.fold_walk` / `hw.trot` keep the
-#: clock and offer `--touchdown`.  [SIM-TUNED, NOT FLOWN]
-TOUCHDOWN = True
-
 
 def stand_options() -> dict:
     """Everything this trot hands `hw.stand.main`, the estimator and its x/y
@@ -143,7 +108,7 @@ def stand_options() -> dict:
                 roll_gains=FS.ROLL_GAINS, track_stop=FS.TRACK_STOP_DEG,
                 velocity=False, limits=FS.LIMITS,
                 swing_height=SWING_HEIGHT, rise_track=True,
-                height=HEIGHT, touchdown=TOUCHDOWN,
+                height=HEIGHT,
                 **TROT.trot_options(PERIOD_S))
 
 

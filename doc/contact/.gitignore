@@ -1,3 +1,0 @@
-# The runs behind README.md: tdsim.py writes them, nothing commits them
-# (the root .gitignore's data/** is anchored at the repository root).
-data/

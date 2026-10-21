@@ -10,9 +10,6 @@
     $V -m hw.fold2_walk --swing-law osc --settle 0.2 the task-space swing and
                                                      DOG5's re-level, the
                                                      defaults before 2026-10-20
-    $V -m hw.fold2_walk --no-touchdown               the clock's word for which
-                                                     foot is down: the walk as
-                                                     flown on 2026-10-07
 
     limp -> settle -> crouch -> rise -> hold --T--> trot (walk) --T--> hold -> park
 
@@ -48,22 +45,6 @@ WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
     0.12 / 0.06 m/s and 12 deg/s, 0.06 m/s or 6 deg/s a press (config.WALK_*;
     x/y doubled 2026-10-20 on request from 0.06 / 0.03 and 0.03 a press);
     `--v-max 0.15 0.10 --yaw-rate-max 40` is still inside what MuJoCo walked.
-
-TOUCHDOWN DETECTION ON, 2026-10-20 -- inherited from `hw.fold2_trot`
-    (`TOUCHDOWN`; scheme A, hw/balance/contact.py; `--no-touchdown` is the
-    walk as flown).  Walking is where it earns its keep: the walk's swing
-    lands 15 mm (median) / 27 mm (p90) off its arc on this robot, and the
-    2026-10-06 fall at 629 s was a LATE landing -- the FR/RL swing lagging
-    its arc, the clock handing the allocator a foot still in the air, the
-    trunk rolling +0.9 -> +7.6 deg in 80 ms on the force that foot could not
-    give.  With the detector that foot stays out of the allocator and probes
-    down to the floor; the diagonal that is down carries the trunk the
-    while.  And a foot the rolled trunk lands EARLY is handed over the sweep
-    it is felt rather than pushed on into the floor by the arc.  The
-    world-fixed footholds are kept through the probe: the arc's end is
-    carried straight down in the trunk's z, its x/y where the foothold was
-    placed.  `hw.fold2_trot`'s docstring has the mechanism; the exit report
-    and the log's `td_*` columns say what it did.  [SIM-TUNED, NOT FLOWN]
 
 THE ARMATURE IS THE osc SWING'S GAIN, here as in `hw.fold_walk`: under
 `--swing-law osc`, fit it with `hw.swing_bench --analyse` and pass
