@@ -41,6 +41,12 @@ zero -- hung up there is no floor; on the floor the site IS the floor):
 The first two swings of every leg are skipped (the hold's state, not the
 swing's), as doc/swing_height does: 40 swings a run are summarised.
 
+THE GAIT AXIS.  Figures 9-12 are doc/swing_height's (doc/gait_study's) 7-10
+on the robot's runs: the whole bout by gait cycle with the clock's swing
+shaded by diagonal and the commanded arc dashed, RR alone by gait cycle,
+every cycle of RR overlaid on the leg's own clock, and the clock's instants
+per swing.
+
 THE EFFECTIVE INERTIA.  Over every swing window, per joint, least squares of
 tau_meas - g (and tau_cmd - g) on (qdd, qd, 1): what the leg answered the
 torque with.  The links' share is `leg_dynamics.mass_matrix` at the hold with
@@ -646,6 +652,176 @@ def fig_legs(runs, path):
     fig.tight_layout(); fig.savefig(path, bbox_inches="tight"); plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# the gait axis -- doc/swing_height's figures 7-10 (doc/gait_study's), on the
+# robot's runs: the whole bout by gait cycle, every cycle overlaid, per cycle
+# ---------------------------------------------------------------------------
+PAIR_COL = {"FL+RR": "#f3e6b0", "FR+RL": "#d9c7e8"}     # the gait study's shading
+LEG_COL = ["C0", "C1", "C2", "C3"]
+
+
+def cycles(r: dict) -> np.ndarray:
+    """Gait cycles since the first liftoff of the bout (t / period)."""
+    sw = r["swing_s"] > 0
+    first = int(np.flatnonzero(sw.any(axis=1))[0])
+    return (r["t"] - r["t"][first]) / float(r["period"])
+
+
+def heights(r: dict):
+    """(n, 4) the feet above their sites and (n, 4) the commanded arc, mm (NaN in stance)."""
+    z = 1e3 * (r["x_b"][:, :, 2] - r["rest"][None, :, 2])
+    zr = 1e3 * (r["p_swing"][:, :, 2] - r["rest"][None, :, 2])
+    return z, zr
+
+
+def _shade(ax, r, cyc, lo, hi, s):
+    sw = r["swing_s"] > 0
+    for pair, legs in (("FL+RR", (0, 3)), ("FR+RL", (1, 2))):
+        up = sw[:, legs].any(axis=1)
+        ax.fill_between(cyc[s], lo, hi, where=up[s], color=PAIR_COL[pair], alpha=0.9, lw=0,
+                        label="clock: %s SWING" % pair)
+
+
+def fig_one_axis(runs, stems, path, title, c0=2.0, c1=9.0):
+    """The study's figure 10: the four feet on one axis by gait cycle, the
+    commanded arc dashed, the clock's swing shaded by diagonal; a panel per run."""
+    plt = _plt()
+    fig, axes = plt.subplots(len(stems), 1, figsize=(14, 3.2 * len(stems)), sharex=True,
+                             sharey=True)
+    for ax, stem in zip(np.atleast_1d(axes), stems):
+        g = next(g for g in GROUPS if g[0] == stem)
+        r = runs[stem]
+        cyc = cycles(r)
+        s = (cyc >= c0) & (cyc <= c1)
+        z, zr = heights(r)
+        _shade(ax, r, cyc, -8, 32, s)
+        for i in range(4):
+            ax.plot(cyc[s], zr[s, i], lw=1.0, ls="--", color=LEG_COL[i], alpha=0.6)
+            ax.plot(cyc[s], z[s, i], lw=1.1, color=LEG_COL[i], label="%s (FK)" % LEGS[i])
+        ax.axhline(CLEAR_MM, color="k", lw=0.6, ls="--", label="4 mm gate")
+        ax.axhline(20, color="0.5", lw=0.5, ls=":", label="apex asked, 20 mm")
+        ax.axhline(0, color="0.6", lw=0.5)
+        ax.set_ylim(-6, 26)
+        ax.set_xlim(c0, c1)
+        ax.set_ylabel("height above\nthe site, mm")
+        ax.grid(axis="x", color="0.9", lw=0.5)
+        ax.legend(fontsize=7, ncol=8, loc="upper right")
+        rows = r["kept"]
+        ax.set_title("%s (%s, period %.1f s): dashed the arc the clock commands, solid the "
+                     "foot; apex %.1f mm, h_td %+.1f mm, arrives %+.0f ms (medians)"
+                     % (g[1], g[2], g[3], 1e3 * stat(rows, "apex")[0],
+                        1e3 * stat(rows, "h_td")[0], 1e3 * stat(rows, "t_arr")[0]),
+                     fontsize=9, loc="left")
+    np.atleast_1d(axes)[-1].set_xlabel("gait cycle since the bout's first liftoff (t / period)")
+    fig.suptitle(title, y=1.0)
+    fig.tight_layout(); fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+
+
+def fig_by_gait(runs, path, c0=2.0, c1=9.0):
+    """The study's figure 9: RR by gait cycle, red where the clock has it in swing."""
+    plt = _plt()
+    fig, axes = plt.subplots(len(GROUPS), 1, figsize=(14, 2.4 * len(GROUPS)), sharex=True,
+                             sharey=True)
+    for ax, g in zip(axes, GROUPS):
+        r = runs[g[0]]
+        cyc = cycles(r)
+        s = (cyc >= c0) & (cyc <= c1)
+        z, zr = heights(r)
+        c = ~(r["swing_s"][:, 3] > 0)
+        stance = np.where(c, z[:, 3], np.nan)
+        swing = np.where(~c, z[:, 3], np.nan)
+        for e in np.flatnonzero(c[1:] != c[:-1]) + 1:
+            swing[e - 1:e + 1] = z[e - 1:e + 1, 3]
+        ax.plot(cyc[s], zr[s, 3], lw=0.9, ls="--", color="0.4", label="the arc")
+        ax.plot(cyc[s], stance[s], lw=0.9, color="C0", label="clock: STANCE")
+        ax.plot(cyc[s], swing[s], lw=0.9, color="C3", label="clock: SWING")
+        ax.axhline(CLEAR_MM, color="k", lw=0.6, ls="--", label="4 mm gate")
+        ax.axhline(0, color="0.8", lw=0.5)
+        ax.set_ylabel("%s\n%s\nRR, mm" % (g[1], g[2]), fontsize=8)
+        ax.grid(axis="x", color="0.9", lw=0.5)
+        ax.legend(fontsize=7, ncol=4, loc="upper right")
+    axes[0].set_ylim(-6, 26)
+    axes[0].set_xlim(c0, c1)
+    axes[-1].set_xlabel("gait cycle since the bout's first liftoff (t / period; each run on its "
+                        "own period)")
+    fig.suptitle("RR foot's FK height above its site by gait cycle; red where the clock has the "
+                 "leg in swing, blue in stance, dashed the commanded arc", y=1.0)
+    fig.tight_layout(); fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+
+
+def fig_vs_phase(runs, path):
+    """The study's figure 8: every cycle of RR on the leg's own clock, overlaid,
+    dark = early, yellow = late; a panel per run."""
+    plt = _plt()
+    fig, axes = plt.subplots(4, 2, figsize=(13, 11), sharey=True)
+    cmap = plt.get_cmap("viridis")
+    for ax, g in zip(axes.T.ravel(), GROUPS):
+        r = runs[g[0]]
+        t = r["t"]
+        z, zr = heights(r)
+        rows = [x for x in r["swings"] if x["leg"] == 3]
+        T = 1e3 * stat(rows, "T")[0]
+        period = 1e3 * float(r["period"])
+        n = len(rows)
+        for j, x in enumerate(rows):
+            a = x["a"]; b = min(len(t), a + int(period / 4.0))
+            ax.plot(1e3 * (t[a:b] - t[a]), z[a:b, 3], lw=0.6, alpha=0.8, color=cmap(j / max(n - 1, 1)))
+        a, b = rows[SKIP]["a"], rows[SKIP]["b"]
+        ax.plot(1e3 * (t[a:b] - t[a]), zr[a:b, 3], lw=1.4, ls="--", color="k", alpha=0.6,
+                label="the arc")
+        ax.plot([1e3 * x["T"] for x in rows[SKIP:]], [1e3 * x["h_td"] for x in rows[SKIP:]],
+                "k.", ms=5, label="h_td at the clock's touchdown")
+        ax.axvline(0.0, color="k", lw=0.8, ls=":")
+        ax.axvline(T, color="k", lw=0.8, ls="--", label="clock: touchdown")
+        ax.axhline(CLEAR_MM, color="0.5", lw=0.5, ls="--")
+        ax.axhline(0, color="0.8", lw=0.5)
+        ax.set_xlim(-5, period)
+        kept_rows = [x for x in r["kept"] if x["leg"] == 3]
+        ax.set_title("%s %s: RR apex %.1f mm, lag %.0f ms, h_td %+.1f mm, arrives %+.0f ms"
+                     % (g[1], g[2], 1e3 * stat(kept_rows, "apex")[0], 1e3 * stat(kept_rows, "lag")[0],
+                        1e3 * stat(kept_rows, "h_td")[0], 1e3 * stat(kept_rows, "t_arr")[0]),
+                     fontsize=9, loc="left")
+        ax.set_ylabel("RR, mm"); ax.legend(fontsize=7, loc="upper right")
+    axes[0, 0].set_ylim(-8, 26)
+    for ax in axes[-1]:
+        ax.set_xlabel("ms after the clock's liftoff of RR (one line per cycle, dark = early, "
+                      "yellow = late; the axis is one period)")
+    fig.suptitle("RR foot height against the gait clock, every cycle overlaid", y=1.0)
+    fig.tight_layout(); fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+
+
+def fig_per_cycle(runs, path):
+    """The study's figure 7: the clock's instants per swing -- h_td, the apex,
+    the height at liftoff -- every leg, in the order the swings happened."""
+    plt = _plt()
+    fig, axes = plt.subplots(4, 2, figsize=(13, 10), sharey=True)
+    for ax, g in zip(axes.T.ravel(), GROUPS):
+        r = runs[g[0]]
+        rows = r["swings"]
+        i = np.arange(1, len(rows) + 1)
+        col = [LEG_COL[x["leg"]] for x in rows]
+        ax.scatter(i, [1e3 * x["h_td"] for x in rows], s=14, c=col, marker="o",
+                   label="h_td, the clock's touchdown (colour = leg)")
+        ax.plot(i, [1e3 * x["h_td"] for x in rows], lw=0.5, color="0.6")
+        ax.scatter(i, [1e3 * x["apex"] for x in rows], s=10, c=col, marker="^",
+                   label="apex reached")
+        ax.scatter(i, [1e3 * x["z0"] for x in rows], s=12, c="0.3", marker="x",
+                   label="height at the clock's liftoff")
+        ax.axvline(4 * SKIP + 0.5, color="0.5", lw=0.6, ls=":")
+        ax.axhline(CLEAR_MM, color="k", lw=0.5, ls="--")
+        ax.axhline(20, color="0.6", lw=0.5, ls=":")
+        ax.axhline(0, color="0.8", lw=0.5)
+        ax.set_title("%s %s" % (g[1], g[2]), fontsize=9, loc="left")
+        ax.set_ylabel("mm"); ax.legend(fontsize=7, ncol=3, loc="upper right")
+    axes[0, 0].set_ylim(-6, 28)
+    for ax in axes[-1]:
+        ax.set_xlabel("swing count, the order flown (FL FR RL RR: C0 C1 C2 C3; left of the "
+                      "dotted line: not summarised)")
+    fig.suptitle("Every leg's height at the clock's liftoff and touchdown, and its apex, per swing "
+                 "(dashed: the 4 mm gate, dotted: the 20 mm apex)", y=1.0)
+    fig.tight_layout(); fig.savefig(path, bbox_inches="tight"); plt.close(fig)
+
+
 # ===========================================================================
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -679,6 +855,18 @@ def main(argv=None) -> int:
         fig_xy(runs, os.path.join(FIG, "6_foot_path.png"))
         fig_inertia(runs, os.path.join(FIG, "7_inertia_fit.png"))
         fig_legs(runs, os.path.join(FIG, "8_legs.png"))
+        fig_one_axis(runs, [g[0] for g in GROUPS if g[4] is None],
+                     os.path.join(FIG, "9a_gait_one_axis_period.png"),
+                     "Guess 1 by gait cycle -- FF off, the four feet on one axis; shaded = the "
+                     "clock has that diagonal in swing")
+        fig_one_axis(runs, ["b_off_T20_1", "b_ff003_T20_1", "b_off_T08_1", "b_ff001_T08_1",
+                            "b_ff003_T08_1"],
+                     os.path.join(FIG, "9b_gait_one_axis_ff.png"),
+                     "Guesses 2 and 3 by gait cycle -- the feedforward off and on at 2.0 s and "
+                     "0.8 s; shaded = the clock has that diagonal in swing")
+        fig_by_gait(runs, os.path.join(FIG, "10_gait_rr_by_gait.png"))
+        fig_vs_phase(runs, os.path.join(FIG, "11_gait_rr_vs_phase.png"))
+        fig_per_cycle(runs, os.path.join(FIG, "12_gait_per_swing.png"))
         print("figures in %s" % FIG)
     return 0
 
