@@ -1,13 +1,18 @@
 """The swing leg's inertial feedforward, A/B ON THE ROBOT: hung up, FOLD2's
-hold, the legs swing on the clock with `--swing-ff` OFF and then ON.
+hold, the legs swing on the clock -- ONE RUN WITH `--swing-ff`, ONE WITHOUT,
+each to its own log.
 
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
-    $V -m hw.swing_ff --log ff_ab.npz               ENTER: pose; ENTER: swing (FF off);
-                                                    ENTER: stop; F: flip FF; ENTER: swing ...
-    $V -m hw.swing_ff --ab 10 --log ff_ab.npz       10 swings per leg FF OFF, hold, 10 FF ON,
-                                                    hold, exit with the A/B table
-    $V -m hw.swing_ff --legs RR --ab 10 --log rr.npz
+    $V -m hw.swing_ff --swings 10                   FF OFF: ENTER pose, ENTER swing, 10 per leg,
+                                                    hold; X.  Log: swing_ff_off_<time>.npz
+    $V -m hw.swing_ff --swings 10 --swing-ff        FF ON, the same.  Log: swing_ff_on_<time>.npz
+    $V -m hw.swing_ff --legs RR --swings 10 --swing-ff --log rr_on.npz
                                                     one leg: doc/swing_height's case, on the robot
+
+THE FEEDFORWARD IS A COMMAND-LINE DECISION, NOT A KEY: a run is FF off or FF
+on from its first sweep to its last, its log says which (`ff_on`, and the
+file name), and the A/B is two runs.  ENTER in hold swings again, the same
+way.
 
 HANG THE ROBOT UP FIRST.  No balance law, no height loop, no allocator and
 NO IMU: the trunk is taken as level and nothing here carries it.  The legs
@@ -36,7 +41,7 @@ can be put beside the study's table.
             (`config.KP_JOINT_HOLD` 5 / `KD_JOINT_HOLD` 0.2, `_ABD` for abd;
             `--kp-joint` and the rest are `hw.trot`'s flags), plus each
             leg's own gravity.  q_hold is the IK pose the ramp went to.
-            F flips the feedforward for the next bout.                  ENTER ->
+                                                                        ENTER ->
     swing   the gait clock runs -- TIME ALONE decides stance and swing, no
             touchdown detection.  A leg in `--legs` that the clock lifts
             leaves the joint layer entirely (the 2026-10-01 rule in
@@ -45,7 +50,7 @@ can be put beside the study's table.
             M0 J^+ (a_ref - Jdot qd_ref).  The stance legs keep the joint
             layer.  ENTER latches a stop at the next four-foot window;
             `--swings N` does the same once every swinging leg has landed
-            N times.
+            N times.  ENTER in hold swings again.
     X       e-stop, any time.  Motors stop; the legs drop to their hang.
 
 WHAT IT SHARES WITH THE WALK AND THE STUDY, EXACTLY
@@ -72,14 +77,16 @@ RESTING SITE (the hold's target, the arc's zero; there is no floor):
     h_td    height on the sweep the clock lands the foot
     vz_td   the foot's vertical speed on that sweep
 
-At exit, one row per (leg, FF) with the medians, beside the study's.
+At exit, one row per leg with the medians, beside the study's.
 
-THE LOG, `--log FILE.npz`: every torque-mode sweep -- t, phase, bout, ff_on,
-q, qd, x_b, p_swing / v_swing / a_swing (NaN on a stance leg), swing_s,
+THE LOG -- ALWAYS WRITTEN, `--log FILE.npz` names it, the default is
+swing_ff_<on|off>_<YYYYmmdd-HHMMSS>.npz in the working directory, so the two
+runs never land in one file.  Every torque-mode sweep: t, phase, bout (the
+ENTER count), q, qd, x_b, p_swing / v_swing / a_swing (NaN on a stance leg), swing_s,
 contact, q_arc (the arc's own IK, the guard's), the torque split tau_g /
 tau_hold / tau_pd / tau_ff, tau_req (before the gate), tau_cmd (sent),
 tau_meas (driver iq), errors, temps, cap -- and the run's constants once:
-q_pose, rest, period, duty, ramp, swing_height, kp_swing, kd_swing,
+ff_on, q_pose, rest, period, duty, ramp, swing_height, kp_swing, kd_swing,
 kp_joint, kd_joint, m0, height, tau_cap, tau_slew, legs.  The column names
 are `hw.swing_bench`'s where the two have the same thing.
 """
@@ -133,15 +140,12 @@ TAU_CAP = SAFE.TAU_HARD_NM           # 9 N*m
 TAU_SLEW = 300.0                     # N*m/s
 #: mm above the resting site that counts as "the foot has left" (lag).
 CLEAR_MM = 4.0
-#: s in HOLD before `--ab` presses ENTER / F by itself.
-AB_PAUSE_S = 2.0
 
 PHASES = ("limp", "pose", "hold", "swing")
 PHASE_BLURB = {
     "limp": "NO TORQUE -- the legs hang.  ENTER ramps them to FOLD2's hold.",
     "pose": "POSITION mode, smoothstep to the hold.  Torque follows by itself.",
-    "hold": "TORQUE -- every leg on the joint layer + gravity.  ENTER swings; "
-            "F flips the feedforward; X stops.",
+    "hold": "TORQUE -- every leg on the joint layer + gravity.  ENTER swings; X stops.",
     "swing": "the clock runs; ENTER latches a stop at the next four-foot window; "
              "X is an E-STOP.",
 }
@@ -206,7 +210,7 @@ class SwingFF:
                  swing_height: float = SWING_HEIGHT, swing_ff: bool = False,
                  kp_swing=None, kd_swing=None, kp_joint=None, kd_joint=None,
                  ff_inertia=None, height: float = FOLD2_HEIGHT,
-                 pose_s: float = POSE_S, swings: int = 0, ab: bool = False,
+                 pose_s: float = POSE_S, swings: int = 0,
                  swing_stop_deg: float = 30.0) -> None:
         self.gate = gate
         self.gait = gait
@@ -232,7 +236,6 @@ class SwingFF:
         self.height = float(height)
         self.pose_s = float(pose_s)
         self.swings_wanted = int(swings)
-        self.ab = bool(ab)
         self.swing_stop_deg = float(swing_stop_deg)
         #: The hold: FOLD2's feet, the trunk `height` up -- what the ramp
         #: goes to, what the joint layer holds, where the arc leaves from.
@@ -244,8 +247,7 @@ class SwingFF:
         self.max_dps = None
         self.trip = None
         self.notice = None
-        self.bout = 0                           # bouts started
-        self.bouts_done = 0
+        self.bout = 0                           # ENTERs into swing
         self.stop_latched = False
         self.tau = np.zeros(C.N_JOINTS)         # requested, before the gate
         self.tau_g = np.zeros(C.N_JOINTS)
@@ -288,24 +290,6 @@ class SwingFF:
         self.stop_latched = True
         return "stop latched: HOLD at the next four-foot window"
 
-    def toggle_ff(self) -> str:
-        if self.phase == "swing":
-            return "F ignored while swinging: ENTER stops the bout first"
-        self.swing_ff = not self.swing_ff
-        return "feedforward %s for the next bout" % ("ON" if self.swing_ff else "OFF")
-
-    def auto(self, now: float, q) -> str | None:
-        """`--ab`: the operator's keys, pressed by the clock.  Returns a line to
-        print, or "exit" once the second bout has landed."""
-        if not self.ab or self.phase != "hold" or now - self.t_phase < AB_PAUSE_S:
-            return None
-        if self.bouts_done == 0:
-            return "[ab] " + self.enter(now, q)
-        if self.bouts_done == 1:
-            said = self.toggle_ff()
-            return "[ab] %s\n   [ab] %s" % (said, self.enter(now, q))
-        return "exit"
-
     def _go(self, phase: str, now: float) -> None:
         self.phase = phase
         self.t_phase = float(now)
@@ -329,7 +313,7 @@ class SwingFF:
                 off = np.degrees(np.abs(C.unflat(body.q) - self.q_pose)).max()
                 self.notice = ("HOLD: torque mode, the joint layer on the IK pose (the ramp "
                                "arrived within %.2f deg).  The gate ramps the cap over %.1f s."
-                               "  ENTER to swing, F to flip the feedforward (now %s)."
+                               "  ENTER to swing (FF %s)."
                                % (off, self.gate.ramp_s, "ON" if self.swing_ff else "OFF"))
             return "position", C.flat(q_des)
         return "torque", self._torque(now, body)
@@ -355,9 +339,8 @@ class SwingFF:
             # what matters in the air (`hw.swing_bench` says why).
             if self.stop_latched and clock.contact.all():
                 self._go("hold", now)
-                self.bouts_done += 1
                 self.notice = ("HOLD: bout %d stopped at a four-foot window.  ENTER swings "
-                               "again (FF %s), F flips it." % (
+                               "again (FF %s); X ends the run." % (
                                    self.bout, "ON" if self.swing_ff else "OFF"))
                 swinging[:] = False
                 self.swing_s[:] = 0.0
@@ -437,7 +420,7 @@ class SwingFF:
         return head
 
     def report(self) -> str:
-        """One row per (leg, FF): the study's medians.  The A/B."""
+        """One row per leg: the study's medians, this run's FF state."""
         if not self.done:
             return "  no swing landed"
         out = ["  %-4s %-3s %3s  %11s %6s  %7s  %7s  %8s  %8s  %6s  %6s  %6s  %6s"
@@ -490,8 +473,7 @@ def _print_phase(bench: SwingFF) -> None:
 def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
         clock=time.perf_counter, log: "RunLog | None" = None,
         gcq: "RT.QuietGC | None" = None) -> str | None:
-    """Drive `bench` on an ARMED `mb` until X, a trip, or `--ab`'s end.  Returns
-    the reason, None for a clean end.  `hw.swing_bench.run`'s loop: the same
+    """Drive `bench` on an ARMED `mb` until X or a trip.  Returns the reason.  `hw.swing_bench.run`'s loop: the same
     round robin, latched sweep, gate, monitors and stop lines, with the IMU
     replaced by `TrunkOrientation.level()`."""
     ids = HM.motor_ids()
@@ -545,13 +527,6 @@ def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
                 return "operator X"
             if pressed in ("\r", "\n"):
                 print("\n   " + bench.enter(now, q), flush=True)
-            elif pressed in ("f", "F"):
-                print("\n   " + bench.toggle_ff(), flush=True)
-            said = bench.auto(now, q)
-            if said == "exit":
-                return None
-            if said:
-                print("\n   " + said, flush=True)
 
             mode, values = bench.update(now, body)
             if bench.trip:
@@ -585,7 +560,7 @@ def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
                     return reason
                 if log is not None:
                     log.add(t=now - t0, phase=bench.phase, bout=bench.bout,
-                            ff_on=bench.swing_ff, q=q, qd=qd_ctrl, x_b=body.x_b,
+                            q=q, qd=qd_ctrl, x_b=body.x_b,
                             p_swing=bench.p_swing.copy(), v_swing=bench.v_swing.copy(),
                             a_swing=bench.a_swing.copy(), swing_s=bench.swing_s.copy(),
                             contact=bench.contact.copy(), q_arc=bench.q_arc.copy(),
@@ -645,18 +620,16 @@ def main(argv=None) -> int:
     ap.add_argument("--legs", nargs="+", default=list(C.LEGS), choices=list(C.LEGS),
                     help="which legs follow the arc when the clock lifts them")
     ap.add_argument("--swing-ff", action="store_true",
-                    help="start with the feedforward ON (F flips it between bouts)")
+                    help="the inertial feedforward ON for the whole run (off without)")
     ap.add_argument("--swings", type=int, default=0, metavar="N",
                     help="stop a bout once every swinging leg has landed N times; "
                          "0 waits for ENTER")
-    ap.add_argument("--ab", type=int, default=None, metavar="N",
-                    help="the whole A/B by itself: N swings per leg with the feedforward "
-                         "as --swing-ff says, hold, N with it flipped, hold, exit")
     ap.add_argument("--height", type=float, default=1e3 * FOLD2_HEIGHT, metavar="MM",
                     help="floor to trunk bottom at FOLD2's hold")
     ap.add_argument("--pose-s", type=float, default=POSE_S,
                     help="the position ramp from the hang to the hold, s")
-    ap.add_argument("--log", default=None, metavar="FILE.npz")
+    ap.add_argument("--log", default=None, metavar="FILE.npz",
+                    help="where the run goes; default swing_ff_<on|off>_<time>.npz")
 
     g = ap.add_argument_group("the clock", "the study's: time alone, no touchdown detection")
     g.add_argument("--period", type=float, default=PERIOD_S, metavar="SECONDS")
@@ -697,13 +670,8 @@ def main(argv=None) -> int:
     s.add_argument("--unconfirmed", default=None, metavar="WHY")
     args = ap.parse_args(argv)
 
-    swings = args.swings
-    if args.ab is not None:
-        if args.ab <= 0:
-            ap.error("--ab wants a positive number of swings per leg")
-        if args.swings and args.swings != args.ab:
-            ap.error("--ab sets --swings; give one of them")
-        swings = args.ab
+    log_path = args.log or time.strftime("swing_ff_%s_%%Y%%m%%d-%%H%%M%%S.npz"
+                                         % ("on" if args.swing_ff else "off"))
     try:
         gait = GAIT.TrotGait(period=args.period, duty=args.duty, ramp=args.contact_ramp,
                              settle_s=0.0)
@@ -726,8 +694,7 @@ def main(argv=None) -> int:
                         kp_joint=[args.kp_joint_abd, args.kp_joint, args.kp_joint],
                         kd_joint=[args.kd_joint_abd, args.kd_joint, args.kd_joint],
                         ff_inertia=m0, height=1e-3 * args.height, pose_s=args.pose_s,
-                        swings=swings, ab=args.ab is not None,
-                        swing_stop_deg=args.swing_stop)
+                        swings=args.swings, swing_stop_deg=args.swing_stop)
     except ValueError as refusal:
         print("[swing_ff] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
         return 2
@@ -757,19 +724,14 @@ def main(argv=None) -> int:
           % (args.swing_height, 1e3 * gait.swing_duration, bench.kp_swing, bench.kd_swing,
              demand["qd"][2], demand["tau"].max(), demand["slew"], args.tau_slew))
     print("  feedforward M0 J^+ (a_ref - Jdot qd_ref): M0 diag %s kg m^2 (armature %s); "
-          "starts %s, F flips it between bouts; logged as tau_ff"
+          "%s FOR THIS RUN (--swing-ff); logged as tau_ff"
           % (np.array2string(np.diag(bench.m0), precision=4),
              "%.5f" % (P.ARMATURE if args.ff_armature is None else args.ff_armature),
              "ON" if args.swing_ff else "OFF"))
-    if args.ab is not None:
-        print("  --ab %d: bout 1 FF %s, bout 2 FF %s, %d swings per leg each, %.0f s of hold "
-              "between; exits with the table"
-              % (args.ab, "ON" if args.swing_ff else "OFF",
-                 "OFF" if args.swing_ff else "ON", args.ab, AB_PAUSE_S))
+    print("  log: %s" % log_path)
     print("  the study's prediction (doc/swing_height, RR): FF off apex ~15 mm / h_td ~+13; "
           "FF on apex ~23 / h_td ~-2")
-    print("  ENTER: limp -> pose; hold -> swing; swing -> stop at four feet.  F: flip FF.  "
-          "X: E-STOP.")
+    print("  ENTER: limp -> pose; hold -> swing; swing -> stop at four feet.  X: E-STOP.")
 
     from .motor import motorbus  # noqa: F401  (the bus module the link opens)
     print("  " + RT.boost())
@@ -780,17 +742,15 @@ def main(argv=None) -> int:
         return 2
     since = CANL.uptime()
     key = KeyPoller()
-    if not key.ok and args.ab is None:
-        print("[swing_ff] stdin is not a terminal: ENTER, F and X will not work",
+    if not key.ok:
+        print("[swing_ff] stdin is not a terminal: ENTER and X will not work",
               file=sys.stderr)
-    log = None
-    if args.log:
-        log = RunLog(q_pose=bench.q_pose, rest=bench.rest, period=gait.period,
-                     duty=gait.duty, ramp=gait.ramp, swing_height=bench.swing_height,
-                     kp_swing=bench.kp_swing, kd_swing=bench.kd_swing,
-                     kp_joint=bench.kp_joint, kd_joint=bench.kd_joint, m0=bench.m0,
-                     height=bench.height, tau_cap=args.tau_cap, tau_slew=args.tau_slew,
-                     legs=bench.legs)
+    log = RunLog(ff_on=bench.swing_ff, q_pose=bench.q_pose, rest=bench.rest,
+                 period=gait.period, duty=gait.duty, ramp=gait.ramp,
+                 swing_height=bench.swing_height, kp_swing=bench.kp_swing,
+                 kd_swing=bench.kd_swing, kp_joint=bench.kp_joint, kd_joint=bench.kd_joint,
+                 m0=bench.m0, height=bench.height, tau_cap=args.tau_cap,
+                 tau_slew=args.tau_slew, legs=bench.legs)
     stop = None
     gcq = RT.QuietGC()
     try:
@@ -814,7 +774,7 @@ def main(argv=None) -> int:
         print("[can] at the stop: %s" % CANL.describe(getattr(mb, "at_stop", None)))
         for line in CANL.dmesg_since(since):
             print("[can] dmesg: " + line)
-    print("[swing_ff] swings, median [p10, p90] apex; FF off against FF on:")
+    print("[swing_ff] swings, FF %s, median [p10, p90] apex:" % ("ON" if bench.swing_ff else "OFF"))
     print(bench.report())
     if gate.started_at is not None:
         print("[swing_ff] peak joint speed, driver / encoder (rad/s; trip %s at %.1f):"
@@ -824,8 +784,7 @@ def main(argv=None) -> int:
             print("  %s  %s" % (C.LEGS[leg], "   ".join(
                 "%4.1f / %4.1f" % pair for pair in zip(
                     gate.qd_peak[row], gate.encoder_qd_peak[row]))))
-    if log is not None:
-        print("[swing_ff] log: %s" % log.save(args.log))
+    print("[swing_ff] log: %s" % log.save(log_path))
     if stop:
         print("[swing_ff] stopped: %s.  Motors stopped; the legs hang." % stop)
         return 0 if stop in ("operator X", "Ctrl-C") else 3
