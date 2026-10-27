@@ -1,0 +1,17 @@
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+ & apex & $s_{apex}$ & lag & rms & $h_{td}$ & $v_{z,td}$ & $|x|$ & $\hat\tau$ & clip \\
+ & mm & & ms & mm & mm & m/s & mm & N\,m & N\,m \\
+\midrule
+FF off & 15.0 & 0.83 & 55 & 9.9 & 13.0 & $-$0.10 & 4.2 & 0.95 & 0.00 \\
+FF on & 23.4 & 0.52 & 33 & 3.4 & $-$1.9 & $-$0.11 & 5.0 & 3.31 & 0.21 \\
+FF on, $\mathbf{M}_0 = \mathbf{M}_{\mathrm{MuJoCo}}(\mathbf{q}_{hold})$ & 23.2 & 0.52 & 33 & 3.4 & $-$1.7 & $-$0.11 & 5.2 & 3.30 & 0.21 \\
+\midrule
+FF off, rotor 0.005 & 18.0 & 0.76 & 55 & 9.8 & 11.6 & $-$0.24 & 3.5 & 1.05 & 0.00 \\
+FF on, rotor 0.005, $\mathbf{M}_0$ on 0.0085 & 34.0 & 0.45 & 28 & 12.1 & $-$8.8 & $-$0.08 & 17.3 & 4.15 & 0.78 \\
+FF on, rotor 0.005, $\mathbf{M}_0$ on 0.005 & 24.5 & 0.48 & 33 & 3.6 & $-$3.4 & $-$0.10 & 5.7 & 2.61 & 0.00 \\
+\midrule
+FF off, joint damping 0.1 & 10.0 & 0.79 & 66 & 9.8 & 7.6 & $-$0.09 & 5.0 & 0.96 & 0.00 \\
+FF on, joint damping 0.1 & 17.3 & 0.45 & 33 & 4.4 & $-$4.8 & $+$0.02 & 5.8 & 3.50 & 0.23 \\
+\bottomrule
+\end{tabular}

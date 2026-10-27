@@ -1,0 +1,41 @@
+THE LEG AT THE STUDY'S HOLD (FOLD2, 160 mm): q = [90.   51.74 53.12] deg, foot at [-219.5  -65.  -180. ] mm (trunk)
+  M(q) from MuJoCo, weighed leg, armature in:
+[[1.18312e-02 1.20699e-04 1.22840e-06]
+ [1.20699e-04 1.30813e-02 3.78763e-04]
+ [1.22840e-06 3.78763e-04 8.72500e-03]]
+  M(q) the law's RNEA, CAD masses, armature in:
+[[1.26360e-02 1.14850e-04 2.20198e-06]
+ [1.14850e-04 1.40148e-02 6.78953e-04]
+ [2.20198e-06 6.78953e-04 8.90333e-03]]
+  M0 the feedforward multiplies by (FL at the lift pose, CAD):
+[[ 1.15466e-02 -1.43302e-04 -2.04119e-06]
+ [-1.43302e-04  1.38562e-02  5.99637e-04]
+ [-2.04119e-06  5.99637e-04  8.90333e-03]]
+  armature share of diag M (abd/pitch/knee): [0.718 0.65  0.974]
+  g(q) MuJoCo weighed [-0.0207 -0.2316  0.0064]   law (CAD, closed form) [-0.0198 -0.2571  0.0116] N*m
+  Lambda = (J M^-1 J^T)^-1 diag, x/y/z: [0.296 0.369 5.722] kg  (links only, no armature: [0.061 0.103 0.576] kg)
+  J at the hold:
+[[ 0.0000e+00  1.8001e-01  1.0149e-01]
+ [ 1.8001e-01 -2.1431e-18  1.6486e-18]
+ [-5.0000e-03 -3.5000e-02  2.6924e-02]]
+  swing.swing_feedforward (bench) vs swing_control.inertial_feedforward (walk), 160 ms / 20 mm arc: max |diff| 3.6e-14 N*m
+  along the arc: peak |M qdd| (MuJoCo) [0.03 2.55 3.08], peak |g| [0.02 0.29 0.01], peak |c qd| [0.003 0.003 0.006] N*m; the law's feedforward peak [0.03 2.63 3.1 ] N*m, its peak rate [  4. 357. 424.] N*m/s against the 300 slew
+THE z AXIS ALONE (linear_model): Lambda_z 5.72 kg (rotor 0.005: 3.60), Kp 400, Kd 40 -> wn 8.36 rad/s (1.33 Hz), zeta 0.42
+  FF off                               apex 11.2 mm at s=0.87  h_td 10.9 mm  lag 68 ms
+  FF on, lam0 = lam                    apex 20.0 mm at s=0.50  h_td -0.0 mm  lag 26 ms
+  FF off, rotor 0.005                  apex 14.2 mm at s=0.80  h_td 12.2 mm  lag 58 ms
+  FF on, rotor 0.005, lam0 on 0.0085   apex 27.5 mm at s=0.44  h_td -7.2 mm  lag 22 ms
+
+PER SWING, median [p10, p90] over swings 3-40 (study metrics; heights above the resting site, mm)
+  FF off                               n 38  apex 15.0 [14.7, 15.1] at s=0.83  lag 55 [55, 61] ms  rms 9.9 [9.7, 10.0]  h_td 13.0 [12.8, 13.4]  vz_td -0.10 m/s  x 4.2 [4.0, 5.9]  under +0.9  tau_pk 0.95  ff 0.00  pd 1.00  clip 0.00
+  FF on                                n 38  apex 23.4 [22.0, 24.8] at s=0.52  lag 33 [28, 33] ms  rms 3.4 [2.8, 4.5]  h_td -1.9 [-3.8, 0.1]  vz_td -0.11 m/s  x 5.0 [2.5, 6.8]  under -2.3  tau_pk 3.31  ff 3.07  pd 0.87  clip 0.21
+  FF off, ideal chain                  n 38  apex 14.1 [14.1, 14.1] at s=0.79  lag 55 [50, 55] ms  rms 9.2 [9.1, 9.3]  h_td 12.2 [12.1, 12.4]  vz_td -0.08 m/s  x 3.3 [3.3, 3.3]  under +1.8  tau_pk 0.87  ff 0.00  pd 0.85  clip 0.00
+  FF on, ideal chain                   n 38  apex 21.7 [21.1, 21.9] at s=0.48  lag 28 [22, 28] ms  rms 1.6 [1.3, 1.9]  h_td 0.7 [-0.2, 1.2]  vz_td -0.01 m/s  x 1.0 [1.0, 1.4]  under +0.7  tau_pk 3.11  ff 3.05  pd 0.12  clip 0.00
+  FF on, M0 = MuJoCo M(q_hold)         n 38  apex 23.2 [21.8, 24.5] at s=0.52  lag 33 [28, 33] ms  rms 3.4 [2.8, 4.4]  h_td -1.7 [-3.6, 0.3]  vz_td -0.11 m/s  x 5.2 [2.6, 6.6]  under -2.1  tau_pk 3.30  ff 3.05  pd 0.86  clip 0.21
+  FF off, rotor 0.005                  n 38  apex 18.0 [17.6, 18.1] at s=0.76  lag 55 [55, 61] ms  rms 9.8 [9.7, 9.9]  h_td 11.6 [11.1, 12.3]  vz_td -0.24 m/s  x 3.5 [2.5, 5.3]  under -2.8  tau_pk 1.05  ff 0.00  pd 1.06  clip 0.00
+  FF on, rotor 0.005, M0 on 0.0085     n 38  apex 34.0 [32.5, 37.2] at s=0.45  lag 28 [28, 28] ms  rms 12.1 [9.8, 13.0]  h_td -8.8 [-11.9, -5.7]  vz_td -0.08 m/s  x 17.3 [14.2, 21.5]  under -8.8  tau_pk 4.15  ff 3.74  pd 1.63  clip 0.78
+  FF on, rotor 0.005, M0 on 0.005      n 38  apex 24.5 [23.4, 25.6] at s=0.48  lag 33 [28, 33] ms  rms 3.6 [3.0, 4.3]  h_td -3.4 [-4.8, -2.4]  vz_td -0.10 m/s  x 5.7 [2.5, 7.0]  under -3.5  tau_pk 2.61  ff 1.92  pd 0.89  clip 0.00
+  FF off, joint damping 0.1            n 38  apex 10.0 [9.8, 10.0] at s=0.79  lag 66 [66, 72] ms  rms 9.8 [9.7, 9.8]  h_td 7.6 [7.5, 7.9]  vz_td -0.09 m/s  x 5.0 [4.8, 6.1]  under +2.4  tau_pk 0.96  ff 0.00  pd 0.91  clip 0.00
+  FF on, joint damping 0.1             n 38  apex 17.3 [16.5, 18.2] at s=0.45  lag 33 [28, 33] ms  rms 4.4 [3.7, 5.2]  h_td -4.8 [-6.5, -3.6]  vz_td +0.02 m/s  x 5.8 [4.2, 6.9]  under -4.8  tau_pk 3.50  ff 3.35  pd 0.74  clip 0.23
+  ROBOT, FF off (p1_lat_1..3, RR)      n 81  apex 19.3 [17.7, 20.5]  lag 50 [44, 56] ms  rms 11.9 [10.3, 13.9]  h_td 12.7 [8.5, 15.5]   (period 0.80 s, swing 159 ms)
+                                       heights above the arc's start (z_ref at the clock's liftoff); the commanded arc peaks 20.8 [20.0, 21.7] above it; the foot sits 1.8 [-0.2, 3.8] above the floor plane at liftoff; on the study's absolute scale apex 21.2 [18.3, 23.1], h_td 14.9 [9.0, 16.7]

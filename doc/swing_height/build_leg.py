@@ -1,0 +1,185 @@
+"""The RR leg alone, trunk pinned: `model/leg_RR.xml`, and the gate that says it
+is the robot's leg.
+
+    D:\\mujoco\\.venv\\Scripts\\python.exe doc\\swing_height\\build_leg.py
+
+WHERE EACH NUMBER COMES FROM
+    geometry    `sim/model/dog6.xml`'s hip_RR / thigh_RR / shin_RR: body
+                offsets, hinge axes, the CAD's link CoMs and inertia tensors,
+                the foot site.  That file is the convention `hw.kinematics`
+                and the robot's encoders use (flat zero, 2026-09 fix).
+    masses      WEIGHED, from D:\\mujoco\\dog6_description\\leg_swing\\leg.xml:
+                hip 0.385 kg (adapter 55 g + pitch motor 330 g), thigh 0.391
+                (link 61 g + knee motor 330 g), shin 0.040 (shin + foot).
+                Each CAD tensor is scaled by weighed / CAD mass, the CoM kept
+                -- leg.xml's own recipe.
+    armature    0.0085 kg m^2 on every hinge: the MG5010-i10 datasheet's
+                rotor inertia, 8.5e-5 kg m^2 (850 g cm^2), x the 10:1 ratio
+                squared.  DOG5 and DOG6 use the same motor.
+
+WHY NOT leg.xml ITSELF
+    leg.xml was cut from D:\\mujoco\\dog6_description\\dog6.xml, the
+    2026-09-07 extraction -- BEFORE sim/model/dog6.xml's hand fix of
+    2026-09-15, which rolled every leg body's inertial and sites 180 deg about
+    x ((x, y, z) -> (x, -y, -z), ixy and ixz negated) because the flat zero
+    had been folded the wrong way.  So in leg.xml every link CoM and the foot
+    site have the opposite z: at the same joint angles its foot is up to 10 mm
+    from `hw.kinematics.foot_position(3, q)` and its abd gravity torque has
+    the opposite sign.  The masses are right; the frame is not the robot's.
+    This file keeps the first and replaces the second, and `check()` below
+    holds the result to the controller's kinematics.
+
+leg.xml switches gravity off because M(q) does not depend on it.  The swing
+needs g(q), so here it is on, and three motors (gear 1, N*m) drive the hinges.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, REPO)
+
+import mujoco                                    # noqa: E402
+
+from sim import params as P                      # noqa: E402
+from hw import kinematics as HK                  # noqa: E402
+from hw.balance import torque as TRQ             # noqa: E402
+
+LEG = 3                                          # RR, `sim.coordinates.LEGS`
+OUT = os.path.join(HERE, "model", "leg_RR.xml")
+BODIES = ("hip_RR", "thigh_RR", "shin_RR")
+JOINTS = ("hip_abd_RR", "hip_pitch_RR", "knee_RR")
+#: kg, weighed (leg.xml's header).
+WEIGHED = {"hip_RR": 0.385, "thigh_RR": 0.391, "shin_RR": 0.040}
+ARMATURE = 0.0085
+
+
+def _f(x) -> str:
+    return " ".join("%.16g" % float(v) for v in np.atleast_1d(x))
+
+
+def _cad_leg():
+    """The three RR bodies of the robot's MJCF, as attribute dicts."""
+    with open(P.XML_PATH, encoding="utf-8") as fh:
+        # its header comment holds "--", which MuJoCo reads and ElementTree
+        # refuses; nothing in a comment is wanted here
+        root = ET.fromstring(re.sub(r"<!--.*?-->", "", fh.read(), flags=re.S))
+    out = {}
+    for name in BODIES:
+        body = root.find(".//body[@name='%s']" % name)
+        inertial = body.find("inertial")
+        joint = body.find("joint")
+        site = body.find("site")
+        out[name] = dict(
+            pos=np.array(body.get("pos").split(), float),
+            axis=np.array(joint.get("axis").split(), float),
+            ipos=np.array(inertial.get("pos").split(), float),
+            mass=float(inertial.get("mass")),
+            full=np.array(inertial.get("fullinertia").split(), float),
+            site=None if site is None else np.array(site.get("pos").split(), float))
+    return out
+
+
+def build() -> str:
+    cad = _cad_leg()
+    lines = []
+    for k, name in enumerate(BODIES):
+        b = cad[name]
+        scale = WEIGHED[name] / b["mass"]
+        pad = "  " * (k + 2)
+        lines.append('%s<body name="%s" pos="%s">' % (pad, name, _f(b["pos"])))
+        lines.append('%s  <joint name="%s" axis="%s"/>' % (pad, JOINTS[k], _f(b["axis"])))
+        lines.append('%s  <!-- CAD %.4f kg -> weighed %.3f kg: tensor x %.4f -->'
+                     % (pad, b["mass"], WEIGHED[name], scale))
+        lines.append('%s  <inertial pos="%s" mass="%.3f"' % (pad, _f(b["ipos"]), WEIGHED[name]))
+        lines.append('%s            fullinertia="%s"/>' % (pad, _f(b["full"] * scale)))
+        if b["site"] is not None:
+            lines.append('%s  <site name="foot_RR" pos="%s" size="0.006"/>'
+                         % (pad, _f(b["site"])))
+    for k in reversed(range(len(BODIES))):
+        lines.append("%s</body>" % ("  " * (k + 2)))
+    body = "\n".join(lines)
+    total = sum(WEIGHED.values())
+    xml = f"""<!-- GENERATED by doc/swing_height/build_leg.py -- edit that, not this.
+
+  DOG6's RR leg alone, the trunk pinned to the world: the robot hung up.
+  Geometry, CoMs and tensor shapes: sim/model/dog6.xml (the hw convention).
+  Masses: weighed, {total:.3f} kg for the leg (leg.xml's numbers); each CAD
+  tensor scaled by weighed / CAD mass.  Armature {ARMATURE} kg m^2 = the
+  MG5010-i10 datasheet rotor, 8.5e-5, x 10^2 (DOG5 and DOG6 share the motor).
+  Gravity ON (the swing needs g(q)); no joint damping, no friction, no
+  contact: the leg swings in air.
+-->
+<mujoco model="dog6_leg_RR">
+  <compiler angle="radian" autolimits="true"/>
+  <option gravity="0 0 -9.81" integrator="implicitfast"/>
+  <default>
+    <joint type="hinge" armature="{ARMATURE}" damping="0"/>
+    <motor gear="1"/>
+  </default>
+  <worldbody>
+{body}
+  </worldbody>
+  <actuator>
+    <motor name="hip_abd_RR" joint="hip_abd_RR"/>
+    <motor name="hip_pitch_RR" joint="hip_pitch_RR"/>
+    <motor name="knee_RR" joint="knee_RR"/>
+  </actuator>
+</mujoco>
+"""
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    with open(OUT, "w", encoding="utf-8") as fh:
+        fh.write(xml)
+    return OUT
+
+
+def check(n: int = 2000, seed: int = 0) -> dict:
+    """The model against the controller's own chain, over random joints on the
+    full circle: FK at the foot site, the site Jacobian, and g(q) as MuJoCo
+    computes it against the closed form the law feeds forward -- which reads
+    the CAD masses, so g is compared on a CAD-mass copy (`cad=True`)."""
+    out = {}
+    rng = np.random.default_rng(seed)
+    for cad in (False, True):
+        spec = mujoco.MjSpec.from_file(OUT)
+        if cad:
+            src = _cad_leg()
+            for name in BODIES:
+                b = spec.body(name)
+                b.mass = src[name]["mass"]
+                b.fullinertia = src[name]["full"]
+        m = spec.compile()
+        d = mujoco.MjData(m)
+        site = m.site("foot_RR").id
+        e_p = e_j = e_g = 0.0
+        jac = np.zeros((3, m.nv))
+        for _ in range(n):
+            q = rng.uniform(-np.pi, np.pi, 3)
+            d.qpos[:] = q
+            d.qvel[:] = 0.0
+            mujoco.mj_forward(m, d)
+            e_p = max(e_p, np.abs(d.site_xpos[site] - HK.foot_position(LEG, q)).max())
+            mujoco.mj_jacSite(m, d, jac, None, site)
+            e_j = max(e_j, np.abs(jac - HK.foot_jacobian(LEG, q)).max())
+            e_g = max(e_g, np.abs(d.qfrc_bias - TRQ.leg_gravity_torque(LEG, q)).max())
+        out["cad" if cad else "weighed"] = dict(fk=e_p, jac=e_j, g=e_g)
+    return out
+
+
+if __name__ == "__main__":
+    print("wrote", build())
+    r = check()
+    print("against hw.kinematics / hw.balance.torque, 2000 random q on the full circle:")
+    for k, v in r.items():
+        print("  %-8s max |FK| %.1e m   max |J| %.1e m   max |g - g_law| %.1e N*m"
+              % (k, v["fk"], v["jac"], v["g"]))
+    ok = r["cad"]["fk"] < 1e-12 and r["cad"]["jac"] < 1e-12 and r["cad"]["g"] < 1e-12
+    print("GATE", "PASS" if ok else "FAIL",
+          "(the CAD-mass copy must match the law's chain to 1e-12)")
+    raise SystemExit(0 if ok else 1)
