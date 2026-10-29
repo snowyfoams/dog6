@@ -1,0 +1,48 @@
+THE HUNG-UP SWING, 2026-10-27, ROUND 1: hw.swing_ff, all four legs, 12 swings a leg, FOLD2 at 160 mm, 20 mm arc, duty 0.8, ramp 0.15, Kp 150/150/400, Kd 6/6/40, cap 9 N*m, slew 300 N*m/s
+per run, median [p10, p90] over the 40 swings after the first two of each leg; heights above the resting site, mm
+
+  group run                   T s swing | apex                   s  lag ms            rms    h_td                vz_td  t_arr ms         vz_arr     dip   x mm
+  B1    FF off, 0.6 s         0.6  116ms |  12.8 [12.4, 13.4]  0.81     53 [49, 56]  10.3   10.6 [9.7, 11.6]  -0.16     48 [44, 52]  -0.12   +0.1    4.8
+  B2    FF off, 0.8 s         0.8  156ms |  15.1 [14.5, 15.8]  0.76     62 [60, 65]   9.7    9.9 [9.2, 10.9]  -0.21     44 [40, 48]  -0.11   +0.3    4.4
+  B3    FF off, 1.0 s         1.0  196ms |  16.6 [16.0, 17.3]  0.73     72 [69, 74]   8.9    8.4 [7.9, 9.0]  -0.22     40 [32, 44]  -0.10   +0.6    4.3
+  B4    FF off, 1.4 s         1.4  276ms |  18.4 [17.6, 19.0]  0.67     90 [85, 93]   7.5    5.9 [5.4, 6.4]  -0.15     32 [24, 44]  -0.08   +0.8    4.9
+  B5    FF off, 2.0 s         2.0  395ms |  19.2 [18.2, 19.9]  0.61    117 [115, 120]   6.2    4.1 [3.6, 5.1]  -0.09     36 [20, 56]  -0.04   +1.0    4.2
+  B6    FF on 0.003, 2.0 s    2.0  395ms |  16.7 [15.6, 16.9]  0.50     82 [82, 87]   3.8    4.0 [3.6, 4.6]  +0.01     64 [60, 68]  -0.05   +0.8    4.1
+  B7    FF on 0.001, 0.8 s    0.8  155ms |  15.3 [14.6, 15.7]  0.66     46 [41, 46]   9.0    3.1 [2.3, 3.9]  -0.24      4 [0, 8]  -0.18   +0.4   11.5
+  B8    FF on 0.003, 0.8 s    0.8  155ms |  18.9 [17.9, 19.4]  0.57     36 [36, 41]   4.9   -1.6 [-2.6, -0.7]  -0.22    -15 [-20, -10]  -0.35   -2.8    7.9
+
+  the torque, per run: peaks over a swing (median over swings), N*m; rate the peak |dtau/dt| sent, N*m/s; jerk the foot's median |z'''| through the swing, m/s^3
+  group run                    tau    ff    pd  clip   meas   rate knee p90   jerk   driver: knee tau_meas on tau_cmd, lag / gain
+  B1    FF off, 0.6 s         1.22  0.00  1.30  0.00   1.02    173       62    634   12 ms / 0.67
+  B2    FF off, 0.8 s         1.01  0.00  1.00  0.00   0.82    153       41    610   12 ms / 0.68
+  B3    FF off, 1.0 s         0.82  0.00  0.79  0.00   0.70    135       29    406   12 ms / 0.68
+  B4    FF off, 1.4 s         0.67  0.00  0.54  0.00   0.60    130       19    443   12 ms / 0.68
+  B5    FF off, 2.0 s         0.61  0.00  0.42  0.00   0.55     88       19    785   12 ms / 0.68
+  B6    FF on 0.003, 2.0 s    0.52  0.24  0.31  0.00   0.50     67       10    291   12 ms / 0.68
+  B7    FF on 0.001, 0.8 s    1.56  1.11  0.97  0.00   1.40    194       56   1531   12 ms / 0.68
+  B8    FF on 0.003, 0.8 s    1.99  1.53  0.82  0.00   1.82    263       98   2354   12 ms / 0.66
+
+  per leg, apex / h_td / t_arr (mm, mm, ms):
+  B1    FF off, 0.6 s         FL 12.7 / +9.8 / +48   FR 12.6 / +10.4 / +48   RL 13.3 / +11.4 / +52   RR 13.3 / +11.3 / +48
+  B2    FF off, 0.8 s         FL 14.9 / +9.5 / +44   FR 14.5 / +9.6 / +44   RL 15.7 / +10.7 / +48   RR 15.6 / +10.6 / +40
+  B3    FF off, 1.0 s         FL 16.4 / +8.1 / +36   FR 16.0 / +8.2 / +44   RL 17.2 / +9.0 / +44   RR 17.2 / +8.6 / +32
+  B4    FF off, 1.4 s         FL 18.1 / +5.6 / +28   FR 17.7 / +6.3 / +44   RL 18.9 / +6.2 / +36   RR 18.6 / +5.5 / +24
+  B5    FF off, 2.0 s         FL 19.3 / +4.2 / +34   FR 18.2 / +5.1 / +55   RL 19.8 / +4.1 / +36   RR 19.0 / +3.7 / +22
+  B6    FF on 0.003, 2.0 s    FL 16.9 / +3.8 / +60   FR 15.6 / +4.6 / +68   RL 16.7 / +4.2 / +68   RR 16.7 / +3.6 / +64
+  B7    FF on 0.001, 0.8 s    FL 15.5 / +3.2 /  +4   FR 14.7 / +2.6 /  +0   RL 15.5 / +3.3 /  +4   RR 15.3 / +3.5 /  +4
+  B8    FF on 0.003, 0.8 s    FL 18.6 / -1.4 / -15   FR 18.6 / -1.7 / -15   RL 19.1 / -1.3 / -15   RR 19.2 / -1.6 / -15
+
+THE EFFECTIVE INERTIA the leg answered with, tau - g = I qdd + b qd + c over the swing windows (kg m^2; R^2 of the fit); the links' own at the hold, armature out, pitch 0.0055 knee 0.0004; the inherited rotor term 0.0085; M0's diag with it pitch 0.0140 knee 0.0089
+  group run                  | from tau_meas: pitch, knee (R^2, torque lead) | from tau_cmd: pitch, knee (R^2, torque lead) | fit / M0 (cmd) pitch, knee
+  B1    FF off, 0.6 s        | 0.0044 (0.64,  0 ms), 0.0007 (0.75, 20 ms) | 0.0056 (0.67,  4 ms), 0.0025 (0.68, 20 ms) | 0.40, 0.28
+  B2    FF off, 0.8 s        | 0.0019 (0.62, 20 ms), 0.0007 (0.76, 20 ms) | 0.0051 (0.58,  4 ms), 0.0029 (0.61,  4 ms) | 0.36, 0.32
+  B3    FF off, 1.0 s        | 0.0020 (0.65, 20 ms), 0.0007 (0.74, 20 ms) | 0.0048 (0.56,  4 ms), 0.0024 (0.52,  4 ms) | 0.34, 0.27
+  B4    FF off, 1.4 s        | 0.0013 (0.60, 20 ms), 0.0006 (0.67, 20 ms) | 0.0033 (0.42,  4 ms), 0.0019 (0.43,  4 ms) | 0.24, 0.21
+  B5    FF off, 2.0 s        | 0.0007 (0.51, 20 ms), 0.0004 (0.66, 20 ms) | 0.0022 (0.38,  4 ms), 0.0013 (0.36,  4 ms) | 0.16, 0.15
+  B6    FF on 0.003, 2.0 s   | 0.0014 (0.57, 20 ms), 0.0009 (0.77, 20 ms) | 0.0022 (0.45, 20 ms), 0.0022 (0.58, 20 ms) | 0.16, 0.25
+  B7    FF on 0.001, 0.8 s   | 0.0043 (0.56,  0 ms), 0.0005 (0.88, 20 ms) | 0.0053 (0.63,  4 ms), 0.0036 (0.73,  4 ms) | 0.38, 0.40
+  B8    FF on 0.003, 0.8 s   | 0.0011 (0.56, 20 ms), 0.0006 (0.82, 20 ms) | 0.0052 (0.64,  4 ms), 0.0026 (0.70, 20 ms) | 0.37, 0.29
+
+GUESS 1 -- period, FF off: apex 12.8, 15.1, 16.6, 18.4, 19.2 mm, h_td +10.6, +9.9, +8.4, +5.9, +4.1 mm, lag as a share of the swing 46, 40, 37, 33, 29 %, t_arr +48, +44, +40, +32, +36 ms, vz_arr -0.12, -0.11, -0.10, -0.08, -0.04 m/s for T = 0.6, 0.8, 1.0, 1.4, 2.0 s
+GUESS 2 -- 2.0 s, FF off -> on 0.003: apex 19.2 -> 16.7 mm (at s 0.61 -> 0.50), lag 117 -> 82 ms, rms 6.2 -> 3.8 mm, h_td +4.1 -> +4.0 mm, t_arr +36 -> +64 ms, vz_arr -0.04 -> -0.05 m/s
+GUESS 3 -- 0.8 s, FF off / 0.001 / 0.003: apex 15.1 / 15.3 / 18.9 mm, rms 9.7 / 9.0 / 4.9 mm, h_td +9.9 / +3.1 / -1.6 mm, t_arr +44 / +4 / -15 ms, vz_arr -0.11 / -0.18 / -0.35 m/s, dip +0.3 / +0.4 / -2.8 mm, x 4.4 / 11.5 / 7.9 mm, rate 153 / 194 / 263 N*m/s
