@@ -8,6 +8,9 @@ each to its own log.
     $V -m hw.swing_ff --swings 10 --swing-ff        FF ON, the same.  Log: swing_ff_on_<time>.npz
     $V -m hw.swing_ff --legs RR --swings 10 --swing-ff --log rr_on.npz
                                                     one leg: doc/swing_height's case, on the robot
+    $V -m hw.swing_ff --swings 10 --sched --sched-zeta 0.7
+                                                    the swing PD's Kp, Kd scheduled on Lambda(q):
+                                                    Kp = wn^2 Lambda, Kd = 2 zeta wn Lambda (below)
 
 THE FEEDFORWARD IS A COMMAND-LINE DECISION, NOT A KEY: a run is FF off or FF
 on from its first sweep to its last, its log says which (`ff_on`, and the
@@ -53,6 +56,19 @@ can be put beside the study's table.
             N times.  ENTER in hold swings again.
     X       e-stop, any time.  Motors stop; the legs drop to their hang.
 
+THE SCHEDULED PD (`--sched`, 2026-10-28).  The swing's Cartesian PD has fixed
+gains, 150 / 150 / 400 N/m and 6 / 6 / 40 N*s/m, on a foot whose apparent mass
+Lambda = (J M0^-1 J^T)^-1 is 0.31 / 0.36 / 5.8 kg at the hold and moves with the
+leg (z: 5.8 kg on the ground, 3.3 kg 20 mm up).  `--sched` re-reads Lambda from
+every sweep's Jacobian and sends Kp = wn^2 Lambda, Kd = 2 zeta wn Lambda
+(`swing.GainSchedule`): one natural frequency and one damping ratio per axis
+whatever the configuration.  wn defaults to what makes Kp at the FOLD2 hold the
+`--kp-swing` value, so at the hold nothing moves but Kd (zeta 0.7 asks z for
+~67 N*s/m against 40, zeta 1.0 for ~95); `--sched-wn` sets it.  Lambda is
+clamped to `--sched-lam-range` x its hold value (Kp floor and singularity cap).
+`--kd-swing` is not used when scheduled.  The log holds kp_eff / kd_eff /
+lam (4, 3, NaN off the swing) and the schedule's constants.
+
 WHAT IT SHARES WITH THE WALK AND THE STUDY, EXACTLY
     `balance.swing.swing_reference_pva` (the arc), `swing_torque` (the PD, at
     the walk's `KP_SWING_WALK` / `KD_SWING_WALK`: for an in-place arc it is
@@ -87,7 +103,8 @@ contact, q_arc (the arc's own IK, the guard's), the torque split tau_g /
 tau_hold / tau_pd / tau_ff, tau_req (before the gate), tau_cmd (sent),
 tau_meas (driver iq), errors, temps, cap -- and the run's constants once:
 ff_on, q_pose, rest, period, duty, ramp, swing_height, kp_swing, kd_swing,
-kp_joint, kd_joint, m0, height, tau_cap, tau_slew, legs.  The column names
+kp_joint, kd_joint, m0, sched_on, sched_wn, sched_zeta, sched_lam_ref,
+sched_lam_range, height, tau_cap, tau_slew, legs.  The column names
 are `hw.swing_bench`'s where the two have the same thing.
 """
 from __future__ import annotations
@@ -209,7 +226,9 @@ class SwingFF:
     def __init__(self, gate: SAFE.SafetyGate, gait: GAIT.TrotGait, *, legs,
                  swing_height: float = SWING_HEIGHT, swing_ff: bool = False,
                  kp_swing=None, kd_swing=None, kp_joint=None, kd_joint=None,
-                 ff_inertia=None, height: float = FOLD2_HEIGHT,
+                 ff_inertia=None,
+                 schedule: "SWING.GainSchedule | None" = None,
+                 height: float = FOLD2_HEIGHT,
                  pose_s: float = POSE_S, swings: int = 0,
                  swing_stop_deg: float = 30.0) -> None:
         self.gate = gate
@@ -233,6 +252,8 @@ class SwingFF:
             if kd_joint is None else kd_joint, dtype=float)
         self.m0 = (SWING.JOINT_INERTIA_M0 if ff_inertia is None
                    else np.asarray(ff_inertia, dtype=float))
+        #: None: the fixed `kp_swing` / `kd_swing`; else Kp, Kd from Lambda(q) every sweep.
+        self.schedule = schedule
         self.height = float(height)
         self.pose_s = float(pose_s)
         self.swings_wanted = int(swings)
@@ -258,6 +279,10 @@ class SwingFF:
         self.v_swing = np.full((C.N_LEGS, 3), np.nan)
         self.a_swing = np.full((C.N_LEGS, 3), np.nan)
         self.q_arc = np.full((C.N_LEGS, 3), np.nan)
+        #: the swing PD's gains and the foot's apparent mass this sweep (NaN off the swing)
+        self.kp_eff = np.full((C.N_LEGS, 3), np.nan)
+        self.kd_eff = np.full((C.N_LEGS, 3), np.nan)
+        self.lam_eff = np.full((C.N_LEGS, 3), np.nan)
         self.swing_s = np.zeros(C.N_LEGS)
         self.contact = np.ones(C.N_LEGS, dtype=bool)
         self.reports: dict[int, SwingReport] = {}
@@ -330,6 +355,9 @@ class SwingFF:
         self.v_swing[:] = np.nan
         self.a_swing[:] = np.nan
         self.q_arc[:] = np.nan
+        self.kp_eff[:] = np.nan
+        self.kd_eff[:] = np.nan
+        self.lam_eff[:] = np.nan
         swinging = np.zeros(C.N_LEGS, dtype=bool)
         if self.phase == "swing":
             clock = self.gait.sample(now)
@@ -358,7 +386,12 @@ class SwingFF:
             s = float(self.swing_s[i])
             p, v, a = SWING.swing_reference_pva(self.rest[i], s, self.gait.swing_duration,
                                                 height=self.swing_height)
-            pd = SWING.swing_torque(body, i, p, v, kp=self.kp_swing, kd=self.kd_swing)
+            if self.schedule is None:
+                kp, kd = self.kp_swing, self.kd_swing
+            else:
+                kp, kd, self.lam_eff[i] = self.schedule.gains(body.jac[i])
+            self.kp_eff[i], self.kd_eff[i] = kp, kd
+            pd = SWING.swing_torque(body, i, p, v, kp=kp, kd=kd)
             tau[sl] += pd
             self.tau_pd[sl] = pd
             if self.swing_ff:
@@ -564,6 +597,8 @@ def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
                             p_swing=bench.p_swing.copy(), v_swing=bench.v_swing.copy(),
                             a_swing=bench.a_swing.copy(), swing_s=bench.swing_s.copy(),
                             contact=bench.contact.copy(), q_arc=bench.q_arc.copy(),
+                            kp_eff=bench.kp_eff.copy(), kd_eff=bench.kd_eff.copy(),
+                            lam=bench.lam_eff.copy(),
                             tau_req=bench.tau.copy(), tau_cmd=tau_sent.copy(),
                             tau_g=bench.tau_g.copy(), tau_hold=bench.tau_hold.copy(),
                             tau_pd=bench.tau_pd.copy(), tau_ff=bench.tau_ff.copy(),
@@ -645,6 +680,19 @@ def main(argv=None) -> int:
     sw.add_argument("--ff-armature", type=float, default=None, metavar="KG_M2",
                     help="the reflected rotor inertia M0 is built on; default "
                          "params.ARMATURE %.4f, the datasheet's" % P.ARMATURE)
+    sw.add_argument("--sched", action="store_true",
+                    help="schedule the swing PD on the foot's apparent mass Lambda(q): "
+                         "Kp = wn^2 Lambda, Kd = 2 zeta wn Lambda, Lambda from the datasheet "
+                         "M0 (not --ff-armature) at every sweep's Jacobian; --kd-swing unused")
+    sw.add_argument("--sched-zeta", type=float, nargs="+", default=[0.7], metavar="ZETA",
+                    help="damping ratio, one value or one per axis (x y z); 0.7-1")
+    sw.add_argument("--sched-wn", type=float, nargs=3, default=None, metavar="RAD_PER_S",
+                    help="natural frequency per axis; default is the wn that makes Kp at "
+                         "FOLD2's hold equal --kp-swing")
+    sw.add_argument("--sched-lam-range", type=float, nargs=2, default=[0.5, 3.0],
+                    metavar=("LO", "HI"),
+                    help="Lambda is clamped to LO..HI x its value at the hold: Kp's floor "
+                         "and the singular pose's cap")
     sw.add_argument("--swing-stop", type=float, default=30.0, metavar="DEG",
                     help="TRIP: a swinging joint this far from the arc's own IK stops "
                          "the run; 0 turns it off")
@@ -687,13 +735,29 @@ def main(argv=None) -> int:
         return 2
     m0 = (None if args.ff_armature is None
           else SWING.feedforward_inertia(args.ff_armature))
+    schedule = None
+    if args.sched:
+        try:
+            if len(args.sched_zeta) not in (1, 3):
+                raise ValueError("--sched-zeta takes 1 value or 3 (x y z)")
+            # Reference: FL at FOLD2's hold (the four legs' Lambda diagonals agree);
+            # Lambda from the datasheet M0, whatever `--ff-armature` does to the feedforward.
+            schedule = SWING.GainSchedule.from_reference(
+                HK.foot_jacobian(0, fold2_pose(1e-3 * args.height)[0]),
+                zeta=args.sched_zeta[0] if len(args.sched_zeta) == 1 else args.sched_zeta,
+                kp=args.kp_swing if args.sched_wn is None else None, wn=args.sched_wn,
+                lam_range=tuple(args.sched_lam_range))
+        except ValueError as refusal:
+            print("[swing_ff] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
+            return 2
     try:
         bench = SwingFF(gate, gait, legs=[C.LEGS.index(name) for name in args.legs],
                         swing_height=1e-3 * args.swing_height, swing_ff=args.swing_ff,
                         kp_swing=args.kp_swing, kd_swing=args.kd_swing,
                         kp_joint=[args.kp_joint_abd, args.kp_joint, args.kp_joint],
                         kd_joint=[args.kd_joint_abd, args.kd_joint, args.kd_joint],
-                        ff_inertia=m0, height=1e-3 * args.height, pose_s=args.pose_s,
+                        ff_inertia=m0, schedule=schedule,
+                        height=1e-3 * args.height, pose_s=args.pose_s,
                         swings=args.swings, swing_stop_deg=args.swing_stop)
     except ValueError as refusal:
         print("[swing_ff] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
@@ -723,6 +787,23 @@ def main(argv=None) -> int:
           "~%.1f N*m inertial; slew ~%.0f to rise against %.0f"
           % (args.swing_height, 1e3 * gait.swing_duration, bench.kp_swing, bench.kd_swing,
              demand["qd"][2], demand["tau"].max(), demand["slew"], args.tau_slew))
+    if schedule is None:
+        print("  swing PD: FIXED gains (--sched schedules them on Lambda(q))")
+    else:
+        # Kp, Kd where the arc takes the foot: the hold and the apex, FL.
+        apex_q, _ = SWING.joint_swing_reference(0, bench.rest[0], 0.5, gait.swing_duration,
+                                                bench.q_pose[0], height=bench.swing_height)
+        kp_h, kd_h, lam_h = schedule.gains(HK.foot_jacobian(0, bench.q_pose[0]))
+        kp_a, kd_a, lam_a = schedule.gains(HK.foot_jacobian(0, apex_q))
+        print("  swing PD SCHEDULED on Lambda(q): wn %s rad/s zeta %s, Lambda clamped to %s x hold"
+              % (np.array2string(schedule.wn, precision=1), np.array2string(schedule.zeta, precision=2),
+                 schedule.lam_range))
+        print("    hold: Lambda %s kg  Kp %s  Kd %s" % (np.array2string(lam_h, precision=2),
+              np.array2string(kp_h, precision=0), np.array2string(kd_h, precision=1)))
+        print("    apex: Lambda %s kg  Kp %s  Kd %s" % (np.array2string(lam_a, precision=2),
+              np.array2string(kp_a, precision=0), np.array2string(kd_a, precision=1)))
+        if list(args.kd_swing) != list(BCFG.KD_SWING_WALK):
+            print("    (--kd-swing %s is not used)" % (args.kd_swing,))
     print("  feedforward M0 J^+ (a_ref - Jdot qd_ref): M0 diag %s kg m^2 (armature %s); "
           "%s FOR THIS RUN (--swing-ff); logged as tau_ff"
           % (np.array2string(np.diag(bench.m0), precision=4),
@@ -749,7 +830,14 @@ def main(argv=None) -> int:
                  period=gait.period, duty=gait.duty, ramp=gait.ramp,
                  swing_height=bench.swing_height, kp_swing=bench.kp_swing,
                  kd_swing=bench.kd_swing, kp_joint=bench.kp_joint, kd_joint=bench.kd_joint,
-                 m0=bench.m0, height=bench.height, tau_cap=args.tau_cap,
+                 m0=bench.m0, height=bench.height,
+                 sched_on=schedule is not None,
+                 sched_wn=np.full(3, np.nan) if schedule is None else schedule.wn,
+                 sched_zeta=np.full(3, np.nan) if schedule is None else schedule.zeta,
+                 sched_lam_ref=np.full(3, np.nan) if schedule is None else schedule.lam_ref,
+                 sched_lam_range=(np.full(2, np.nan) if schedule is None
+                                  else np.asarray(schedule.lam_range)),
+                 tau_cap=args.tau_cap,
                  tau_slew=args.tau_slew, legs=bench.legs)
     stop = None
     gcq = RT.QuietGC()

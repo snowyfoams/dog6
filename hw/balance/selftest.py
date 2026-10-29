@@ -1361,6 +1361,50 @@ def main() -> int:
           SWING.swing_torque(at_fold, fl, rest[fl], np.zeros(3)),
           np.zeros(3), 1e-12, " N*m")
 
+    # THE SCHEDULED GAINS (`swing.GainSchedule`, 2026-10-28): Kp = wn^2 Lambda,
+    # Kd = 2 zeta wn Lambda, Lambda = (J M0^-1 J^T)^-1 from THIS sweep's Jacobian.
+    j_ref = at_fold.jac[fl]
+    zeta_s = 0.7
+    sched = SWING.GainSchedule.from_reference(j_ref, zeta_s, kp=cfg.KP_SWING_WALK)
+    kp_s, kd_s, lam_s = sched.gains(j_ref)
+    close("the schedule gives the fixed Kp back at its reference",
+          kp_s, cfg.KP_SWING_WALK, 1e-9, " N/m")
+    close("...and Kd = 2 zeta sqrt(Kp Lambda) there",
+          kd_s, 2.0 * zeta_s * np.sqrt(kp_s * lam_s), 1e-9, " N*s/m")
+    check("z is the heavy axis (reflected rotor through a short lever)",
+          bool(np.all(np.isfinite(lam_s)) and lam_s[2] > 2.0 * max(lam_s[0], lam_s[1])),
+          "Lambda %s kg" % np.array2string(lam_s, precision=2))
+    p_up = rest[fl] + np.array([0.0, 0.0, cfg.SWING_HEIGHT])
+    hip_up = p_up.copy()
+    hip_up[:2] -= P.HIP_OFFSET[fl][:2]
+    q_apex = HK.leg_ik(fl, hip_up, q_seed=C.unflat(at_fold.q)[fl])
+    kp_a, kd_a, lam_a = sched.gains(HK.foot_jacobian(fl, q_apex))
+    check("the foot at its apex is lighter in z than at the hold",
+          lam_a[2] < 0.9 * lam_s[2], "%.2f against %.2f kg" % (lam_a[2], lam_s[2]))
+    close("...Kp follows Lambda (wn held), x y z",
+          kp_a / kp_s, lam_a / lam_s, 1e-9)
+    close("...and zeta stays 0.7 where the clamp does not hold",
+          kd_a / (2.0 * np.sqrt(kp_a * lam_a)), np.full(3, zeta_s), 1e-9)
+    kp_x, kd_x, lam_x = sched.gains(np.zeros((3, 3)))
+    close("a singular Jacobian is clamped to the cap: Kp = hi x the fixed Kp",
+          kp_x, sched.lam_range[1] * cfg.KP_SWING_WALK, 1e-9, " N/m")
+    check("...and its Lambda is reported as inf", bool(np.all(np.isinf(lam_x))))
+    stiff = SWING.GainSchedule.from_reference(j_ref, zeta_s, kp=cfg.KP_SWING_WALK,
+                                              lam_range=(1.5, 3.0))
+    close("the floor holds Kp at lo x the fixed Kp when Lambda is below it",
+          stiff.gains(j_ref)[0], 1.5 * cfg.KP_SWING_WALK, 1e-9, " N/m")
+    refused = 0
+    for kwargs in (dict(zeta=0.0, kp=cfg.KP_SWING_WALK),
+                   dict(zeta=0.7, kp=cfg.KP_SWING_WALK, lam_range=(2.0, 1.0)),
+                   dict(zeta=0.7, kp=cfg.KP_SWING_WALK, wn=[20.0, 20.0, 8.0]),
+                   dict(zeta=0.7)):
+        try:
+            SWING.GainSchedule.from_reference(j_ref, **kwargs)
+        except ValueError:
+            refused += 1
+    check("a zero zeta, an inverted range, kp AND wn, or neither, are refused",
+          refused == 4, "%d of 4" % refused)
+
     # THE JOINT SWING (`--swing joint`): the same arc through the IK, abd
     # held.  The fold trot's until 2026-09-28; checked here at the 2.0 s
     # clock it was sized for, which is no longer `hw.fold_trot`'s.
