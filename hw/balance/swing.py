@@ -207,7 +207,7 @@ from . import config as cfg          # noqa: E402
 __all__ = ["rest_feet_b", "swing_reference", "swing_reference_pva",
            "solve_jacobian",
            "leg_gains", "swing_torque", "swing_feedforward",
-           "feedforward_inertia",
+           "feedforward_inertia", "foot_mass_diag", "GainSchedule",
            "joint_swing_reference", "joint_swing_torque", "swing_demand",
            "roll_level", "knee_bump", "knee_swing_amplitude",
            "knee_swing_reference", "knee_swing_demand", "SWING_MODES"]
@@ -367,6 +367,91 @@ def feedforward_inertia(armature: float | None = None) -> np.ndarray:
 
 JOINT_INERTIA_M0 = feedforward_inertia()
 JOINT_INERTIA_EST = np.diag(JOINT_INERTIA_M0)
+
+
+def foot_mass_diag(jac, inertia_inv=None) -> np.ndarray:
+    """(3,) diag of Lambda = (J M0^-1 J^T)^-1 in kg: the foot's apparent mass
+    along the trunk's x, y, z at the Jacobian `jac`.  `inertia_inv` is
+    M0^-1 (`JOINT_INERTIA_M0`'s when None).  A Jacobian too close to
+    singular for the inverse to mean anything gives inf on every axis, which
+    `GainSchedule` clamps."""
+    m_inv = np.linalg.inv(JOINT_INERTIA_M0) if inertia_inv is None else inertia_inv
+    jac = np.asarray(jac, dtype=float)
+    try:
+        lam = np.diag(np.linalg.inv(jac @ m_inv @ jac.T))
+    except np.linalg.LinAlgError:
+        return np.full(3, np.inf)
+    if not (np.all(np.isfinite(lam)) and np.all(lam > 0.0)):
+        return np.full(3, np.inf)
+    return lam
+
+
+def _per_axis(x, name: str) -> np.ndarray:
+    x = np.broadcast_to(np.asarray(x, dtype=float), (3,)).copy()
+    if not (np.all(np.isfinite(x)) and np.all(x > 0.0)):
+        raise ValueError("%s %s: every axis must be finite and > 0" % (name, x))
+    return x
+
+
+class GainSchedule:
+    """THE SWING GAINS FOLLOW THE LEG (2026-10-28).  Per Cartesian axis,
+
+        Kp = wn^2 Lambda        Kd = 2 zeta wn Lambda = 2 zeta sqrt(Kp Lambda)
+
+    with Lambda read from THIS sweep's Jacobian (`foot_mass_diag`, the
+    constant M0 of `feedforward_inertia`), so every axis keeps one natural
+    frequency and one damping ratio whatever the leg's configuration.  The
+    fixed 400 / 40 N/m, N*s/m of `config.KP_SWING_WALK` were that only at the
+    FOLD2 hold: Lambda_z is 5.8 kg there and falls to 3.3 kg with the foot
+    20 mm up (the arc's own apex), so zeta_z drifted from 0.42 to ~0.55
+    along one arc; it climbs without bound towards the singular pose as the
+    foot reaches forward.
+
+    Lambda is clamped to [lo, hi] x its value at the reference, so Kp never
+    falls below `lo` of the nominal (a soft apex) nor rises past `hi` (the
+    singular pose).  Where the clamp holds, zeta is zeta sqrt(Lambda_c /
+    Lambda) -- lower than asked, never higher.
+
+    This is the feedback half of `swing_control.swing_osc_torque` on the
+    impedance's own diagonal: the feedforward stays separate (`--swing-ff`),
+    and M0's armature is as much the gains' scale as it is
+    the feedforward's -- it scales Lambda, hence Kp and Kd."""
+
+    def __init__(self, wn, zeta, lam_ref, lam_range=(0.5, 3.0), inertia=None) -> None:
+        self.wn = _per_axis(wn, "wn")
+        self.zeta = _per_axis(zeta, "zeta")
+        self.lam_ref = _per_axis(lam_ref, "lam_ref")
+        lo, hi = (float(v) for v in lam_range)
+        if not 0.0 < lo <= hi:
+            raise ValueError("lam_range (%g, %g): need 0 < lo <= hi" % (lo, hi))
+        self.lam_range = (lo, hi)
+        self.lam_lo, self.lam_hi = lo * self.lam_ref, hi * self.lam_ref
+        self.m_inv = np.linalg.inv(JOINT_INERTIA_M0 if inertia is None
+                                   else np.asarray(inertia, dtype=float))
+
+    @classmethod
+    def from_reference(cls, jac_ref, zeta, *, kp=None, wn=None,
+                       lam_range=(0.5, 3.0), inertia=None) -> "GainSchedule":
+        """The schedule whose reference is the leg at `jac_ref`.  Give `wn`
+        (rad/s per axis) or `kp` (N/m: the wn that reproduces it at the
+        reference, so the fixed gains and the scheduled ones agree there)."""
+        if (kp is None) == (wn is None):
+            raise ValueError("give exactly one of kp and wn")
+        m_inv = np.linalg.inv(JOINT_INERTIA_M0 if inertia is None
+                              else np.asarray(inertia, dtype=float))
+        lam_ref = foot_mass_diag(jac_ref, m_inv)
+        if not np.all(np.isfinite(lam_ref)):
+            raise ValueError("the reference Jacobian is singular")
+        if wn is None:
+            wn = np.sqrt(_per_axis(kp, "kp") / lam_ref)
+        return cls(wn, zeta, lam_ref, lam_range, inertia)
+
+    def gains(self, jac):
+        """``(kp (3,), kd (3,), lam (3,))`` for the Jacobian `jac`; `lam` is
+        the unclamped apparent mass (inf on a singular Jacobian)."""
+        lam = foot_mass_diag(jac, self.m_inv)
+        lam_c = np.clip(lam, self.lam_lo, self.lam_hi)
+        return self.wn ** 2 * lam_c, 2.0 * self.zeta * self.wn * lam_c, lam
 
 #: Seconds along qd_ref for the finite-difference Jdot qdot in
 #: `swing_feedforward`: 6 rad/s x 1e-4 s is 0.6 mrad of joint, far inside
