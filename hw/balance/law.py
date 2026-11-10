@@ -232,6 +232,10 @@ class LawOutput:
     #: The fall hold drove this sweep (`BalanceLaw.fall_hold_deg`): `tau` is
     #: its joint PD, the wrench and the forces are zero -- nothing asked.
     fallen: bool = False
+    #: ms the MPC's QP took, on the sweeps one ran (`BalanceLaw.mpc`); NaN on
+    #: every other sweep.  On a sweep the MPC drove, `allocation` is its
+    #: forces and `wrench` what the SRB law would have asked.
+    mpc_ms: float = float("nan")
 
 
 @dataclass
@@ -487,6 +491,13 @@ class BalanceLaw:
     #: reference, the heading, the joint layer's targets and the swing
     #: (walk.py: one reference, every target taken from it).
     walk: object | None = None
+    #: THE CONVEX MPC AS THE TROT'S FORCE LAW, 2026-11-10: an
+    #: `mpc.MpcForces`, or None -- every entry point but `hw.fold2_cmpc`,
+    #: for which nothing below changes.  Attached, it replaces stages 3-4's
+    #: foot forces on the sweeps a WALKING gait clock runs, and only those:
+    #: the rise, HOLD and the park keep the wrench and `alloc`'s allocator.
+    #: It reads the walk's reference, so it needs `walk`.  mpc.py.
+    mpc: object | None = None
 
     def __post_init__(self) -> None:
         if self.swing not in SWING.SWING_MODES:
@@ -497,6 +508,9 @@ class BalanceLaw:
         if self.walk is not None and self.swing != "cartesian":
             raise ValueError("walking places the foot in x/y; the %s swing "
                              "lifts in z alone" % self.swing)
+        if self.mpc is not None and self.walk is None:
+            raise ValueError("the MPC tracks the walk's reference: it needs "
+                             "a walk plan (walk=)")
         #: The QP allocator (qp.py), when `alloc` asks for it.
         self.qp = (QP.QpAllocator(mu=self.mu, s_diag=self.qp_s)
                    if self.alloc == "qp" else None)
@@ -1195,7 +1209,21 @@ class BalanceLaw:
 
         # -- stage 4 -------------------------------------------------------
         weight = None if clock_now is None else clock_now.weight
-        if self.qp is not None:
+        # THE MPC, ON A WALKING CLOCK'S SWEEPS ONLY (mpc.py): its forces in
+        # place of the wrench's allocation.  The wrench above is still
+        # formed -- it is what the SRB law would have asked, and the log
+        # keeps it beside the forces that went out.
+        mpc_on = (self.mpc is not None and clock_now is not None
+                  and ref is not None)
+        mpc_ms = float("nan")
+        if self.mpc is not None and not mpc_on:
+            self.mpc.idle()
+        if mpc_on:
+            allocation = self.mpc.allocate(now, self, state, gait, clock_now,
+                                           ref, est, com_cmd)
+            if self.mpc.solved_now:
+                mpc_ms = self.mpc.solve_ms
+        elif self.qp is not None:
             allocation = self.qp.allocate(state.r_w, wrench.b_d,
                                           contact=weight)
         else:
@@ -1445,7 +1473,8 @@ class BalanceLaw:
                                     else float(now) - float(est.t)),
                          xy_des=(None if self.xy_des is None
                                  else self.xy_des.copy()),
-                         xy_on=xy is not None, ref=ref, land_w=land_w)
+                         xy_on=xy is not None, ref=ref, land_w=land_w,
+                         mpc_ms=mpc_ms)
 
     def _trip(self, state, allocation, q_ref,
               monitor_residual: bool = True) -> str | None:
@@ -1500,4 +1529,5 @@ class BalanceLaw:
             % (1e3 * self.xy_err_peak, self.xy_acc_peak,
                cfg.MASS * self.xy_acc_peak, self.xy_acc_max),
         ]) + ([] if self.qp is None else ["  " + self.qp.report()])
+            + ([] if self.mpc is None else [self.mpc.report()])
             + ([] if self.walk is None else [self.walk.report()]))

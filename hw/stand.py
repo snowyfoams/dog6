@@ -337,6 +337,10 @@ class StandLog:
         # pin c^b x/y the law flew this sweep -- a step in it is a T's
         # re-centring, and hw.com_check reads both.
         "com_meas": (2,), "com_pin": (2,),
+        # the MPC (hw.fold2_cmpc): ms its QP took, on the sweeps one ran; NaN
+        # on every other.  On a trot sweep of that runner f_w / fz are the
+        # MPC's forces and b_d what the SRB law would have asked.
+        "mpc_ms": (),
     }
 
     def __init__(self) -> None:
@@ -875,6 +879,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                         tau_cmd=stand.tau, tau_meas=tau_meas,
                         tau_req=stand.tau_request,
                         tau_ff=None if out is None else out.tau_ff,
+                        mpc_ms=None if out is None else out.mpc_ms,
                         contact_w=(wave.contact if wave is not None else
                                    None if out is None else out.contact),
                         swing_s=None if out is None else out.swing_s,
