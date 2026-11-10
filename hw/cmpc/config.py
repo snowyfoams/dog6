@@ -26,24 +26,17 @@ from sim import params as P                  # noqa: E402
 from sim import stand as ST                  # noqa: E402
 from sim.cmpc import config as SIMCFG        # noqa: E402
 
-from .. import safety as SAFE                # noqa: E402
 from .. import stand as HS                   # noqa: E402
 from ..balance import config as BCFG         # noqa: E402
 
 # ===========================================================================
 # the gait
 # ===========================================================================
-#: What `--gait` may be.  `stand` is four feet down always and is the default
-#: because `hw.safety.TAU_STAGED_MAX` = 3.0 N*m stands and does not trot.
-#: `trot` is `sim.cmpc.gait`'s timetable, and `run` refuses it without a
-#: written reason because a diagonal needs 4.46 N*m the gate will not pass.
+#: What `--gait` may be.  `stand` is four feet down always and is the default;
+#: `trot` is `sim.cmpc.gait`'s timetable, run when asked for (no gate and no
+#: refusal since 2026-11-10, on request).
 GAITS = ("stand", "trot")
 DEFAULT_GAIT = "stand"
-
-#: Worst joint torque one trot diagonal needs, carrying half the weight, over
-#: the +-0.6 rad envelope `hw.safety` measured.  Quoted so the refusal can
-#: say the number.  [HW, hw.safety docstring]
-TROT_DIAGONAL_NM = 4.46
 
 # ===========================================================================
 # the solve, inside the CAN schedule
@@ -63,19 +56,17 @@ MPC_HZ_MIN_TROT = 40.0
 #: that motor), so S must stay well under 17 ms.  12 ms leaves 5 ms for the
 #: operating system, and the loop re-anchors rather than catching up.
 #:
-#: The desktop solves in 4.3 ms median.  The Pi has not been measured; if it
-#: does not fit, `--mpc-hz 20` halves the load and the stand gait allows it.
-#: [DERIVED from hw.stand.GAP_ESTOP_S; UNTUNED on the Pi]
+#: The desktop solves in 4.3 ms median; the Pi 4.7 ms (fake bus, stand gait,
+#: 2026-11-10).  A REPORTING line, not a trip (2026-11-10, on request): an
+#: over-budget solve is counted in the exit report, and the CAN gap stop line
+#: in `hw.stand.run` is what stops a loop that really stalls.
+#: [DERIVED from hw.stand.GAP_ESTOP_S]
 SOLVE_BUDGET_S = 0.012
 assert SOLVE_BUDGET_S + 2 * (1.0 / HS.RATE_HZ) < HS.GAP_ESTOP_S
 
-#: Consecutive over-budget solves before the trip.  One is the scheduler.
-SOLVE_OVER_STREAK = 3
-
-#: Consecutive solves the QP may fail to return a usable status for before
-#: the run stops.  Between them the previous force is held -- which is the
-#: zero-order hold the method assumes anyway, for one period too long.
-QP_FAIL_STREAK = 3
+#: Statuses whose forces are used.  Any other status keeps the LAST GOOD
+#: forces (`run.HardwareController`) -- the zero-order hold the method assumes
+#: anyway -- where the QP itself returns zero.  No trip (2026-11-10).
 QP_OK_STATUSES = ("solved", "solved inaccurate")
 
 # ===========================================================================
@@ -110,17 +101,24 @@ Z_NUDGE_M = 0.005
 Z_RAMP_S = 1.0
 
 # ===========================================================================
-# the trips the MPC phase adds to the stand's
+# the MPC phase on a tilt.  It adds no trips to the stand's but NaN
+# (2026-11-10, on request: the height, solve-budget and QP-failure trips,
+# each a limp drop from the lift height, are gone)
 # ===========================================================================
-#: Tilt run-stop, the balance package's.  Same robot, same failure.  [HW]
-TILT_STOP_DEG = float(BCFG.TILT_STOP_DEG)
-
-#: Height tracking.  The MPC has no joint target, so the stand's IK tracking
-#: trip does not apply; what it does have is a height it was asked for and a
-#: height it measures.  Sustained, because the QP corrects over a horizon and
-#: a transient of a sweep or two is normal.  [UNTUNED]
-HEIGHT_STOP_M = 0.040
-HEIGHT_STOP_STREAK = 25                                   # 0.10 s at 250 Hz
+#: THE FALL HOLD, IN PLACE OF THE TILT RUN-STOP, 2026-10-06, on request ("set
+#: the cmpc tilt stop is 45 and also if bigger 45, no stop, just hold the
+#: joint angle").  The stop was the balance package's 12 deg, and a stop here
+#: is `MotorBus.close()`: the robot dropped limp from the lift height.  Now
+#: nothing on a tilt stops the MPC phase.  Past this `BodyState.tilt_deg`
+#: (max |roll|, |pitch|) the MPC stops for the rest of the run and the drivers
+#: hold every joint at the angle it had on that sweep -- `run.HardwareCmpc`,
+#: phase "fall" -- until ENTER parks or X.  `--fall-hold`; 0 turns it off,
+#: and then nothing acts on a tilt.  `cloud`'s trots hold past the same 45.
+#:
+#: IN THE DRIVERS' POSITION LOOP (0xA4), NOT A TORQUE PD: it is how settle,
+#: crouch, park and done hold the joints, and the hold runs at settle's speed
+#: cap, `hw.stand.SETTLE_MOTOR_DPS`.
+FALL_HOLD_DEG = 45.0
 
 #: Velocity commands the operator may give in the TROT gait.  `sim.cmpc`'s
 #: ceilings are 0.6 m/s and 90 deg/s and were reached in simulation at 8 N*m;
@@ -138,15 +136,14 @@ def describe() -> str:
     return "\n".join([
         "DOG6 hardware MPC configuration (the controller's own numbers are "
         "sim.cmpc.config's)",
-        "  gait            %s by default; trot needs %.2f N*m a diagonal and "
-        "the gate stops at %.1f"
-        % (DEFAULT_GAIT, TROT_DIAGONAL_NM, SAFE.TAU_STAGED_MAX),
+        "  gait            %s by default; --gait trot runs, no gate"
+        % DEFAULT_GAIT,
         "  MPC             %.0f Hz (sim's); trot not below %.0f, stand may go "
         "lower" % (MPC_HZ, MPC_HZ_MIN_TROT),
-        "  solve budget    %.0f ms, %d in a row trips; CAN stop line %.0f ms"
-        % (1e3 * SOLVE_BUDGET_S, SOLVE_OVER_STREAK, 1e3 * HS.GAP_ESTOP_S),
-        "  QP status       %s accepted; %d failures in a row trips"
-        % (" / ".join(QP_OK_STATUSES), QP_FAIL_STREAK),
+        "  solve budget    %.0f ms, counted, no trip; CAN stop line %.0f ms"
+        % (1e3 * SOLVE_BUDGET_S, 1e3 * HS.GAP_ESTOP_S),
+        "  QP status       %s used; any other keeps the last good forces"
+        % " / ".join(QP_OK_STATUSES),
         "  estimator       velocity low-pass %.0f Hz, yaw from the gyro"
         % VELOCITY_FILTER_HZ,
         "  height          latched at handover; commandable %.0f..%.0f mm "
@@ -154,9 +151,10 @@ def describe() -> str:
         % (1e3 * Z_MIN, 1e3 * Z_MAX,
            1e3 * (Z_MIN - BCFG.TRUNK_BOTTOM_OFFSET),
            1e3 * (Z_MAX - BCFG.TRUNK_BOTTOM_OFFSET)),
-        "  trips           tilt %.0f deg, height %.0f mm for %d sweeps, IMU "
-        "age %.0f ms holds" % (TILT_STOP_DEG, 1e3 * HEIGHT_STOP_M,
-                               HEIGHT_STOP_STREAK, 1e3 * IMU_MAX_AGE_S),
+        "  tilt            no trip; past %.0f deg the fall hold, every joint "
+        "held where it was (0xA4)" % FALL_HOLD_DEG,
+        "  trips           NaN only; IMU age %.0f ms holds"
+        % (1e3 * IMU_MAX_AGE_S),
         "  trot command    |v| <= %.2f m/s, |yaw rate| <= %.0f deg/s"
         % (V_MAX_HW, np.rad2deg(YAW_RATE_MAX_HW)),
     ])

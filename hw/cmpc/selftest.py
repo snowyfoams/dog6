@@ -61,6 +61,7 @@ from ..balance import torque as TRQ          # noqa: E402
 from . import config as cfg                  # noqa: E402
 from . import run as RUN                     # noqa: E402
 from . import state as EST                   # noqa: E402
+from . import swing as HWSWING               # noqa: E402
 
 _FAILURES: list[str] = []
 _PASSES = 0
@@ -114,6 +115,8 @@ def sim_state_from(body, position, velocity, yaw: float = 0.0):
 
 
 def gate_for_test(tau_cap: float = 2.5) -> SAFE.SafetyGate:
+    """For the plain `hw.stand.HardwareStand` the MPC machine is compared
+    against; `HardwareCmpc` itself has no gate (2026-11-10)."""
     return SAFE.SafetyGate(tau_cap, unconfirmed_reason="hw.cmpc.selftest")
 
 
@@ -144,10 +147,6 @@ def main() -> int:
           cfg.SOLVE_BUDGET_S + 2.0 / HS.RATE_HZ < HS.GAP_ESTOP_S,
           "%.0f + %.0f ms < %.0f ms" % (1e3 * cfg.SOLVE_BUDGET_S,
                                         2e3 / HS.RATE_HZ, 1e3 * HS.GAP_ESTOP_S))
-    check("the staged torque ceiling cannot carry a trot diagonal",
-          SAFE.TAU_STAGED_MAX < cfg.TROT_DIAGONAL_NM,
-          "%.1f < %.2f N*m -- which is why the default gait stands"
-          % (SAFE.TAU_STAGED_MAX, cfg.TROT_DIAGONAL_NM))
     check("the commandable height band holds the lift height",
           cfg.Z_MIN < ST.LIFT_HEIGHT < cfg.Z_MAX)
     check("the default MPC rate is the simulator's", cfg.MPC_HZ == SIMCFG.MPC_HZ)
@@ -358,7 +357,7 @@ def main() -> int:
     body_lift = body_at(h_lift)
     def run_both(law="per-leg"):
         a = HS.HardwareStand(gate_for_test(tau_cap), law=law)
-        b = RUN.HardwareCmpc(gate_for_test(tau_cap), law=law)
+        b = RUN.HardwareCmpc(law=law)
         rows_a, rows_b = [], []
         now = 0.0
         a.t_phase = b.t_phase = now
@@ -408,7 +407,7 @@ def main() -> int:
 
     # -- 6. the MPC phase itself ---------------------------------------------
     print("\nhw.cmpc.run: the MPC phase")
-    stand = RUN.HardwareCmpc(gate_for_test(tau_cap), law="per-leg")
+    stand = RUN.HardwareCmpc(law="per-leg")
     now = drive_to_mpc(stand, body_lift)
     check("the handover latches the height the estimator measures",
           stand.controller is not None
@@ -417,8 +416,7 @@ def main() -> int:
           "z %.1f mm (origin), no ramp" % (1e3 * stand.controller.command.z))
     check("...with no velocity command in the stand gait",
           stand.controller.command.is_zero() and stand.gait == "stand")
-    check("the gate was NOT restarted at the handover: the cap is already up",
-          abs(stand.gate.cap_now(now) - tau_cap) < 1e-12)
+    check("the MPC machine has no safety gate", stand.gate is None)
     taus = []
     trips = []
     for _ in range(300):                                  # 1.2 s standing
@@ -429,9 +427,7 @@ def main() -> int:
     taus = np.asarray(taus)
     check("the MPC phase is torque mode and never tripped on a level stance",
           mode == "torque" and all(t is None for t in trips))
-    check("...under the gate's cap", float(np.abs(taus).max()) <= tau_cap + 1e-9,
-          "peak %.2f of %.1f N*m" % (np.abs(taus).max(), tau_cap))
-    check("the QP solved every time it ran", stand._qp_fail_streak == 0
+    check("the QP solved every time it ran", stand.controller.qp_failures == 0
           and len(stand.timing.solve) > 0,
           "%d solves" % len(stand.timing.solve))
     fz = stand.controller.telemetry.forces[:, 2]
@@ -442,8 +438,8 @@ def main() -> int:
           1e-12, " N*m")
     close("...and tau_request = controller + leg gravity",
           stand.tau_request, stand.tau_mpc + stand.tau_grav, 1e-12, " N*m")
-    close("the settled torque IS the request once the slew has caught up",
-          taus[-1], stand.tau_request, 1e-9, " N*m")
+    close("no gate: the torque sent IS the request, every sweep",
+          taus[-1], stand.tau_request, 0.0, " N*m")
     close("sign: at a level stance the knees HOLD the robot up like the SRB "
           "law's", np.sign(stand.tau_request.reshape(4, 3)[:, 2]),
           np.sign(C.flat(TRQ.stance_torque(
@@ -500,8 +496,7 @@ def main() -> int:
           values, C.flat(ST.Q_CROUCH), 1e-12, " rad")
 
     # a --mpc-height target ramps from the latched height
-    stand2 = RUN.HardwareCmpc(gate_for_test(tau_cap), law="per-leg",
-                              z_target=ST.LIFT_HEIGHT + 0.02)
+    stand2 = RUN.HardwareCmpc(law="per-leg", z_target=ST.LIFT_HEIGHT + 0.02)
     drive_to_mpc(stand2, body_lift)
     check("a --mpc-height target starts a ramp AT the latched height",
           stand2.z_ramp is not None
@@ -512,12 +507,27 @@ def main() -> int:
     # -- 7. the trips -----------------------------------------------------------
     print("\nhw.cmpc.run: the trips")
     def fresh_mpc(**kw):
-        s = RUN.HardwareCmpc(gate_for_test(tau_cap), law="per-leg", **kw)
+        s = RUN.HardwareCmpc(law="per-leg", **kw)
         return s, drive_to_mpc(s, body_lift)
+    # THE FALL HOLD in place of the tilt stop (config.FALL_HOLD_DEG): the old
+    # 12 deg stop is gone; past the hold no trip, every joint held at the
+    # angle it had, in position mode, whatever the trunk does next; ENTER
+    # parks from it.
     s, n = fresh_mpc()
-    _, _, trip = s.update(n, body_at(h_lift, R=C.rot_zyx(np.deg2rad(13.0), 0, 0)))
-    check("tilt past the stop trips", trip is not None and "tilt" in trip,
-          trip or "")
+    mode, _, trip = s.update(n, body_at(h_lift, R=C.rot_zyx(np.deg2rad(13.0), 0, 0)))
+    below = mode == "torque" and trip is None
+    s, n = fresh_mpc()
+    R_fall = C.rot_zyx(np.deg2rad(cfg.FALL_HOLD_DEG + 1.0), 0, 0)
+    fallen = body_at(h_lift, R=R_fall)
+    held = []
+    for i, b in enumerate((fallen, body_at(h_lift - 0.01, R=R_fall))):
+        mode, values, trip = s.update(n + 0.004 * i, b)
+        held.append(mode == "position" and trip is None
+                    and s.phase_name == "fall" and np.allclose(values, fallen.q))
+    s.advance(n + 0.008, fallen.q)
+    check("13 deg runs on; past the fall hold every joint holds, ENTER parks",
+          below and all(held) and s.phase_name == "park",
+          "13 deg ok %s, held %s, then %s" % (below, held, s.phase_name))
     s, n = fresh_mpc()
     s.update(n, body_lift)
     s.controller.solve = lambda state, t: None            # no solve at all
@@ -525,41 +535,137 @@ def main() -> int:
     _, _, trip = s.update(n + 0.004, body_lift)
     check("a NaN force out of the QP trips rather than reaching a motor",
           trip is not None and "non-finite" in trip, trip or "")
+    # THE REMOVED TRIPS (2026-11-10, on request): each is now a run that
+    # goes on, and what replaced it is checked.
+    five_solves = int(5 * 250 / cfg.MPC_HZ) + 2
     s, n = fresh_mpc()
     original_solve = s.controller.solve
     def slow_solve(state, t):
         original_solve(state, t)
         s.controller.telemetry.solve_ms = 1e3 * cfg.SOLVE_BUDGET_S + 1.0
     s.controller.solve = slow_solve
-    trips = []
-    for k in range(int(cfg.SOLVE_OVER_STREAK * 250 / cfg.MPC_HZ) + 10):
-        trips.append(s.update(n + 0.004 * k, body_lift)[2])
-    first = next((k for k, t in enumerate(trips) if t), None)
-    check("a solve over budget %d times in a row trips" % cfg.SOLVE_OVER_STREAK,
-          first is not None and "budget" in trips[first]
-          and first >= (cfg.SOLVE_OVER_STREAK - 1) * 250 / cfg.MPC_HZ,
-          "first trip on sweep %s: %s" % (first, trips[first] if first is not None
-                                           else "none"))
+    trips = [s.update(n + 0.004 * k, body_lift)[2] for k in range(five_solves)]
+    check("a solve over budget is counted, not tripped",
+          all(t is None for t in trips) and s.timing.over_budget >= 5,
+          "%d over budget, trips %s" % (s.timing.over_budget,
+                                        next((t for t in trips if t), "none")))
     s, n = fresh_mpc()
-    original_solve = s.controller.solve
-    def failing_solve(state, t):
-        original_solve(state, t)
-        s.controller.telemetry.status = "maximum iterations reached"
-    s.controller.solve = failing_solve
-    trips = [s.update(n + 0.004 * k, body_lift)[2]
-             for k in range(int(cfg.QP_FAIL_STREAK * 250 / cfg.MPC_HZ) + 10)]
-    check("a QP that stops solving %d times in a row trips" % cfg.QP_FAIL_STREAK,
-          any(t and "returned" in t for t in trips),
-          next((t for t in trips if t), ""))
+    for k in range(20):
+        s.update(n + 0.004 * k, body_lift)
+    good = s.controller._forces.copy()
+    solver = s.controller.solver
+    real_solve = solver.solve
+    def failing(*args, **kwargs):
+        real_solve(*args, **kwargs)
+        solver.last_status = "primal infeasible"
+        return np.zeros(solver.n_vars)              # what the QP gives on failure
+    solver.solve = failing
+    trips = [s.update(n + 0.004 * (20 + k), body_lift)[2]
+             for k in range(five_solves)]
+    check("a failed QP keeps the last good forces and does not trip",
+          all(t is None for t in trips) and s.controller.qp_failures >= 5
+          and np.array_equal(s.controller._forces, good)
+          and good[:, 2].sum() > 0.5 * P.WEIGHT,
+          "%d failures, fz %s N" % (s.controller.qp_failures,
+                                    np.array2string(s.controller._forces[:, 2],
+                                                    precision=1)))
     s, n = fresh_mpc()
     s.update(n, body_lift)
     s.replan_height(cfg.Z_MAX, seconds=0.001)
-    trips = [s.update(n + 0.004 * (k + 1), body_lift)[2]
-             for k in range(cfg.HEIGHT_STOP_STREAK + 2)]
-    check("a sustained height error trips", any(t and "height" in t for t in trips),
-          next((t for t in trips if t), ""))
-    check("...but not before HEIGHT_STOP_STREAK sweeps",
-          all(t is None for t in trips[:cfg.HEIGHT_STOP_STREAK - 1]))
+    trips = [s.update(n + 0.004 * (k + 1), body_lift)[2] for k in range(50)]
+    check("a sustained height error does not trip",
+          all(t is None for t in trips), next((t for t in trips if t), ""))
+
+    # what the run loop stops on with no gate: safety.hardware_trip
+    q0 = body_lift.q
+    qd0 = np.zeros(C.N_JOINTS)
+    ids = HM.motor_ids()
+    check("no gate, hardware_trip: a NaN encoder stops",
+          SAFE.hardware_trip(np.full(C.N_JOINTS, np.nan), qd0) is not None)
+    check("...over-temperature stops", "overtemp" in (SAFE.hardware_trip(
+        q0, qd0, temps=np.full(C.N_JOINTS, SAFE.TEMP_ESTOP_C + 1)) or ""))
+    check("...a CAN miss streak stops", "missed" in (SAFE.hardware_trip(
+        q0, qd0, miss_streaks=np.full(C.N_JOINTS, SAFE.MISS_ESTOP)) or ""))
+    check("...a driver fault stops, the 0x80 latch alone does not",
+          "fault" in (SAFE.hardware_trip(q0, qd0, errors={ids[0]: 0x02}) or "")
+          and SAFE.hardware_trip(q0, qd0, errors={ids[0]: 0x80}) is None)
+    check("...overspeed and a joint past its limit do NOT stop",
+          SAFE.hardware_trip(q0, np.full(C.N_JOINTS, 50.0)) is None
+          and SAFE.hardware_trip(np.full(C.N_JOINTS, 10.0), qd0) is None)
+    check("...and a clean state passes", SAFE.hardware_trip(
+        q0, qd0, temps=np.full(C.N_JOINTS, 40), miss_streaks=np.zeros(C.N_JOINTS),
+        errors={}) is None)
+
+    # -- 7b. the swing leg: the balance controller's (2026-11-10) -------------
+    print("\nhw.cmpc.swing: the trot's swing leg is the balance controller's")
+    s, n = fresh_mpc(gait="trot")
+    ctl = s.controller
+    check("the trot flies the robot's walk swing: Kp 150/150/400, Kd 6/6/40, "
+          "20 mm", isinstance(ctl, RUN.HardwareController)
+          and np.array_equal(ctl.kp_swing, [150.0, 150.0, 400.0])
+          and np.array_equal(ctl.kd_swing, [6.0, 6.0, 40.0])
+          and ctl.swing_height == 0.020)
+    st = s.estimate.state
+    leg = 2
+    foot_b, jac = st.feet_body[leg], st.jacobians_body[leg]
+    qd_t = np.array([0.5, -1.0, 2.0])
+    p_t = foot_b + np.array([0.010, -0.005, 0.020])
+    v_t = np.array([0.10, 0.0, 0.20])
+    by_hand = jac.T @ (HWSWING.KP_SWING_WALK * (p_t - foot_b)
+                       + HWSWING.KD_SWING_WALK * (v_t - jac @ qd_t))
+    tau_law = ctl._swing_torque(st, leg, st.q[leg], qd_t, p_t, v_t,
+                                np.array([5.0, 5.0, 50.0]))
+    close("the law is J^T [Kp (p_ref - x) + Kd (v_ref - J qd)], trunk frame, "
+          "on the closed-form x_b and J", tau_law, by_hand, 1e-12, " N*m")
+    close("...with NO feedforward: a_ref changes nothing", tau_law,
+          ctl._swing_torque(st, leg, st.q[leg], qd_t, p_t, v_t, np.zeros(3)),
+          0.0, " N*m")
+    close("...and NO leg weight inside: on the arc, at rest, it is zero",
+          ctl._swing_torque(st, leg, st.q[leg], np.zeros(3), foot_b,
+                            np.zeros(3), np.zeros(3)), np.zeros(3), 0.0, " N*m")
+    kp4 = np.tile(HWSWING.KP_SWING_WALK, (4, 1))
+    kp4[leg] = [150.0, 150.0, 600.0]
+    ctl4 = RUN.HardwareController(schedule=GAIT.TROT, sensor_split=False,
+                                  kp_swing=kp4)
+    own = ctl4._swing_torque(st, leg, st.q[leg], qd_t, p_t, v_t, np.zeros(3))
+    other = ctl4._swing_torque(st, 0, st.q[0], qd_t, st.feet_body[0] + p_t - foot_b,
+                               v_t, np.zeros(3))
+    check("a leg's own row (--kp-swing-walk-rl) changes that leg alone",
+          not np.allclose(own, tau_law) and np.allclose(other, ctl._swing_torque(
+              st, 0, st.q[0], qd_t, st.feet_body[0] + p_t - foot_b, v_t,
+              np.zeros(3))))
+    calls = []
+    law = ctl._swing_torque
+    def spy(state, i, q, qd, p, v, a):
+        tau = law(state, i, q, qd, p, v, a)
+        calls.append((i, np.array(p, float), tau.copy(),
+                      ctl._target[i][2] - state.position[2],
+                      state.feet_body[i][2]))
+        return tau
+    ctl._swing_torque = spy
+    once, trips = True, []
+    for k in range(int(SIMCFG.GAIT_PERIOD / 0.004) + 2):
+        calls.clear() if k == 0 else None
+        mark = len(calls)
+        trips.append(s.update(n + 0.004 * (k + 1), body_lift)[2])
+        for i, _, tau, _, _ in calls[mark:]:
+            rows = slice(3 * i, 3 * i + 3)
+            once &= (np.allclose(s.tau_mpc[rows], tau, atol=1e-12)
+                     and np.allclose(s.tau_request[rows] - s.tau_grav[rows], tau,
+                                     atol=1e-12))
+    swung = sorted({c[0] for c in calls})
+    check("a gait period on a fixed body: every leg swings, nothing trips",
+          swung == [0, 1, 2, 3] and all(t is None for t in trips),
+          "legs %s" % swung)
+    check("a swinging leg's torque IS the law's, its weight added ONCE "
+          "(the run's leg gravity)", once)
+    rises = []
+    for i in range(4):
+        mine = [c for c in calls if c[0] == i]
+        rises.append(max(c[1][2] for c in mine)
+                     - max(max(c[3] for c in mine), max(c[4] for c in mine)))
+    close("the arc's apex is 20 mm above its higher end", np.array(rises),
+          np.full(4, HWSWING.SWING_HEIGHT), 5e-4, " m")
 
     # -- 8. timing, for the record -----------------------------------------------
     print("\ntiming on this machine (the Pi is the number that matters)")
@@ -583,16 +689,22 @@ def main() -> int:
           sweep_us <= 1.5 * srb_us,
           "p50 %.0f us against %.0f us; one CAN slot is %.0f us"
           % (sweep_us, srb_us, 1e6 / (HS.RATE_HZ * HM.N_JOINTS)))
+    s, n = fresh_mpc(gait="trot")
+    for k in range(500):
+        s.update(n + 0.004 * k, body_lift)
+    trot_us = 1e6 * np.percentile(s.timing.sweep, 50)
+    check("the trot's no-solve sweep, two legs on the robot's swing law, "
+          "costs no more than 1.5x the stand's", trot_us <= 1.5 * sweep_us,
+          "p50 %.0f us against %.0f us (sim.cmpc's law: ~5500 on the Pi)"
+          % (trot_us, sweep_us))
 
     # -- 9. the whole path, on hw.fake_bus ----------------------------------------
     print("\nthe whole sequence on hw.fake_bus, --auto, per-leg lift (no dynamics)")
     from ..fake_bus import FakeDriverBus
     from ..motor import motorbus
     ids = HM.motor_ids()
-    gate = gate_for_test(1.0)
-    # No height target: the fake robot has no dynamics and stays in the
-    # crouch, so a target 125 mm up would (correctly) fire the height trip.
-    stand = RUN.HardwareCmpc(gate, law="per-leg")
+    # No height target: the fake robot has no dynamics and stays in the crouch.
+    stand = RUN.HardwareCmpc(law="per-leg")
     log = RUN.CmpcLog()
     bus = FakeDriverBus(ids=ids)
     with motorbus.MotorBus(ids, bus=bus, dirs=HM.motor_directions()) as mb:

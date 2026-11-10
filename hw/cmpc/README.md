@@ -1,10 +1,11 @@
 # `hw.cmpc` — the convex MPC on the robot
 
 ```
-python -m hw.cmpc.selftest                        73 checks, no robot, no IMU, no MuJoCo
+python -m hw.cmpc.selftest                        85 checks, no robot, no IMU, no MuJoCo
 python -m hw.cmpc.run --fake --auto 1 --no-imu --law per-leg   the whole path on hw.fake_bus
-python -m hw.cmpc.run --tau-cap 2.5 --log run.npz              the first run: stand gait
-python -m hw.cmpc.run --tau-cap 2.5 --mpc-height 140           ...and rise to 140 mm
+python -m hw.cmpc.run --log run.npz                            stand gait
+python -m hw.cmpc.run --mpc-height 140                         ...and rise to 140 mm
+python -m hw.cmpc.run --gait trot --log trot.npz               the trot, WASD/QE
 python -m hw.cmpc.config                          every number this path adds
 ```
 
@@ -35,8 +36,8 @@ Both handovers are latches, not steps:
 
 | | |
 |---|---|
-| lift → mpc | the height command is latched at the trunk height the estimator measures; the reference's xy and yaw anchor at zero. The `SafetyGate` is the **same object** the lift used — its slew limiter (5 N·m/s) is what blends the SRB law's last torque into the MPC's first |
-| mpc → park | `HardwareStand.advance` latches the measured pose and ramps to `Q_CROUCH` in position mode, exactly as after the lift. ENTER does it; so does any trip |
+| lift → mpc | the height command is latched at the trunk height the estimator measures; the reference's xy and yaw anchor at zero. There is no gate (2026-11-10), so nothing blends the SRB law's last torque into the MPC's first |
+| mpc → park | `HardwareStand.advance` latches the measured pose and ramps to `Q_CROUCH` in position mode, exactly as after the lift. ENTER does it |
 
 Inside the MPC phase the controller's own joint-space floor on the stance
 legs (`KP_JOINT` / `KD_JOINT`, pure damping about the measured angle) is kept
@@ -46,12 +47,14 @@ as in simulation.
 
 | | sim | robot | where |
 |---|---|---|---|
-| gait | trot timetable | **stand**: four feet down at every step of the horizon. `TAU_STAGED_MAX` = 3.0 N·m stands (2.20) and cannot carry a trot diagonal (4.46), so `--gait trot` is refused without `--trot-anyway "why"` | `sim.cmpc.gait.STAND` |
+| gait | trot timetable | **stand** by default: four feet down at every step of the horizon. `--gait trot` runs the timetable, no refusal (2026-11-10) | `sim.cmpc.gait.STAND` |
 | state | ground truth from MuJoCo | `state.KinematicOdometry`: IMU roll/pitch, **gyro-integrated yaw** (the magnetometer is logged, never used), height and velocity from the stance feet, xy integrated | `hw/cmpc/state.py` |
 | kinematics | `sim.kinematics` chain walk, 810 µs/sweep | `hw.kinematics` closed form, handed in through `BodyState.feet_body` / `jacobians_body` | `sim.cmpc.controller` |
 | IMU hold | emulated at 200 Hz | real: `Controller(sensor_split=False)`, `imu_fresh` per sweep | `sim.cmpc.controller` |
 | leg gravity | none | `hw.balance.torque`'s closed form added, as the SRB and per-leg laws do. `--no-leg-gravity` is the simulator's law exactly | `run.HardwareCmpc._mpc` |
-| torque limit | 8 N·m clamp | that clamp, then `SafetyGate`: cap, limit block, slew | `run.HardwareCmpc._mpc` |
+| torque limit | 8 N·m clamp | that clamp, then the 0xA1 field's 9.94 N·m. **No `SafetyGate`** (2026-11-10, on request): no cap, no slew, no ramp, no joint-limit block, in the lift too | `run.HardwareCmpc._mpc` |
+| QP failure | zero force | the last good forces are kept (`run.HardwareController`), counted in the report | `run.HardwareController` |
+| swing leg (trot) | eq (1)-(3): Kp 500 / Kd 20 isotropic, J'Λ(a − J̇q̇) + C q̇ + G by RNEA, apex 30 mm | **the balance controller's** (2026-11-10, on request): `hw/balance/swing_control`'s impedance as `hw.fold2_walk` flies it, J^T[Kp(p_ref − x) + Kd(v_ref − Jq̇)], Kp 150/150/400, Kd 6/6/40 (`--kp/--kd-swing-walk`, per leg `--kp-swing-walk-rl` …), no feedforward, apex 20 mm (`--swing-height`); its weight is the run's leg-gravity term, once. The foothold and arc stay sim.cmpc's | `hw.cmpc.swing`, `run.HardwareController._swing_torque` |
 | OSQP polishing | on | off: OSQP 1.x prints a line from C on every solve with no active set, `verbose` or not, and a standing QP never has one. `--polish` turns it back on | `Controller(solver_settings=)` |
 
 None of the simulator's own behaviour changes: `Controller()` with no
@@ -74,46 +77,50 @@ showed the robot can violate, and nothing here can detect it. The
 accelerometer is not fused; a filter that uses it is its own module, when the
 kinematic estimate has been seen to be the limit.
 
-## The solve is inside the CAN schedule, so it is a trip
+## The solve is inside the CAN schedule
 
 The whole controller runs at slot 0 of the 4 ms sweep and delays every motor
 behind it. The 250 Hz half is cheap on this path (the kinematics arrive
 precomputed; measured no-solve sweep **0.48 ms p50** here against the SRB
 law's 0.39 on the same machine). The QP is not: every `mpc_dt` it runs in the
 same slot, and `hw.stand.run` stops the run when any motor goes 25 ms without
-a frame. So a solve past `SOLVE_BUDGET_S` = 12 ms for three solves in a row
-is a trip here, before a driver's input-lost latch reports it.
+a frame. A solve past `SOLVE_BUDGET_S` = 12 ms is counted in the exit
+report, not tripped (2026-11-10); the 25 ms gap line is what stops a stall.
 
 ```
 desktop (sim README)   4.25 ms median
 this container         5.7 ms p50, 8.4 p95, 27 max     4 of 80 over budget
-the Pi                 NOT MEASURED -- run --fake first; the exit report prints it
+the Pi                 4.7 ms p50 stand, 5.7 trot (fake bus, 2026-11-10)
 ```
 
 If it does not fit, `--mpc-hz 20` halves the load. A **trot** must not go
 below 40 Hz (`sim.cmpc.config.MPC_HZ` has the measured subharmonic); a
 four-foot **stand** has no diagonal pendulum mode to excite and may.
 
-## Trips the MPC phase adds to the stand's
+## What the MPC phase does on trouble
 
 | | |
 |---|---|
-| tilt | `|roll|` or `|pitch|` past 12° (`hw.balance.config`'s) |
-| height | 40 mm from the commanded height for 25 sweeps |
-| QP | status not `solved` / `solved inaccurate` three solves running |
-| solve budget | over 12 ms three solves running |
-| non-finite | any NaN torque out of the controller |
+| tilt | **held**, not tripped: past `FALL_HOLD_DEG` = 45° of `|roll|` or `|pitch|` (`--fall-hold`, 0 = off) the MPC stops for the rest of the run, the phase reads `fall`, and the drivers hold every joint at the angle it had, in 0xA4 position mode, until ENTER parks or X |
+| QP | a status other than `solved` / `solved inaccurate` keeps the last good forces; no trip |
+| solve budget | counted; no trip |
+| height | nothing (the 40 mm trip was removed 2026-11-10) |
+| non-finite | any NaN torque out of the controller: **trip**, the phase's only one |
 | IMU stale | **held**, not tripped, as in `hw.balance`; counted in the report |
 
-The stand's own trips — joint limits, overspeed, over-temperature, CAN miss,
-driver faults, the torque readback — run in `hw.stand.run` around all of this,
-unchanged.
+With no gate, `hw.stand.run` stops this runner on `safety.hardware_trip` —
+NaN encoder, over-temperature, CAN miss, driver fault — plus the 0x80
+input-lost latch, the CAN gap line and the torque readback. No joint-limit
+stop, no overspeed stop. The lift keeps its own trips: hw.stand's tracking
+and the SRB law's `hw.balance.config.TILT_STOP_DEG` = 12°.
 
 ## Operator
 
 ENTER steps the phase; from `mpc` it parks. X is an e-stop everywhere and from
 `mpc` it **drops the robot** from the lift height; run the first MPC phases
-supported, as the first lifts were. `+` / `-` nudge the height 5 mm through a
+supported, as the first lifts were. Past 45° of tilt the status line reads
+`fall`: the MPC is off and every joint is held where it was; ENTER parks from
+there too. `+` / `-` nudge the height 5 mm through a
 C2 ramp (`hw.balance.reference.Quintic`). W/S/A/D/Q/E and SPACE drive the
 velocity command exactly as in `sim.cmpc.run`, in the trot gait only, under
 `V_MAX_HW` = 0.2 m/s.
@@ -127,12 +134,14 @@ read with one script — plus `f_mpc`, `fz_mpc`, `contacts`, `solve_ms`, `qp_ok`
 
 ## What is still open
 
-- **Nothing here has seen a motor.** The 73 checks say the hardware path
+- **Nothing here has seen a motor.** The 85 checks say the hardware path
   computes what the simulator's computes, not that the robot will stand.
-- **The Pi's solve time.** The budget is derived from the CAN stop line, not
-  measured against the machine that has to meet it.
 - **The estimator is kinematic.** No accelerometer, no slip detection.
-- **The trot** needs a torque ceiling above 4.46 N·m and a swing law whose
-  250 Hz half is 2.1 ms per leg on `sim.leg_dynamics`. Neither is this
-  branch's; both are known.
+- **The trot's swing reference is still sim.cmpc's**: eq (33) about the
+  hip, re-planned every sweep from the estimate's velocity, a world-frame arc
+  from liftoff, no -ω×p. The robot's walk plans about its stance sites and,
+  at zero command, flies a trunk-frame arc with no velocity term — the fix
+  for 2026-10-05's feet chasing a noisy v̂ at Kp 150 (hw/balance/footstep.py).
+- **The trot's clock is sim.cmpc's**, 0.5 s at duty 0.5 (250 ms swing); the
+  robot's walk flies 0.6 s at duty 0.70.
 - **`R_BODY_IMU` is still the identity placeholder**, as everywhere else.

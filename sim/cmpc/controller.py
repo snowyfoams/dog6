@@ -220,6 +220,11 @@ class Controller:
         self._mpc_tick = Ticker(self.mpc_dt)     # 40 Hz
         self._imu_tick = Ticker(cfg.IMU_DT)      # 200 Hz
 
+        #: The swing arc's apex (`swing.SwingTrajectory.height`).  An
+        #: attribute so the hardware path can fly the robot's own; the
+        #: simulator keeps `config.SWING_HEIGHT`.
+        self.swing_height = cfg.SWING_HEIGHT
+
         self._forces = np.zeros((4, 3))          # MPC solution, WORLD axes
         self._forces_body = np.zeros((4, 3))     # fb = R' f, held between IMU
         self._imu: BodyState | None = None       # the held IMU sample
@@ -382,6 +387,13 @@ class Controller:
                 self._target[leg] = state.foot_world(leg)
         self._contact_prev = np.asarray(contacts, dtype=bool).copy()
 
+    def _swing_torque(self, state: BodyState, leg: int, q, qd,
+                      p_ref_body, v_ref_body, a_ref_body) -> np.ndarray:
+        """One swing leg's three joint torques: eq (1)-(3), `swing.swing_torque`.
+        The hardware path overrides this with the swing law the robot flies
+        (`hw.cmpc.swing`); the simulator's law is this one, unchanged."""
+        return swing.swing_torque(leg, q, qd, p_ref_body, v_ref_body, a_ref_body)
+
     def update(self, truth: BodyState, t: float,
                imu_fresh: bool | None = None) -> np.ndarray:
         """One 250 Hz sweep.  Returns (4, 3) joint torques, already clamped.
@@ -438,12 +450,13 @@ class Controller:
                 # so the swing tracks worse with the floor than without it.
                 torque[leg] = torque[leg] + swing.joint_pd(q, qd, q)
             else:
-                arc = swing.SwingTrajectory(self._liftoff[leg], self._target[leg])
+                arc = swing.SwingTrajectory(self._liftoff[leg], self._target[leg],
+                                            height=self.swing_height)
                 p_w, v_w, a_w = arc.at(progress[leg])
                 p_b, v_b = swing.to_body(p_w, v_w, state.position,
                                          state.velocity, state.rotation)
                 a_b = state.rotation.T @ a_w
-                torque[leg] = swing.swing_torque(leg, q, qd, p_b, v_b, a_b)
+                torque[leg] = self._swing_torque(state, leg, q, qd, p_b, v_b, a_b)
 
         # np.clip DOES NOT FILTER NaN, AND THAT IS NOT AN ACADEMIC POINT.
         # NaN is neither above a bound nor below one, so `np.clip` returns it

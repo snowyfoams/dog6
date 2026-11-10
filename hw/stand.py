@@ -260,10 +260,13 @@ class HardwareStand:
     PHASES = PHASES
     BLURB = BLURB
 
-    def __init__(self, gate: SAFE.SafetyGate, *, law: str = "srb",
+    def __init__(self, gate: SAFE.SafetyGate | None, *, law: str = "srb",
                  balance: BLAW.BalanceLaw | None = None):
         if law not in LAWS:
             raise ValueError("law must be one of %s, got %r" % (LAWS, law))
+        #: None is NO GATE (`hw.cmpc.run`, 2026-11-10, on request): the torque
+        #: phases send what the law asks, and `run` stops on
+        #: `safety.hardware_trip` alone.
         self.gate = gate
         self.law = law
         self.balance = balance if balance is not None else BLAW.BalanceLaw()
@@ -337,7 +340,8 @@ class HardwareStand:
             self.max_dps = ramp_motor_dps(self.q_ref0, ST.Q_CROUCH,
                                           ST.RAMP_POSITION)
         elif name == "lift":
-            self.gate.start(now, q=q)
+            if self.gate is not None:
+                self.gate.start(now, q=q)
             q4 = C.unflat(q)
             self.gravity = np.stack([SK.leg_gravity_torque(i, q4[i])
                                      for i in range(C.N_LEGS)])
@@ -414,7 +418,7 @@ class HardwareStand:
         self.q_des = self.out.q_ref
         self.gravity = self.balance.gravity
         self.tau_request = self.out.tau
-        self.tau = self.gate.apply(self.tau_request, body.q, now)
+        self.tau = self.shape(self.tau_request, body.q, now)
         self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))
         return "torque", self.tau, self.out.trip
 
@@ -438,9 +442,15 @@ class HardwareStand:
         request = ST.compliance_torque(q4, C.unflat(qd), self.h_cmd,
                                        kin=HK, gravity=self.gravity)
         self.tau_request = C.flat(request)
-        self.tau = self.gate.apply(self.tau_request, q, now)
+        self.tau = self.shape(self.tau_request, q, now)
         self.tau_peak = max(self.tau_peak, float(np.abs(self.tau).max()))
         return "torque", self.tau, None
+
+    def shape(self, tau_request, q, now: float) -> np.ndarray:
+        """The gate's shaping -- or, with no gate, the request as sent."""
+        if self.gate is None:
+            return np.array(tau_request, dtype=float)
+        return self.gate.apply(tau_request, q, now)
 
 
 class StandLog:
@@ -640,9 +650,15 @@ def run(mb, stand: HardwareStand, *, rate_hz: float = RATE_HZ, key=None,
                         "nothing for %.0f ms and went limp"
                         % (latched, 1e3 * SAFE.INPUT_LOST_S))
             temps = np.asarray([mb.rec(mid).temp or 0 for mid in ids])
-            reason = stand.gate.estop_reason(
-                q, qd_driver, now, temps=temps,
-                miss_streaks=misses.update(mb), errors=errors)
+            miss_streaks = misses.update(mb)
+            if stand.gate is None:
+                reason = SAFE.hardware_trip(q, qd_driver, temps=temps,
+                                            miss_streaks=miss_streaks,
+                                            errors=errors)
+            else:
+                reason = stand.gate.estop_reason(
+                    q, qd_driver, now, temps=temps,
+                    miss_streaks=miss_streaks, errors=errors)
             if reason:
                 return reason
 

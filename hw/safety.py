@@ -81,7 +81,8 @@ from .hardware_map import (          # noqa: E402
     unconfirmed,
 )
 
-__all__ = ["SafetyGate", "CanMissMonitor", "TorqueReadback", "TAU_HARD_NM",
+__all__ = ["SafetyGate", "hardware_trip", "CanMissMonitor", "TorqueReadback",
+           "TAU_HARD_NM",
            "TAU_START_MAX", "TAU_STAGED_MAX", "QD_ESTOP", "QD_ESTOP_HARD",
            "TEMP_ESTOP_C", "MISS_ESTOP", "TAU_BLACKOUT_FRAC",
            "TAU_BLACKOUT_STREAK", "describe"]
@@ -299,29 +300,49 @@ class SafetyGate:
         if overspeed:
             return overspeed
 
-        if temps is not None:
-            temps = np.asarray(temps)
-            if np.any(temps > TEMP_ESTOP_C):
-                index = int(np.argmax(temps))
-                return (f"overtemp CAN {motor_ids()[index]}: "
-                        f"{int(temps[index])} C")
+        return _device_reason(temps, miss_streaks, errors)
 
-        if miss_streaks is not None:
-            miss_streaks = np.asarray(miss_streaks)
-            if np.any(miss_streaks >= MISS_ESTOP):
-                index = int(np.argmax(miss_streaks))
-                return (f"CAN {motor_ids()[index]} missed "
-                        f"{int(miss_streaks[index])} consecutive replies")
 
-        if errors:
-            # bit 7 (0x80) is the input-signal-lost latch, which the runner
-            # recovers over CAN; bits 0-6 are real faults and stop the run.
-            hard = {mid: err for mid, err in errors.items() if err & 0x7F}
-            if hard:
-                detail = ", ".join(f"CAN {mid}=0x{err:02x}"
-                                   for mid, err in hard.items())
-                return f"motor fault: {detail}"
-        return None
+def hardware_trip(q, qd, *, temps=None, miss_streaks=None, errors=None):
+    """The trips that are NOT the gate's: a non-finite encoder or velocity,
+    over-temperature, a motor that stops answering, a driver fault code.
+    Returns a reason string, or None.
+
+    `hw.cmpc.run` runs with no `SafetyGate` (2026-11-10, on request) and stops
+    on these alone -- no joint-limit stop, no overspeed stop.  A gate's own
+    `estop_reason` runs the same four, in the same order around its two."""
+    q = np.asarray(q, dtype=float)
+    qd = np.asarray(qd, dtype=float)
+    if not np.all(np.isfinite(q)) or not np.all(np.isfinite(qd)):
+        return "invalid encoder or velocity state"
+    return _device_reason(temps, miss_streaks, errors)
+
+
+def _device_reason(temps, miss_streaks, errors):
+    """Over-temperature, CAN miss, driver fault: the drivers' own witnesses."""
+    if temps is not None:
+        temps = np.asarray(temps)
+        if np.any(temps > TEMP_ESTOP_C):
+            index = int(np.argmax(temps))
+            return (f"overtemp CAN {motor_ids()[index]}: "
+                    f"{int(temps[index])} C")
+
+    if miss_streaks is not None:
+        miss_streaks = np.asarray(miss_streaks)
+        if np.any(miss_streaks >= MISS_ESTOP):
+            index = int(np.argmax(miss_streaks))
+            return (f"CAN {motor_ids()[index]} missed "
+                    f"{int(miss_streaks[index])} consecutive replies")
+
+    if errors:
+        # bit 7 (0x80) is the input-signal-lost latch, which the runner
+        # recovers over CAN; bits 0-6 are real faults and stop the run.
+        hard = {mid: err for mid, err in errors.items() if err & 0x7F}
+        if hard:
+            detail = ", ".join(f"CAN {mid}=0x{err:02x}"
+                               for mid, err in hard.items())
+            return f"motor fault: {detail}"
+    return None
 
 
 #: The measured-torque witness.  A motor is "not producing" when the drivers
