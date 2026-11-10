@@ -8,6 +8,9 @@ each to its own log.
     $V -m hw.swing_ff --swings 10 --swing-ff        FF ON, the same.  Log: swing_ff_on_<time>.npz
     $V -m hw.swing_ff --legs RR --swings 10 --swing-ff --log rr_on.npz
                                                     one leg: doc/swing_height's case, on the robot
+    $V -m hw.swing_ff --only RR --swings 10 --swing-ff --log rr_only_on.npz
+                                                    ONE LEG POWERED: RR swings, the other
+                                                    three hang limp at zero torque (below)
     $V -m hw.swing_ff --swings 10 --sched --sched-zeta 0.7
                                                     the swing PD's Kp, Kd scheduled on Lambda(q):
                                                     Kp = wn^2 Lambda, Kd = 2 zeta wn Lambda (below)
@@ -56,6 +59,18 @@ can be put beside the study's table.
             N times.  ENTER in hold swings again.
     X       e-stop, any time.  Motors stop; the legs drop to their hang.
 
+ONE LEG POWERED, `--only LEG` (2026-11-10, on request: the FF-on runs stopped on
+0x01 low voltage / 0x02 high voltage, the supply suspected).  `--legs RR` swings
+RR but the other nine motors still hold the pose on the joint layer + gravity;
+`--only RR` swings RR AND powers nothing else: the other legs get 0xA1 iq = 0
+on every frame from arm to stop -- no position ramp in pose, no joint layer,
+no gravity -- so they stay in their limp hang and draw no phase current.  They
+stay on the bus (read, monitored, logged), so the round robin, the sweep time
+and the trips are exactly a twelve-motor run's: only the supply's load
+changes.  The stop window, `--swings` and the report are the swinging leg's.
+More than one leg may be named (`--only FL RR`); `--legs` and `--only` do not
+go together.  The log's `powered` (4,) says which legs had torque.
+
 THE SCHEDULED PD (`--sched`, 2026-10-28).  The swing's Cartesian PD has fixed
 gains, 150 / 150 / 400 N/m and 6 / 6 / 40 N*s/m, on a foot whose apparent mass
 Lambda = (J M0^-1 J^T)^-1 is 0.31 / 0.36 / 5.8 kg at the hold and moves with the
@@ -79,7 +94,8 @@ WHAT IT SHARES WITH THE WALK AND THE STUDY, EXACTLY
     slew (9 N*m, 300 N*m/s: the 2026-10-21 line).  M0 is the law's own
     (`swing.JOINT_INERTIA_M0`: CAD links at the lift pose + `params.ARMATURE`);
     the study found M0 built from the weighed leg at this hold changes the
-    apex by 0.2 mm, so it is not a knob here beyond `--ff-armature`.
+    apex by 0.2 mm, so it is not a knob here beyond `--ff-armature` and
+    `--ff-scale` (the whole M0 times K, doc/swing_hw section 7's 0.35).
 
 WHAT IT PRINTS -- the study's metrics, per swing, heights above the leg's
 RESTING SITE (the hold's target, the arc's zero; there is no floor):
@@ -101,10 +117,12 @@ runs never land in one file.  Every torque-mode sweep: t, phase, bout (the
 ENTER count), q, qd, x_b, p_swing / v_swing / a_swing (NaN on a stance leg), swing_s,
 contact, q_arc (the arc's own IK, the guard's), the torque split tau_g /
 tau_hold / tau_pd / tau_ff, tau_req (before the gate), tau_cmd (sent),
-tau_meas (driver iq), errors, temps, cap -- and the run's constants once:
+tau_meas (driver iq), errors, vbus / ibus (12,: each driver's last STATUS1
+bus voltage and bus current, 2026-11-10), temps, cap -- and the run's constants once:
 ff_on, q_pose, rest, period, duty, ramp, swing_height, kp_swing, kd_swing,
-kp_joint, kd_joint, m0, sched_on, sched_wn, sched_zeta, sched_lam_ref,
-sched_lam_range, height, tau_cap, tau_slew, legs.  The column names
+kp_joint, kd_joint, m0 (the scaled one the law flew), ff_scale, ff_armature,
+sched_on, sched_wn, sched_zeta, sched_lam_ref, sched_lam_range, height,
+tau_cap, tau_slew, legs, powered.  The column names
 are `hw.swing_bench`'s where the two have the same thing.
 """
 from __future__ import annotations
@@ -230,13 +248,24 @@ class SwingFF:
                  schedule: "SWING.GainSchedule | None" = None,
                  height: float = FOLD2_HEIGHT,
                  pose_s: float = POSE_S, swings: int = 0,
-                 swing_stop_deg: float = 30.0) -> None:
+                 swing_stop_deg: float = 30.0, powered=None) -> None:
         self.gate = gate
         self.gait = gait
         self.legs = np.zeros(C.N_LEGS, dtype=bool)
         self.legs[list(legs)] = True
         if not self.legs.any():
             raise ValueError("no leg to swing")
+        #: `--only`: the legs that get torque at all; the rest get iq = 0 on
+        #: every frame (keepalive in pose, zero in torque) and hang limp.
+        self.powered = np.ones(C.N_LEGS, dtype=bool)
+        if powered is not None:
+            self.powered[:] = False
+            self.powered[list(powered)] = True
+        if (self.legs & ~self.powered).any():
+            raise ValueError("a swinging leg must be powered: %s swings but is not in --only"
+                             % "/".join(C.LEGS[i] for i in np.flatnonzero(
+                                 self.legs & ~self.powered)))
+        self.powered_j = np.repeat(self.powered, 3)
         self.swing_height = float(swing_height)
         self.swing_ff = bool(swing_ff)
         self.kp_swing = np.asarray(BCFG.KP_SWING_WALK if kp_swing is None else kp_swing,
@@ -335,11 +364,15 @@ class SwingFF:
             if elapsed >= self.pose_s + 0.5:
                 self.gate.start(now, body.q)
                 self._go("hold", now)
-                off = np.degrees(np.abs(C.unflat(body.q) - self.q_pose)).max()
+                off = np.degrees(np.abs(C.unflat(body.q) - self.q_pose)[self.powered]).max()
                 self.notice = ("HOLD: torque mode, the joint layer on the IK pose (the ramp "
                                "arrived within %.2f deg).  The gate ramps the cap over %.1f s."
                                "  ENTER to swing (FF %s)."
                                % (off, self.gate.ramp_s, "ON" if self.swing_ff else "OFF"))
+                if not self.powered.all():
+                    self.notice += ("  --only: %s powered; %s limp at zero torque."
+                                    % ("/".join(C.LEGS[i] for i in np.flatnonzero(self.powered)),
+                                       "/".join(C.LEGS[i] for i in np.flatnonzero(~self.powered))))
             return "position", C.flat(q_des)
         return "torque", self._torque(now, body)
 
@@ -377,6 +410,11 @@ class SwingFF:
         self.contact = ~swinging
         for i in range(C.N_LEGS):
             sl = slice(3 * i, 3 * i + 3)
+            if not self.powered[i]:
+                # --only: no gravity, no joint layer -- this leg hangs at iq = 0.
+                tau[sl] = 0.0
+                self.tau_g[sl] = 0.0
+                continue
             if not swinging[i]:
                 # THE JOINT LAYER, as the law's: Kp (q_hold - q) - Kd qd.
                 hold = self.kp_joint * (self.q_pose[i] - q4[i]) - self.kd_joint * qd4[i]
@@ -499,8 +537,22 @@ class RunLog:
         return "%d sweeps -> %s" % (len(self.rows), path)
 
 
+def _rec_array(mb, ids, field: str) -> np.ndarray:
+    """One 0x9A field per motor, NaN where none has come yet.  Each motor's
+    last STATUS1 reply: bus voltage (V) / bus current (A) / error byte arrive
+    in the same frame; one motor is asked every `STATUS_EVERY_SWEEPS` sweeps,
+    so a motor's value is up to 12 x 2 sweeps old, the bus's (all motors
+    share it) up to 2."""
+    return np.asarray([np.nan if getattr(mb.rec(mid), field) is None
+                       else float(getattr(mb.rec(mid), field)) for mid in ids])
+
+
 def _print_phase(bench: SwingFF) -> None:
-    print("\n>> %-6s : %s" % (bench.phase, PHASE_BLURB[bench.phase]), flush=True)
+    blurb = PHASE_BLURB[bench.phase]
+    if not bench.powered.all() and bench.phase != "limp":
+        blurb += ("  [--only: %s limp at iq = 0]"
+                  % "/".join(C.LEGS[i] for i in np.flatnonzero(~bench.powered)))
+    print("\n>> %-6s : %s" % (bench.phase, blurb), flush=True)
 
 
 def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
@@ -593,7 +645,7 @@ def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
                     return reason
                 if log is not None:
                     log.add(t=now - t0, phase=bench.phase, bout=bench.bout,
-                            q=q, qd=qd_ctrl, x_b=body.x_b,
+                            q=q, qd=qd_ctrl.copy(), x_b=body.x_b,
                             p_swing=bench.p_swing.copy(), v_swing=bench.v_swing.copy(),
                             a_swing=bench.a_swing.copy(), swing_s=bench.swing_s.copy(),
                             contact=bench.contact.copy(), q_arc=bench.q_arc.copy(),
@@ -604,6 +656,8 @@ def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
                             tau_pd=bench.tau_pd.copy(), tau_ff=bench.tau_ff.copy(),
                             tau_meas=tau_meas,
                             errors=np.asarray([errors.get(mid, 0) or 0 for mid in ids]),
+                            vbus=_rec_array(mb, ids, "voltage"),
+                            ibus=_rec_array(mb, ids, "current"),
                             temps=temps, cap=bench.gate.cap_now(now))
             else:
                 tau_sent = np.zeros(n)
@@ -627,6 +681,8 @@ def run(mb, bench: SwingFF, *, rate_hz: float = RATE_HZ, key=None,
         if (sweep % STATUS_EVERY_SWEEPS == 0
                 and k == (sweep // STATUS_EVERY_SWEEPS) % n):
             taken = mb.status1_req(mid)
+        elif mode == "position" and not bench.powered_j[k]:
+            taken = mb.keepalive(mid)       # --only: 0xA1 iq = 0, the leg stays limp
         elif mode == "position":
             taken = mb.position(mid, float(np.rad2deg(values[k])),
                                 max_dps=float(bench.max_dps[k]))
@@ -652,8 +708,15 @@ def main(argv=None) -> int:
         prog="python -m hw.swing_ff",
         description=__doc__.splitlines()[0],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--legs", nargs="+", default=list(C.LEGS), choices=list(C.LEGS),
-                    help="which legs follow the arc when the clock lifts them")
+    which = ap.add_mutually_exclusive_group()
+    which.add_argument("--legs", nargs="+", default=list(C.LEGS), choices=list(C.LEGS),
+                       help="which legs follow the arc when the clock lifts them; the "
+                            "others hold the pose on the joint layer")
+    which.add_argument("--only", nargs="+", default=None, choices=list(C.LEGS),
+                       metavar="LEG",
+                       help="swing these legs and power NOTHING else: every other leg gets "
+                            "iq = 0 for the whole run and hangs limp (less load on the "
+                            "supply); the bus, the sweep and the trips are unchanged")
     ap.add_argument("--swing-ff", action="store_true",
                     help="the inertial feedforward ON for the whole run (off without)")
     ap.add_argument("--swings", type=int, default=0, metavar="N",
@@ -693,6 +756,9 @@ def main(argv=None) -> int:
                     metavar=("LO", "HI"),
                     help="Lambda is clamped to LO..HI x its value at the hold: Kp's floor "
                          "and the singular pose's cap")
+    sw.add_argument("--ff-scale", type=float, default=1.0, metavar="K",
+                    help="the whole M0 times K, so tau_ff times K (doc/swing_hw "
+                         "section 7 proposes 0.35)")
     sw.add_argument("--swing-stop", type=float, default=30.0, metavar="DEG",
                     help="TRIP: a swinging joint this far from the arc's own IK stops "
                          "the run; 0 turns it off")
@@ -733,8 +799,10 @@ def main(argv=None) -> int:
     except (RuntimeError, ValueError) as refusal:
         print("[swing_ff] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
         return 2
-    m0 = (None if args.ff_armature is None
-          else SWING.feedforward_inertia(args.ff_armature))
+    try:
+        m0 = SWING.feedforward_inertia(args.ff_armature, args.ff_scale)
+    except ValueError as refusal:
+        ap.error(str(refusal))
     schedule = None
     if args.sched:
         try:
@@ -750,15 +818,18 @@ def main(argv=None) -> int:
         except ValueError as refusal:
             print("[swing_ff] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
             return 2
+    swing_names = args.legs if args.only is None else args.only
     try:
-        bench = SwingFF(gate, gait, legs=[C.LEGS.index(name) for name in args.legs],
+        bench = SwingFF(gate, gait, legs=[C.LEGS.index(name) for name in swing_names],
                         swing_height=1e-3 * args.swing_height, swing_ff=args.swing_ff,
                         kp_swing=args.kp_swing, kd_swing=args.kd_swing,
                         kp_joint=[args.kp_joint_abd, args.kp_joint, args.kp_joint],
                         kd_joint=[args.kd_joint_abd, args.kd_joint, args.kd_joint],
                         ff_inertia=m0, schedule=schedule,
                         height=1e-3 * args.height, pose_s=args.pose_s,
-                        swings=args.swings, swing_stop_deg=args.swing_stop)
+                        swings=args.swings, swing_stop_deg=args.swing_stop,
+                        powered=(None if args.only is None
+                                 else [C.LEGS.index(name) for name in args.only]))
     except ValueError as refusal:
         print("[swing_ff] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
         return 2
@@ -780,7 +851,12 @@ def main(argv=None) -> int:
                        for i in range(C.N_LEGS))))
     print("  stance legs: the joint layer Kp %s Kd %s (abd/pitch/knee) + gravity; a swinging "
           "leg gets none of it" % (bench.kp_joint, bench.kd_joint))
-    print("  legs %s   %s" % (" ".join(args.legs), gait))
+    print("  legs %s   %s" % (" ".join(swing_names), gait))
+    if args.only is not None:
+        limp = [name for i, name in enumerate(C.LEGS) if not bench.powered[i]]
+        print("  --only: POWERED %s; %s get iq = 0 from arm to stop (no pose ramp, no joint "
+              "layer, no gravity) and hang limp -- still on the bus, read and monitored"
+              % ("/".join(args.only), "/".join(limp) or "none"))
     demand = SWING.swing_demand(0, bench.rest[0], gait.swing_duration,
                                 1e-3 * args.swing_height, bench.q_pose[0])
     print("  swing apex %.0f mm over %.0f ms, Cartesian PD Kp %s Kd %s; knee ~%.1f rad/s, "
@@ -804,11 +880,11 @@ def main(argv=None) -> int:
               np.array2string(kp_a, precision=0), np.array2string(kd_a, precision=1)))
         if list(args.kd_swing) != list(BCFG.KD_SWING_WALK):
             print("    (--kd-swing %s is not used)" % (args.kd_swing,))
-    print("  feedforward M0 J^+ (a_ref - Jdot qd_ref): M0 diag %s kg m^2 (armature %s); "
-          "%s FOR THIS RUN (--swing-ff); logged as tau_ff"
+    print("  feedforward M0 J^+ (a_ref - Jdot qd_ref): M0 diag %s kg m^2 (armature %s, "
+          "x %.2f --ff-scale); %s FOR THIS RUN (--swing-ff); logged as tau_ff"
           % (np.array2string(np.diag(bench.m0), precision=4),
              "%.5f" % (P.ARMATURE if args.ff_armature is None else args.ff_armature),
-             "ON" if args.swing_ff else "OFF"))
+             args.ff_scale, "ON" if args.swing_ff else "OFF"))
     print("  log: %s" % log_path)
     print("  the study's prediction (doc/swing_height, RR): FF off apex ~15 mm / h_td ~+13; "
           "FF on apex ~23 / h_td ~-2")
@@ -830,7 +906,9 @@ def main(argv=None) -> int:
                  period=gait.period, duty=gait.duty, ramp=gait.ramp,
                  swing_height=bench.swing_height, kp_swing=bench.kp_swing,
                  kd_swing=bench.kd_swing, kp_joint=bench.kp_joint, kd_joint=bench.kd_joint,
-                 m0=bench.m0, height=bench.height,
+                 m0=bench.m0, ff_scale=args.ff_scale,
+                 ff_armature=(P.ARMATURE if args.ff_armature is None else args.ff_armature),
+                 height=bench.height,
                  sched_on=schedule is not None,
                  sched_wn=np.full(3, np.nan) if schedule is None else schedule.wn,
                  sched_zeta=np.full(3, np.nan) if schedule is None else schedule.zeta,
@@ -838,7 +916,7 @@ def main(argv=None) -> int:
                  sched_lam_range=(np.full(2, np.nan) if schedule is None
                                   else np.asarray(schedule.lam_range)),
                  tau_cap=args.tau_cap,
-                 tau_slew=args.tau_slew, legs=bench.legs)
+                 tau_slew=args.tau_slew, legs=bench.legs, powered=bench.powered)
     stop = None
     gcq = RT.QuietGC()
     try:
@@ -872,6 +950,21 @@ def main(argv=None) -> int:
             print("  %s  %s" % (C.LEGS[leg], "   ".join(
                 "%4.1f / %4.1f" % pair for pair in zip(
                     gate.qd_peak[row], gate.encoder_qd_peak[row]))))
+    # The last STATUS1 each driver sent: on a 0x01 / 0x02 stop the faulting
+    # motor's voltage here came in the same frame as the fault byte.
+    volts, amps = _rec_array(mb, ids, "voltage"), _rec_array(mb, ids, "current")
+    errs = [mb.rec(mid).error for mid in ids]
+    print("[swing_ff] last STATUS1 per motor, bus V / bus A / error (CAN id):")
+    for leg in range(C.N_LEGS):
+        print("  %s  %s" % (C.LEGS[leg], "   ".join(
+            "%2d: %5.2f V %+5.2f A %s" % (ids[j], volts[j], amps[j],
+                                         "--" if errs[j] is None else "0x%02X" % errs[j])
+            for j in range(3 * leg, 3 * leg + 3))))
+    if log.rows:
+        v = np.array([r["vbus"] for r in log.rows])
+        if np.isfinite(v).any():
+            print("[swing_ff] bus voltage over the torque phase: min %.2f  max %.2f V "
+                  "(any motor's STATUS1)" % (np.nanmin(v), np.nanmax(v)))
     print("[swing_ff] log: %s" % log.save(log_path))
     if stop:
         print("[swing_ff] stopped: %s.  Motors stopped; the legs hang." % stop)

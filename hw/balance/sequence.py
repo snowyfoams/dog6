@@ -250,6 +250,12 @@ def phases_for(wave: str | None) -> tuple[str, ...]:
 #: wave phase is entered: halfway from the crouch to the lift target.
 WAVE_MIN_HEIGHT = 0.5 * (ST.CROUCH_HEIGHT + ST.LIFT_HEIGHT)
 
+#: Duty 0.5 has no four-foot window (`gait.py`), so a trot or a step there is
+#: left in the first sweeps of a swing, the pair the clock just lifted still
+#: on the floor: 10 ms of a 300 ms swing is 0.05 mm of a 20 mm apex, and two
+#: sweeps of the robot's 5.5 ms loop.
+HANDOVER_EXIT_S = 0.010
+
 #: What the lift phase is actually doing, which depends on `--law`.  The
 #: phase banner is the one place an operator reads it, so it says which.
 LIFT_BLURB = {
@@ -785,8 +791,16 @@ class StandSequence:
         after it, and the first sweep on the way down is the closest thing
         to full support that duty has.  Same instant `full_support` would
         have picked if it existed; one sweep later than it when it does.
+
+        AT DUTY 0.5 THERE IS NO WINDOW (`gait.py`, 2026-10-29): the exit is the
+        handover itself, the first HANDOVER_EXIT_S of a swing.  The HOLD then
+        gives the pair just lifted its weight back.
         """
         sample = gait.sample(now)
+        if gait.duty == 0.5:
+            lifted = ~sample.contact
+            return bool(lifted.any() and sample.swing_s[lifted].max()
+                        * gait.swing_duration < HANDOVER_EXIT_S)
         if sample.full_support or not sample.contact.all():
             self._exit_min_w = None
             return bool(sample.full_support)

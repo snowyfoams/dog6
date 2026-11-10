@@ -41,7 +41,10 @@ WHAT THE RUNNER DOES WITH IT (`hw.stand.run`)
     Every sweep, where it would read the keyboard, it asks the script.  The
     keyboard still works, and ANY key the operator presses CANCELS the rest
     of the script and says so: the person at the robot overrides the file,
-    and X is X.  An event whose phase ends before its time is SKIPPED, and
+    and X is X.  One exception: ENTER before the script's first press, in a
+    phase no line is timed from, is the stand-up (limp, settle, crouch,
+    rise, stepped by hand on the robot) and goes through with the script
+    still waiting (`KeyScript.lets_through`).  An event whose phase ends before its time is SKIPPED, and
     the report says so -- a fall mid-shuttle drops the shuttle's remaining
     presses, and a `fall +3 ENTER` line then parks.  `--auto` beside a script
     (--fake only) steps the position phases only -- limp, settle, crouch,
@@ -288,8 +291,9 @@ class KeyScript:
         return any(ch in ev.keys for ev in self.events)
 
     def banner(self) -> list:
-        lines = ["SCRIPT %s: %d event%s -- any key pressed by hand cancels "
-                 "the rest" % (self.name, len(self.events),
+        lines = ["SCRIPT %s: %d event%s -- stand it up with ENTER; from the "
+                 "first scripted press, any key pressed by hand cancels the "
+                 "rest" % (self.name, len(self.events),
                                "" if len(self.events) == 1 else "s")]
         for ev in self.events:
             lines.append("     %-10s %+8.1f s  %s" % (ev.anchor, ev.t, ev.text))
@@ -336,6 +340,18 @@ class KeyScript:
         if self.queue:
             return self.queue.pop(0)
         return None
+
+    def lets_through(self, ch, stand) -> bool:
+        """True if the operator's key is the stand-up's ENTER and leaves the
+        script running: ENTER before the script's first press, in a phase no
+        line is timed from (limp, settle, crouch, rise, for every file in
+        hw/scripts).  On the robot `--auto` is refused, so the person at the
+        robot stands it up by hand and the file takes over at HOLD.  Any
+        other key, or ENTER once the script has pressed or in a phase it times
+        from, is the operator taking over."""
+        if ch not in ("\r", "\n") or self.fired or self.cancelled is not None:
+            return False
+        return all(ev.phase != stand.phase_name for ev in self.events)
 
     def cancel(self, why: str) -> str:
         """The operator took over: nothing more goes out."""

@@ -10,6 +10,8 @@
     $V -m hw.fold2_walk --swing-law osc --settle 0.2 the task-space swing and
                                                      DOG5's re-level, the
                                                      defaults before 2026-10-20
+    $V -m hw.fold2_walk --qp-s 1 1 1 1 1 1           the QP's S as every other
+                                                     entry point has it
 
     limp -> settle -> crouch -> rise -> hold --T--> trot (walk) --T--> hold -> park
 
@@ -23,6 +25,15 @@ and the footholds, the Cartesian impedance swing (the default since
 `config.WN_SWING_OSC`), and the walk's clock -- 0.6 s at duty 0.70, no
 settle (DOG6 needs none, the operator's test of 2026-10-20).  `hw.fold_walk`'s docstring
 says why each of those, and doc/walk/README.md has the runs.
+
+THE QP'S S IS FOLD2_WALK'S OWN (2026-10-29, on request): Fz 10 and roll 20,
+the rest 1 (config.QP_S_FOLD2_WALK; every other entry point keeps S = I).
+On four feet it acts only where a face or the fz box binds.  On a diagonal
+pair it acts on every sweep: roll about the feet's own line is bought with
+pitch the other way -- a 0.3 N*m roll ask delivers 0.21 roll and -0.56
+pitch, against 0.03 and -0.08 at S = I (config.QP_S_FOLD2_WALK has the
+numbers, `--qp-s 1 1 10 20 20 1` the pitch-weighted alternative).  Not
+flown.  `--qp-s` sets all six.
 
 WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
     The footholds are placed about the stance's OWN sites, latched from
@@ -42,8 +53,9 @@ WHAT IS FOLD2'S OWN, AND WHAT IT DOES TO THE WALK
     forward); 0.20 m/s forward is the edge, 4 of 6 to the tilt stop.  Joint
     friction with a late IMU, a mu 0.5 floor, DOG6's lighter rotor with
     DOG5's M0 or a fitted one: none tipped.  The keys' box is the fold's,
-    0.12 / 0.06 m/s and 12 deg/s, 0.06 m/s or 6 deg/s a press (config.WALK_*;
-    x/y doubled 2026-10-20 on request from 0.06 / 0.03 and 0.03 a press);
+    0.12 / 0.03 m/s and 12 deg/s, 0.06 m/s (W/S), 0.03 m/s (A/D) or 6 deg/s
+    a press (config.WALK_*; x/y doubled 2026-10-20 on request from 0.06 /
+    0.03 and 0.03 a press, y halved back 2026-10-21 on request);
     `--v-max 0.15 0.10 --yaw-rate-max 40` is still inside what MuJoCo walked.
 
 THE ARMATURE IS THE osc SWING'S GAIN, here as in `hw.fold_walk`: under
@@ -81,13 +93,15 @@ if __package__ in (None, ""):        # allow `python hw/fold2_walk.py` too
 from . import fold2_trot as F2       # noqa: E402
 from . import fold_walk as FW        # noqa: E402
 from . import stand as STAND         # noqa: E402
+from .balance import config as BCFG  # noqa: E402
 
 __all__ = ["main", "walk_options"]
 
 
 def walk_options() -> dict:
-    """`hw.fold2_trot`'s options, walking (`fold_walk.walking`)."""
-    return FW.walking(F2.stand_options())
+    """`hw.fold2_trot`'s options, walking (`fold_walk.walking`), with
+    fold2_walk's own QP weights (config.QP_S_FOLD2_WALK)."""
+    return dict(FW.walking(F2.stand_options()), qp_s=BCFG.QP_S_FOLD2_WALK)
 
 
 def main(argv=None) -> int:

@@ -812,7 +812,7 @@ def run(mb, bench: SwingBench, *, rate_hz: float = RATE_HZ, key=None,
                 if reason:
                     return reason
                 if log is not None:
-                    log.add(t=now - t0, phase=bench.phase, q=q, qd=qd_ctrl,
+                    log.add(t=now - t0, phase=bench.phase, q=q, qd=qd_ctrl.copy(),
                             x_b=body.x_b, p_swing=bench.p_swing.copy(),
                             swing_s=bench.swing_s.copy(), contact=bench.contact.copy(),
                             tau_req=bench.tau.copy(), tau_cmd=tau_sent.copy(),
@@ -911,6 +911,9 @@ def main(argv=None) -> int:
                     help="the reflected rotor inertia the feedforward's M0 is built "
                          "on (joint side).  Default params.ARMATURE %.5f -- DOG5's, "
                          "not measured on DOG6; --analyse fits it from a log" % P.ARMATURE)
+    sw.add_argument("--ff-scale", type=float, default=1.0, metavar="K",
+                    help="the whole M0 times K, so tau_ff times K (doc/swing_hw "
+                         "section 7 proposes 0.35)")
     sw.add_argument("--kp-swing", type=float, nargs=3, default=list(BCFG.KP_SWING),
                     metavar="N_PER_M")
     sw.add_argument("--kd-swing", type=float, nargs=3, default=list(BCFG.KD_SWING),
@@ -934,6 +937,10 @@ def main(argv=None) -> int:
                  "at %.0f mm" % (1e3 * BCFG.H_LIFT))
     height = FOLD_HEIGHT if args.height is None else 1e-3 * args.height
     kp_swing, kd_swing, own_swing = swing_leg_gains(args)
+    try:
+        ff_inertia = SWING.feedforward_inertia(args.ff_armature, args.ff_scale)
+    except ValueError as refusal:
+        ap.error(str(refusal))
     if own_swing and args.swing != "cartesian":
         ap.error("--kp/--kd-swing-%s are the Cartesian swing's; --swing %s swings "
                  "on its own joint PD" % (own_swing[0].lower(), args.swing))
@@ -958,8 +965,7 @@ def main(argv=None) -> int:
                            swing_ff=args.swing_ff, kp_swing=kp_swing,
                            kd_swing=kd_swing, pose_s=args.pose_s, swings=args.swings,
                            swing_stop_deg=args.swing_stop,
-                           ff_inertia=(None if args.ff_armature is None
-                                       else SWING.feedforward_inertia(args.ff_armature)),
+                           ff_inertia=ff_inertia,
                            posture=args.posture, height=height)
     except ValueError as refusal:
         print("[bench] REFUSED before opening the bus:\n  %s" % refusal, file=sys.stderr)
@@ -993,12 +999,14 @@ def main(argv=None) -> int:
     if demand["tau"].max() > args.tau_cap:
         print("  WARNING: the arc asks ~%.1f N*m against a %.1f cap -- raise --tau-cap "
               "or lower --swing-height" % (demand["tau"].max(), args.tau_cap))
-    m0 = np.diag(SWING.feedforward_inertia(args.ff_armature))
+    m0 = np.diag(ff_inertia)
     print("  feedforward %s" % (
-        "ON: M0 J^+ (a_ref - Jdot qd_ref), M0 diag %s (armature %s), logged as tau_ff"
+        "ON: M0 J^+ (a_ref - Jdot qd_ref), M0 diag %s (armature %s, x %.2f --ff-scale), "
+        "logged as tau_ff"
         % (np.array2string(m0, precision=4),
            "%.5f measured" % args.ff_armature if args.ff_armature is not None
-           else "%.5f INHERITED from DOG5 -- --analyse a log to measure it" % P.ARMATURE)
+           else "%.5f INHERITED from DOG5 -- --analyse a log to measure it" % P.ARMATURE,
+           args.ff_scale)
         if args.swing_ff else "OFF (--swing-ff)"))
     print("  ENTER: limp -> pose; hold -> swing; swing -> stop at four feet.  X: E-STOP.")
 

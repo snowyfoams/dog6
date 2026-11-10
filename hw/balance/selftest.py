@@ -1298,8 +1298,38 @@ def main() -> int:
         refused = False
     except ValueError:
         refused = True
-    check("duty 0.5 is refused: no window to hand the load across in",
-          refused)
+    check("duty 0.5 is refused with a ramp: no window to hand the load "
+          "across in", refused)
+    # DUTY 0.5, NO RAMP (2026-10-29, on request): let through, and only so.
+    try:
+        GAIT.TrotGait(duty=0.5, ramp=0.0, settle_s=0.2)
+        refused = False
+    except ValueError:
+        refused = True
+    check("duty 0.5 refuses a settle", refused)
+    half = GAIT.TrotGait(period=0.6, duty=0.5, ramp=0.0, settle_s=0.0)
+    half.reset(0.0)
+    # Off the handover instants: ON one, the phase's rounding can read both
+    # diagonals down for that instant (they are -- it is the handover).
+    t_half = np.arange(0.0005, 1.2, 0.001)
+    hs = [half.sample(t) for t in t_half]
+    hc = np.array([s.contact for s in hs])
+    hweight = np.array([s.weight for s in hs])
+    check("duty 0.5, ramp 0: exactly two feet down, weights exactly 0 / 1, "
+          "never full support, the first lift at once",
+          bool(np.all(hc.sum(axis=1) == 2) and np.all(hweight == hc)
+               and not any(s.full_support for s in hs)
+               and not half.contact(0.0)[fr] and half.entry_s == 0.0))
+    seq_half = SEQ.StandSequence(SAFE.SafetyGate(3.0), law="srb")
+    exits = np.array([seq_half._four_foot_window(half, t) for t in t_half])
+    since = np.mod(t_half[exits] + 1e-9, half.swing_duration)
+    check("...and T leaves it at every handover, in the first %.0f ms of the "
+          "swing" % (1e3 * SEQ.HANDOVER_EXIT_S),
+          bool(exits.any() and np.all(since < SEQ.HANDOVER_EXIT_S + 1e-6))
+          and len(set((t_half[exits] + 1e-9)
+                      // half.swing_duration)) == 4,
+          "%d exit sweeps, at most %.1f ms into a swing"
+          % (exits.sum(), 1e3 * since.max() if exits.any() else np.nan))
 
     # -- the allocator's trot path ----------------------------------------
     fold = POSE.FOLD
@@ -2415,10 +2445,10 @@ def main() -> int:
         keys.stop()
         keys.press(ch)
         one[ch] = (keys.command.vx, keys.command.vy, keys.command.yaw_rate)
-    v1, y1 = cfg.WALK_V_STEP, cfg.WALK_YAW_STEP
+    v1, w1, y1 = cfg.WALK_V_STEP, cfg.WALK_VY_STEP, cfg.WALK_YAW_STEP
     close("keys: W/S x, A/D y, Q/E yaw -- one step each, nothing else moves",
           [one[ch] for ch in "wsadqe"],
-          [(v1, 0, 0), (-v1, 0, 0), (0, v1, 0), (0, -v1, 0), (0, 0, y1),
+          [(v1, 0, 0), (-v1, 0, 0), (0, w1, 0), (0, -w1, 0), (0, 0, y1),
            (0, 0, -y1)], 1e-15)
     keys.stop()
     for _ in range(50):
@@ -2531,6 +2561,30 @@ def main() -> int:
           np.linalg.norm(a_q.residual) < np.linalg.norm(a_l.residual),
           "|residual| %.3f against %.3f" % (np.linalg.norm(a_q.residual),
                                             np.linalg.norm(a_l.residual)))
+    # fold2_walk's S (config.QP_S_FOLD2_WALK, 2026-10-29): Fz and roll heavy.
+    heavy = WQP.QpAllocator(s_diag=cfg.QP_S_FOLD2_WALK)
+    check("law qp_s reaches the QP; None keeps config.QP_S",
+          np.array_equal(LAW.BalanceLaw(foot_xy=fold.foot_xy, srb=fold.srb,
+                                        qp_s=cfg.QP_S_FOLD2_WALK).qp.s_diag,
+                         cfg.QP_S_FOLD2_WALK)
+          and np.array_equal(plain.qp.s_diag, cfg.QP_S))
+    a_h = heavy.allocate(at_fold.r_w, push)
+    check("fold2_walk's S: the 27 N push on four feet gives up less Fz",
+          abs(a_h.residual[2]) < abs(a_q.residual[2]),
+          "Fz off by %.3f N against %.3f at S = I"
+          % (abs(a_h.residual[2]), abs(a_q.residual[2])))
+    at_f2 = state_at(cfg.H_LIFT, foot_xy=POSE.FOLD2.foot_xy,
+                     q_seed=POSE.FOLD2.q, srb=POSE.FOLD2.srb)
+    ask = np.array([0.0, 0.0, cfg.WEIGHT, 0.3, 0.0, 0.0])
+    diag = np.array([1.0, 0.0, 0.0, 1.0])
+    d_i = WQP.QpAllocator().allocate(at_f2.r_w, ask, contact=diag).residual + ask
+    d_h = heavy.allocate(at_f2.r_w, ask, contact=diag).residual + ask
+    check("...on FOLD2's diagonal pair, nothing binding, a 0.3 N*m roll ask: "
+          "more roll delivered, and paid for in pitch",
+          heavy.last_iter == 0 and d_h[3] > 5.0 * d_i[3]
+          and abs(d_h[4]) > abs(d_i[4]),
+          "roll %.3f pitch %+.3f N*m against %.3f %+.3f at S = I"
+          % (d_h[3], d_h[4], d_i[3], d_i[4]))
     # A CERTIFICATE, NOT A COMPARISON: x feasible, and the gradient a
     # non-negative combination of the working rows -- KKT, which for a
     # convex QP is optimality.

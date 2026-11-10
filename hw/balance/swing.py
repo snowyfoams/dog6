@@ -346,10 +346,18 @@ def joint_swing_reference(leg: int, rest_b, progress: float, duration: float,
 #: signs are the robot's: `hw.kinematics` and `sim.kinematics` agree to
 #: 1e-12 over random poses (`sim.selftest`), so the joint coordinates are one
 #: convention.
-def feedforward_inertia(armature: float | None = None) -> np.ndarray:
+def feedforward_inertia(armature: float | None = None,
+                        scale: float = 1.0) -> np.ndarray:
     """The 3x3 M0 the feedforward multiplies by: the links at the lift pose
     plus `armature` on the diagonal -- `params.ARMATURE` (DOG5's 8.5e-5 x
-    10^2, INHERITED, NOT MEASURED ON DOG6) unless a measured one is given.
+    10^2, INHERITED, NOT MEASURED ON DOG6) unless a measured one is given --
+    the whole of it times `scale` (`--ff-scale`).
+
+    `--ff-scale`, 2026-10-29, on request: doc/swing_hw section 7's fix, the
+    full M0 times one factor in place of a smaller armature (0.35 there: its
+    fit of the 10-27 bench logs puts the right feedforward at ~1/3 of M0).  Under
+    the impedance + `--swing-ff` it scales tau_ff and nothing else; under
+    `--swing-law osc` M0 is the whole law's gain, so it scales the PD too.
 
     THE ARMATURE IS 61-96 % OF M0, SO IT IS THE FEEDFORWARD'S GAIN.  On the
     bench, 2026-09-25, with the feedforward on, a 15 mm arc reached 26 mm and
@@ -359,10 +367,13 @@ def feedforward_inertia(armature: float | None = None) -> np.ndarray:
     smaller than the inherited number, and `hw.swing_bench --analyse` fits it
     from a log's own q and tau (`--ff-armature` then puts it here).
     """
+    if not float(scale) > 0.0:
+        raise ValueError("--ff-scale %g: M0 must stay positive; leave --swing-ff "
+                         "off to fly without the feedforward" % scale)
     q_lift = np.asarray(cfg.NOMINAL_POSE, dtype=float)[0]
     links = LD.mass_matrix(0, q_lift, armature=False)
     a = P.ARMATURE if armature is None else float(armature)
-    return links + a * np.eye(3)
+    return float(scale) * (links + a * np.eye(3))
 
 
 JOINT_INERTIA_M0 = feedforward_inertia()

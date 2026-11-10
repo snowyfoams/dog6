@@ -154,7 +154,9 @@ class WalkHook:
                        default=np.degrees(BCFG.WALK_YAW_RATE_MAX),
                        metavar="DEG_S")
         g.add_argument("--v-step", type=float, default=BCFG.WALK_V_STEP,
-                       metavar="M_S", help="one W/S/A/D press")
+                       metavar="M_S", help="one W/S press")
+        g.add_argument("--vy-step", type=float, default=BCFG.WALK_VY_STEP,
+                       metavar="M_S", help="one A/D press")
         g.add_argument("--yaw-step", type=float,
                        default=np.degrees(BCFG.WALK_YAW_STEP), metavar="DEG_S",
                        help="one Q/E press")
@@ -222,7 +224,7 @@ class WalkHook:
                        metavar="S", help="...for this long")
 
     def configure(self, args) -> None:
-        self.keys = WalkKeys(v_step=args.v_step,
+        self.keys = WalkKeys(v_step=args.v_step, vy_step=args.vy_step,
                              yaw_step=np.radians(args.yaw_step),
                              vx_max=args.v_max[0], vy_max=args.v_max[1],
                              yaw_rate_max=np.radians(args.yaw_rate_max))
@@ -232,6 +234,7 @@ class WalkHook:
                                   leash=1e-3 * args.leash)
         ff = getattr(args, "swing_ff", False)
         armature = getattr(args, "ff_armature", None)
+        ff_scale = getattr(args, "ff_scale", 1.0)
         # ONE LEG'S OWN impedance, 2026-10-05, on request: a (4, 3) table,
         # `--kp-swing-walk` in every row.  The osc law has no Kp/Kd to take.
         self.kp_rows, self.kd_rows, self.own_swing = STAND.swing_leg_gains(
@@ -250,8 +253,8 @@ class WalkHook:
         self.plan = WalkPlan(reference=reference, kv=args.step_kv,
                              kp_swing=self.kp_rows,
                              kd_swing=self.kd_rows, swing_ff=ff,
-                             ff_inertia=(None if armature is None else
-                                         BSWING.feedforward_inertia(armature)),
+                             ff_inertia=BSWING.feedforward_inertia(armature,
+                                                                   ff_scale),
                              hold_xy_max=1e-3 * args.hold_xy_max,
                              swing_law=args.swing_law,
                              wn_swing=args.wn_swing,
@@ -264,19 +267,20 @@ class WalkHook:
         return dict(walk=self.plan)
 
     def banner(self, args) -> list:
-        swing = ("osc, wn %s rad/s, zeta %.2f, M0 armature %s"
+        swing = ("osc, wn %s rad/s, zeta %.2f, M0 armature %s x %.2f"
                  % (np.array2string(np.asarray(args.wn_swing), precision=0),
                     args.zeta_swing,
                     "inherited (DOG5's)" if getattr(args, "ff_armature", None)
-                    is None else "%.5f" % args.ff_armature)
+                    is None else "%.5f" % args.ff_armature,
+                    getattr(args, "ff_scale", 1.0))
                  if args.swing_law == "osc" else
                  "impedance, Kp %s Kd %s%s"
                  % (np.array2string(np.asarray(args.kp_swing_walk),
                                     precision=0),
                     np.array2string(np.asarray(args.kd_swing_walk),
                                     precision=0),
-                    " + feedforward" if getattr(args, "swing_ff", False)
-                    else ""))
+                    " + feedforward x %.2f M0" % getattr(args, "ff_scale", 1.0)
+                    if getattr(args, "swing_ff", False) else ""))
         return ["WALK while trotting: %s" % WalkKeys.help_line(),
                 "     limits vx %.2f vy %.2f m/s, yaw %.0f deg/s; slew %.2f "
                 "m/s^2; leash %.0f mm; foothold eq (33) + %.2f s feedback; "

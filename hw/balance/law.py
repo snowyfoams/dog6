@@ -478,6 +478,9 @@ class BalanceLaw:
     #: the wrench delivered is whatever the clip left (`--alloc wls`).
     #: qp.py says where the two differ and where they cannot.
     alloc: str = "qp"
+    #: The QP's S diagonal (Fx, Fy, Fz, Mx, My, Mz), None for config.QP_S
+    #: (`--qp-s`; `hw.fold2_walk` passes config.QP_S_FOLD2_WALK).
+    qp_s: object | None = None
     #: WALKING, 2026-10-04: a `walk.WalkPlan`, or None -- every entry point
     #: but `hw.fold_walk`, for which nothing below changes.  Attached, it
     #: engages on the first trot sweep and from then on owns the x/y rows'
@@ -495,7 +498,8 @@ class BalanceLaw:
             raise ValueError("walking places the foot in x/y; the %s swing "
                              "lifts in z alone" % self.swing)
         #: The QP allocator (qp.py), when `alloc` asks for it.
-        self.qp = QP.QpAllocator(mu=self.mu) if self.alloc == "qp" else None
+        self.qp = (QP.QpAllocator(mu=self.mu, s_diag=self.qp_s)
+                   if self.alloc == "qp" else None)
         if self.swing_roll and self.swing != "cartesian":
             raise ValueError("swing_roll levels the Cartesian arc; the joint "
                              "swing latches its own at liftoff")

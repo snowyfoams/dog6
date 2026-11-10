@@ -7,7 +7,7 @@
 drive the robot:
 
     W / S     forward / back      +- WALK_V_STEP     (sim: 0.1 m/s)
-    A / D     left / right        +- WALK_V_STEP
+    A / D     left / right        +- WALK_VY_STEP    (half W/S's since 2026-10-21)
     Q / E     turn left / right   +- WALK_YAW_STEP   (sim: 20 deg/s)
     SPACE     stop: all three zero
 
@@ -48,11 +48,13 @@ class WalkKeys:
     """The accumulated walking command, and the keys that move it."""
 
     def __init__(self, *, v_step: float = cfg.WALK_V_STEP,
+                 vy_step: float = cfg.WALK_VY_STEP,
                  yaw_step: float = cfg.WALK_YAW_STEP,
                  vx_max: float = cfg.WALK_VX_MAX,
                  vy_max: float = cfg.WALK_VY_MAX,
                  yaw_rate_max: float = cfg.WALK_YAW_RATE_MAX):
         self.v_step, self.yaw_step = float(v_step), float(yaw_step)
+        self.vy_step = float(vy_step)
         self.vx_max, self.vy_max = float(vx_max), float(vy_max)
         self.yaw_rate_max = float(yaw_rate_max)
         self.command = Command(vx=0.0, vy=0.0, yaw_rate=0.0)
@@ -72,7 +74,8 @@ class WalkKeys:
             self.stop()
             return "walk: STOP  (%s)" % self.describe_command()
         axis, sign = KEYMAP[ch.lower()]
-        step = self.yaw_step if axis == "yaw_rate" else self.v_step
+        step = {"vx": self.v_step, "vy": self.vy_step,
+                "yaw_rate": self.yaw_step}[axis]
         c = self.command
         values = dict(vx=c.vx, vy=c.vy, yaw_rate=c.yaw_rate)
         values[axis] += sign * step
@@ -92,7 +95,7 @@ class WalkKeys:
     @staticmethod
     def help_line() -> str:
         return ("W/S x +-%.2f  A/D y +-%.2f m/s  Q/E yaw +-%.0f deg/s  "
-                "SPACE stop" % (cfg.WALK_V_STEP, cfg.WALK_V_STEP,
+                "SPACE stop" % (cfg.WALK_V_STEP, cfg.WALK_VY_STEP,
                                 np.degrees(cfg.WALK_YAW_STEP)))
 
 

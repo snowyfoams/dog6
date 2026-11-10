@@ -40,6 +40,16 @@ WHERE THE CLOCK STARTS -- THE ONE THING NOT COPIED FROM DOG5
     slew then absorbed.  `reset` here starts the clock at the freeze point
     instead -- mid the all-four window, every weight already 1 -- so entering
     the trot moves nothing.  The first liftoff follows `entry_s` later.
+
+DUTY 0.5 WITH NO RAMP, 2026-10-29 (on request, to see what DOG6 does)
+    `duty=0.5, ramp=0` is let through, and only that pair: one diagonal
+    lands on the sweep the other lifts, every weight is exactly 0 or 1, and
+    a whole diagonal's load steps across at each handover -- the slew is all
+    that is left between it and the motors.  There is no all-four window, so
+    there is no freeze point: `reset` starts at phase 0, the FR/RL diagonal
+    lifting on the first sweep (`entry_s` 0), `full_support` is never true,
+    and no settle is possible.  The trot is left at a handover instead
+    (`sequence.StandSequence._four_foot_window`).
 """
 from __future__ import annotations
 
@@ -85,11 +95,17 @@ class TrotGait:
                  settle_every: int = cfg.SETTLE_EVERY):
         if not period > 0.0:
             raise ValueError("period must be positive, got %r" % period)
-        if not 0.5 < duty < 1.0:
+        if not 0.5 <= duty < 1.0:
             raise ValueError(
-                "duty %r has no all-four window: at <= 0.5 the contact ramp "
-                "has nowhere to hand the load across, and the settle would "
-                "hold a foot that is meant to swing" % duty)
+                "duty %r: below 0.5 there are instants with no foot down"
+                % duty)
+        if ramp < 0.0:
+            raise ValueError("ramp must be >= 0, got %r" % ramp)
+        if duty == 0.5 and (ramp > 0.0 or settle_s > 0.0):
+            raise ValueError(
+                "duty 0.5 has no all-four window: the contact ramp has "
+                "nowhere to hand the load across (--contact-ramp 0) and the "
+                "settle would hold a foot that is meant to swing (--settle 0)")
         if settle_s < 0.0:
             raise ValueError("settle_s must be >= 0, got %r" % settle_s)
         if int(settle_every) != settle_every or settle_every < 1:
@@ -108,9 +124,9 @@ class TrotGait:
         self._t0 = 0.0
         # MEASURED, not assumed (trot_demo's guard): at the freeze point every
         # leg must be planted at FULL weight, or the settle is a lean and the
-        # clock's start is a step.
+        # clock's start is a step.  Duty 0.5 has no such point (docstring).
         w = self._weight_from_phase(self._raw_phase(self.freeze_s))
-        if not bool(np.all(w >= 1.0 - 1e-9)):
+        if self.duty > 0.5 and not bool(np.all(w >= 1.0 - 1e-9)):
             raise ValueError(
                 "freeze point %.3f s is not full four-foot support (duty %.2f, "
                 "ramp %.2f): weights %s"
@@ -196,6 +212,9 @@ class TrotGait:
                         (ph - self.duty) / (1.0 - self.duty))
 
     def _weight_from_phase(self, ph) -> np.ndarray:
+        if self.ramp == 0.0:
+            # No ramp: weight 1 from the touchdown sweep, 0 from liftoff.
+            return np.where(ph < self.duty, 1.0, 0.0)
         s = np.clip(ph / self.duty, 0.0, 1.0)
         r = max(self.ramp, 1e-9)
         w = smoothstep(np.minimum(s / r, (1.0 - s) / r))

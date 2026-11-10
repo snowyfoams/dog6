@@ -975,10 +975,22 @@ def _script_checks() -> None:
     st = Stub()
     check("limp: nothing due", s.poll(0.0, st) is None
           and "waiting for hold" in s.status(0.0, st), s.status(0.0, st))
+    through = []
+    for p in ("limp", "settle", "crouch", "rise", "hold"):
+        st.phase_name = p
+        through.append(s.lets_through("\r", st))
+    st.phase_name = "crouch"
+    check("the stand-up's ENTER goes through, not HOLD's, not another key",
+          through == [True, True, True, True, False]
+          and not s.lets_through(" ", st) and not s.lets_through("t", st)
+          and s.cancelled is None, "%r" % through)
     st.phase_name, st.t_phase = "hold", 10.0
     out = [s.poll(t, st) for t in (10.0, 12.9, 13.0, 13.1)]
     check("hold +3: T on the sweep it is due, once",
           out == [None, None, "t", None], "%r" % out)
+    st.phase_name = "rise"
+    check("...and after that first press, ENTER is the operator's again",
+          not s.lets_through("\r", st), "")
     st.phase_name, st.t_phase, st.t_trot = "recentre", 13.2, 0.0
     check("recentre: nothing scripted there", s.poll(13.3, st) is None, "")
     st.phase_name, st.t_phase, st.t_trot = "trot", 14.0, 14.0

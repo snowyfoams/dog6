@@ -651,8 +651,11 @@ COM_SPREAD_MAX = 0.015
 #: 60 % OF THAT SINCE 2026-10-05, on request ("the velocity is high"): the
 #: press was 0.05 m/s and 10 deg/s, as doc/walk flew it.  W/S/A/D DOUBLED
 #: 2026-10-20, on request ("improve the wasd for xy velocity, 2 times"):
-#: 0.03 -> 0.06 m/s a press; Q/E's yaw press is unchanged.
+#: 0.03 -> 0.06 m/s a press; Q/E's yaw press is unchanged.  A/D HALVED
+#: BACK 2026-10-21, on request ("the y direction locomotion is not good"):
+#: WALK_VY_STEP is its own press, 0.06 -> 0.03 m/s; W/S keep 0.06.
 WALK_V_STEP = 0.06
+WALK_VY_STEP = 0.03
 WALK_YAW_STEP = float(np.radians(6.0))
 
 #: What the keys may accumulate to: inside what MuJoCo walked, not what the
@@ -668,9 +671,11 @@ WALK_YAW_STEP = float(np.radians(6.0))
 #: THE X/Y BOX DOUBLED 2026-10-20 with the press, on request: 0.06 / 0.03 ->
 #: 0.12 / 0.06 m/s (yaw stays 12 deg/s).  0.12 m/s forward is past the 0.10
 #: of the sweep above and short of the 0.15 that tipped; `--v-max 0.06 0.03
-#: --v-step 0.03` is the box before.
+#: --v-step 0.03` is the box before.  Y HALVED BACK 2026-10-21 with its
+#: press, on request: 0.06 -> 0.03 m/s, one A/D press; `--v-max 0.12 0.06
+#: --vy-step 0.06` is the y of 2026-10-20.
 WALK_VX_MAX = 0.12                  # m/s
-WALK_VY_MAX = 0.06                  # m/s
+WALK_VY_MAX = 0.03                  # m/s
 WALK_YAW_RATE_MAX = float(np.radians(12.0))   # rad/s
 
 #: The command is SLEWED toward what the keys ask, never stepped: a step in
@@ -807,7 +812,23 @@ HOLD_XY_ERR_MAX = 0.020             # m
 #: optimisation, not by clipping and rescaling afterwards.  alpha W is the
 #: soft cone (W is allocation's (10, 10, 1)); small, so the wrench is
 #: tracked to ~0.1 N.  beta 0: the gate's slew already smooths.  [UNTUNED]
-QP_S = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+QP_S = np.array([1.0, 1.0, 1, 80, 1.0, 1.0])
+#: `hw.fold2_walk`'s S, 2026-10-29, on request ("give heavy weight for the z
+#: and roll"): (Fx, Fy, Fz, Mx, My, Mz), Fz and the roll moment over the
+#: rest.  Roll's 20 is DOG5's flown moment weight (its W_TASK: forces ~57 N
+#: against moments ~5 N*m, so S = I trades 1 N*m for 1 N); z's 10 has no
+#: flight behind it.  WHERE S ACTS: on four feet only where a face or the fz
+#: box binds (a 27 N push: Fz off by 0.57 N at S = I, 0.07 here).  On a
+#: DIAGONAL PAIR ON EVERY SWEEP, nothing binding: the moment about the feet's
+#: own line is reachable only through sideways force on the 141 mm lever
+#: below the CoM, and S picks the trade.  FOLD2's diagonal, a 0.3 N*m roll
+#: ask (selftest's numbers): S = I delivers 0.03 of it and -0.08 N*m pitch;
+#: this S 0.21 of it and -0.56 N*m pitch, sign flipping with the diagonal,
+#: and a 0.3 pitch ask gets 0.13 (0.28 at S = I).  1 1 10 20 20 1 (pitch
+#: weighted as roll, DOG5's ratio) delivers 0.10 roll, -0.06 pitch, a full
+#: pitch ask, for 0.56 N of Fy.  Every other entry point keeps QP_S;
+#: `--qp-s` overrides on any.  [UNTUNED -- NOT FLOWN]
+QP_S_FOLD2_WALK = np.array([1.0, 1.0, 10.0, 100.0, 1.0, 1.0])
 QP_ALPHA = 1.0e-4
 QP_BETA = 0.0
 #: Active-set iterations a sweep may take; the cap returns the last FEASIBLE
@@ -905,10 +926,10 @@ def describe() -> str:
         "    joint hold layer     Kp %.1f N*m/rad  Kd %.2f N*m*s/rad   every "
         "leg, q latched on reaching HOLD" % (KP_JOINT_HOLD, KD_JOINT_HOLD),
         "  walking (hw.fold_walk)  [SIM-TUNED, NOT FLOWN]",
-        "    keys        +-%.2f m/s, +-%.0f deg/s a press; box vx %.2f vy %.2f "
-        "m/s, yaw %.0f deg/s"
-        % (WALK_V_STEP, np.degrees(WALK_YAW_STEP), WALK_VX_MAX, WALK_VY_MAX,
-           np.degrees(WALK_YAW_RATE_MAX)),
+        "    keys        x +-%.2f, y +-%.2f m/s, +-%.0f deg/s a press; box vx "
+        "%.2f vy %.2f m/s, yaw %.0f deg/s"
+        % (WALK_V_STEP, WALK_VY_STEP, np.degrees(WALK_YAW_STEP), WALK_VX_MAX,
+           WALK_VY_MAX, np.degrees(WALK_YAW_RATE_MAX)),
         "    reference   slew %.2f m/s^2, %.0f deg/s^2; leash %.0f mm, %.0f deg"
         % (WALK_ACC_MAX, np.degrees(WALK_YAW_ACC_MAX), 1e3 * WALK_LEASH,
            np.degrees(WALK_YAW_LEASH)),
@@ -923,6 +944,7 @@ def describe() -> str:
            1e3 * HOLD_XY_ERR_MAX),
         "    QP          S %s  alpha %.0e  beta %.0e  cap %d iterations"
         % (QP_S, QP_ALPHA, QP_BETA, QP_MAX_ITER),
+        "    QP S, fold2_walk  %s" % (QP_S_FOLD2_WALK,),
     ])
 
 

@@ -724,14 +724,17 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
             pressed = key.get() if key is not None else None
             # THE SCRIPT (hw.script) PRESSES WHERE THE OPERATOR WOULD, one
             # key a sweep, and a key from the keyboard cancels it: whoever is
-            # at the robot overrides the file.  With a script, --auto keeps
-            # only the position phases; HOLD and the trot are the script's.
+            # at the robot overrides the file -- except the stand-up's ENTER,
+            # before the script's first press (`KeyScript.lets_through`).
+            # With a script, --auto keeps only the position phases; HOLD and
+            # the trot are the script's.
             auto_now = auto_s
             if script is not None:
                 if pressed is not None:
-                    print("\n   " + script.cancel("operator pressed %s"
-                                                  % SCRIPT.key_name(pressed)),
-                          flush=True)
+                    if not script.lets_through(pressed, stand):
+                        print("\n   " + script.cancel(
+                            "operator pressed %s" % SCRIPT.key_name(pressed)),
+                            flush=True)
                 else:
                     pressed = script.poll(now, stand)
                     if pressed is not None:
@@ -868,7 +871,7 @@ def run(mb, stand: StandSequence, *, rate_hz: float = RATE_HZ, key=None,
                             None if out is None else out.allocation.fz),
                         f_w=None if out is None else out.allocation.f_w,
                         residual=None if out is None else out.allocation.residual,
-                        q=body.q, qd=body.qd, q_ref=stand.q_des,
+                        q=body.q, qd=body.qd.copy(), q_ref=stand.q_des,
                         tau_cmd=stand.tau, tau_meas=tau_meas,
                         tau_req=stand.tau_request,
                         tau_ff=None if out is None else out.tau_ff,
@@ -1096,7 +1099,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
          terse: bool = False, limits: bool = True,
          rise_track: bool = False, height: float = None,
          stand_xy=None, slide_from: float = None,
-         est_xy: bool = None, alloc: str = "qp",
+         est_xy: bool = None, alloc: str = "qp", qp_s=None,
          fall_hold: float = None, kp_joint: float = None,
          kp_joint_abd: float = None, kp_rise: float = None) -> int:
     """The runner.  `crouch` is the posture the lift starts from and PARK
@@ -1152,7 +1155,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     law drives: "qp" (`hw.balance.qp`, the friction pyramid and the contact
     box inside the problem -- the default since 2026-10-04, on request), or
     "wls" (`allocation.allocate`, the least squares with the cone clipped on
-    afterwards, which every run flew until then).  A hook with
+    afterwards, which every run flew until then).  `qp_s` is `--qp-s`'s
+    default, the QP's S diagonal (None: config.QP_S).  A hook with
     `law_kwargs(args)` hands the law more keyword arguments --
     `hw.fold_walk`'s walk plan.
     `fall_hold` (deg) is `--fall-hold`'s default, THE FALL HOLD
@@ -1194,8 +1198,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                     help="the operator's keys from a file, on the phase clock "
                          "(hw.script): T, the walk's keys, SPACE and ENTER at "
                          "scheduled seconds after each phase is entered, the "
-                         "same in every run.  Any key pressed by hand cancels "
-                         "the rest.  Beside --auto (--fake) the position "
+                         "same in every run.  Stand it up with ENTER; from "
+                         "the script's first press, any key pressed by hand "
+                         "cancels the rest.  Beside --auto (--fake) the position "
                          "phases still step by themselves and the script owns "
                          "HOLD and the trot")
 
@@ -1274,6 +1279,17 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                           "delivered is the closest the cone can make "
                           "(hw.balance.qp); 'wls' the least squares, the cone "
                           "clipped on afterwards (every run until 2026-10-04)")
+    law.add_argument("--qp-s", type=float, nargs=6,
+                     default=[float(s) for s in
+                              (BCFG.QP_S if qp_s is None else qp_s)],
+                     metavar=("FX", "FY", "FZ", "MX", "MY", "MZ"),
+                     help="the QP's wrench weights S, world (Fx, Fy, Fz, "
+                          "roll, pitch, yaw); a larger one is given up "
+                          "later where the cone or the fz box binds, and "
+                          "on a diagonal pair, which cannot make the moment "
+                          "about its own line, on every sweep.  Default "
+                          "config.QP_S (all 1); hw.fold2_walk's is "
+                          "QP_S_FOLD2_WALK (1 1 10 20 1 1)")
     law.add_argument("--ablate-attitude", action="store_true",
                      help="zero both attitude gains -- the other half of the "
                           "A/B.  Height loop and gravity only; the trunk will "
@@ -1329,7 +1345,10 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                "speed and the handover torque rate scale as "
                                "1/period")
         trot.add_argument("--duty", type=float, default=gait.duty,
-                          help="stance fraction, in (0.5, 1)")
+                          help="stance fraction, in [0.5, 1); 0.5 only with "
+                               "--contact-ramp 0 --settle 0 (no four-foot "
+                               "window: the load steps across, and T leaves "
+                               "the trot at a handover)")
         trot.add_argument("--contact-ramp", type=float, default=gait.ramp,
                           metavar="FRACTION",
                           help="fraction of STANCE a foot's share of the load "
@@ -1337,7 +1356,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                "It has to fit inside the four-foot window, so "
                                "the ceiling is (duty - 0.5) / (2 duty) = 0.19 "
                                "at duty 0.80; past it the clock refuses and "
-                               "says so")
+                               "says so.  0 is none: the weight steps 0/1")
         trot.add_argument("--settle", type=float, default=gait.settle_s,
                           metavar="SECONDS",
                           help="the four-foot re-level; 0 turns it off")
@@ -1390,6 +1409,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                "%.4f, DOG5's, not measured on DOG6; "
                                "`hw.swing_bench --analyse` fits it from a log"
                                % P.ARMATURE)
+        trot.add_argument("--ff-scale", type=float, default=1.0, metavar="K",
+                          help="the feedforward's whole M0 times K (doc/swing_hw "
+                               "section 7 proposes 0.35).  Under --swing-ff it "
+                               "scales tau_ff only; under --swing-law osc M0 is "
+                               "the law's gain, so the PD too")
         trot.add_argument("--kp-swing", type=float, nargs=3, metavar="N_PER_M",
                           default=list(BCFG.KP_SWING),
                           help="the Cartesian swing PD's x y z stiffness.  The "
@@ -1551,6 +1575,11 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
     if hook is not None:
         hook.add_arguments(ap)
     args = ap.parse_args(argv)
+    try:                                  # --ff-scale, refused before anything is built
+        BSWING.feedforward_inertia(getattr(args, "ff_armature", None),
+                                   getattr(args, "ff_scale", 1.0))
+    except ValueError as refusal:
+        ap.error(str(refusal))
     if hook is not None:
         try:
             hook.configure(args)
@@ -1783,8 +1812,9 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                               and args.swing_roll),
                               kp_stance_xy=args.kp_stance_xy,
                               kd_stance_xy=args.kd_stance_xy,
-                              ff_inertia=(None if gait is None or args.ff_armature is None
-                                          else BSWING.feedforward_inertia(args.ff_armature)),
+                              ff_inertia=(None if gait is None
+                                          else BSWING.feedforward_inertia(args.ff_armature,
+                                                                          args.ff_scale)),
                               **({} if gait is None else dict(
                                   kp_swing=kp_swing, kd_swing=kd_swing,
                                   kp_swing_knee=np.asarray(args.kp_swing_knee,
@@ -1803,6 +1833,7 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                                   stand_xy=np.asarray(stand_xy, float),
                                   slide_from_h=slide_from)),
                               alloc=args.alloc,
+                              qp_s=np.asarray(args.qp_s, dtype=float),
                               **({} if hook is None
                                  or not hasattr(hook, "law_kwargs")
                                  else hook.law_kwargs(args)),
@@ -1919,13 +1950,15 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
                   % (demand["tau"].max(), args.tau_cap))
         print("       swing feedforward %s"
               % ("ON: tau += %s per swing leg, open "
-                 "loop, M0 diag %s kg m^2 (armature %s); logged as tau_ff"
+                 "loop, M0 diag %s kg m^2 (armature %s, x %.2f --ff-scale); "
+                 "logged as tau_ff"
                  % ("M0 qdd_ref (the knee bump's)" if swing == "knee"
                     else "M0 J^+ (a_ref - Jdot qd_ref)",
-                    np.array2string(np.diag(BSWING.feedforward_inertia(args.ff_armature)),
+                    np.array2string(np.diag(BSWING.feedforward_inertia(args.ff_armature,
+                                                                       args.ff_scale)),
                                     precision=4),
                     "%.5f measured" % args.ff_armature if args.ff_armature is not None
-                    else "%.5f INHERITED from DOG5" % P.ARMATURE)
+                    else "%.5f INHERITED from DOG5" % P.ARMATURE, args.ff_scale)
                  if args.swing_ff else
                  "OFF (--swing-ff turns it on): the PD alone makes the "
                  "swing torque, out of tracking error"))
@@ -2031,7 +2064,8 @@ def main(argv=None, crouch: POSE.CrouchPose = POSE.NOMINAL,
         print("       mu %.2f, leg gravity %d leg%s/sweep, allocator %s"
               % (args.mu, args.gravity_legs,
                  "" if args.gravity_legs == 1 else "s",
-                 "QP -- the pyramid and the contact box inside the problem"
+                 "QP -- the pyramid and the contact box inside the problem, "
+                 "S %s" % " ".join("%g" % s for s in args.qp_s)
                  if args.alloc == "qp" else
                  "WLS -- the least squares, the cone clipped on afterwards "
                  "(--alloc qp is the default)"))
